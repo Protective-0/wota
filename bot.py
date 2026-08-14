@@ -23,6 +23,7 @@ Cara Menjalankan:
 import asyncio
 import random
 import logging
+import signal
 from typing import Optional, Any, cast
 import os
 import re
@@ -1570,7 +1571,7 @@ class MediaScraperBot(commands.Bot):
 
 
 def main() -> None:
-    """Fungsi utama untuk menjalankan bot."""
+    """Fungsi utama untuk menjalankan bot dengan graceful SIGTERM handling."""
     if not DISCORD_BOT_TOKEN:
         raise ValueError("DISCORD_BOT_TOKEN tidak ditemukan di file .env!")
     if DISCORD_CHANNEL_ID == 0:
@@ -1579,7 +1580,33 @@ def main() -> None:
         raise ValueError("DISCORD_ALLOWED_USER_ID tidak ditemukan di file .env!")
 
     bot = MediaScraperBot()
-    bot.run(DISCORD_BOT_TOKEN)
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+
+        # Graceful shutdown: SIGTERM (Docker stop / systemd stop) dan SIGINT (Ctrl+C)
+        # Tanpa handler ini, Docker kirim SIGTERM → Python tidak tangkap → tunggu 10s → SIGKILL
+        # Efek SIGKILL: DB commit terakhir hilang, browser Playwright zombie, temp file tidak bersih.
+        def _signal_handler():
+            logger.info("[\u2699\ufe0f SYSTEM] SIGTERM/SIGINT diterima \u2014 memulai graceful shutdown...")
+            asyncio.create_task(bot.close())
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, _signal_handler)
+            except (NotImplementedError, OSError):
+                # Windows tidak support add_signal_handler — skip, biarkan default handler
+                pass
+
+        try:
+            await bot.start(DISCORD_BOT_TOKEN)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if not bot.is_closed():
+                await bot.close()
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

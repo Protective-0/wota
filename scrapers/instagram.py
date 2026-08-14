@@ -634,22 +634,20 @@ class InstagramScraper(BaseScraper):
         match = re.search(r"/reel/([A-Za-z0-9_-]+)", url)
         return match.group(1) if match else ""
 
+
     async def close(self) -> None:
-        """Tutup browser dan playwright dengan aman."""
+        """Tutup browser dan playwright dengan aman + timeout anti-hang untuk headless server."""
+        async def _safe_close(coro, label: str) -> None:
+            try:
+                await asyncio.wait_for(coro, timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout menutup {label} — lanjutkan shutdown")
+            except Exception as e:
+                logger.warning(f"Error menutup {label}: {e}")
+
         if self._context:
-            try:
-                await self._context.close()
-            except Exception:
-                pass
-
+            await _safe_close(self._context.close(), "Instagram browser context")
         if self._browser:
-            try:
-                await self._browser.close()
-            except Exception:
-                pass
-
+            await _safe_close(self._browser.close(), "Instagram browser")
         if self._playwright:
-            try:
-                await self._playwright.stop()
-            except Exception:
-                pass
+            await _safe_close(self._playwright.stop(), "Instagram playwright")

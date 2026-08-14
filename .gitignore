@@ -52,3 +52,9 @@ logs/
 # Operating System Files
 .DS_Store
 Thumbs.db
+
+# Agent Skills & Customizations (Local only)
+.agents/
+skills-lock.json
+.skills/
+

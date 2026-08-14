@@ -1231,6 +1231,13 @@ class MediaDownloader:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120.0)
             except asyncio.TimeoutError:
                 proc.kill()
+                # FIX: await proc.wait() setelah kill() untuk mencegah zombie process di Linux.
+                # Tanpa wait(), gallery-dl tetap di process table sebagai <defunct> zombie
+                # sampai parent process (Python) keluar. Pada server long-running, akumulasi.
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass  # Proses bandel — biarkan OS reap saat bot restart
                 logger.error("gallery-dl timeout setelah 2 menit")
                 return []
 
@@ -1350,24 +1357,28 @@ class MediaDownloader:
                         headers=req_headers,
                         cookies=cookies,
                         timeout=60,
-                        allow_redirects=True
+                        allow_redirects=True,
+                        stream=True,  # FIX: stream agar tidak load seluruh response ke RAM
                     )
                     if response.status_code != 200:
                         logger.error(f"Gagal download URL langsung (HTTP status {response.status_code})")
                         return None
 
+                    # FIX: streaming chunk write — cegah RAM spike untuk file besar
                     async with aiofiles.open(output_path, "wb") as f:
-                        await f.write(response.content)
+                        async for chunk in response.aiter_bytes(8192):
+                            await f.write(chunk)
                 return output_path
             except (ImportError, ModuleNotFoundError):
                 import httpx  # pyright: ignore[reportMissingImports]
                 async with httpx.AsyncClient(headers=req_headers, cookies=cookies, timeout=60.0, follow_redirects=True) as client:
-                    response = await client.get(media_url, follow_redirects=True)
-                    if response.status_code != 200:
-                        logger.error(f"Gagal download URL langsung via httpx (HTTP status {response.status_code})")
-                        return None
-                    async with aiofiles.open(output_path, "wb") as f:
-                        await f.write(response.content)
+                    async with client.stream("GET", media_url) as response:
+                        if response.status_code != 200:
+                            logger.error(f"Gagal download URL langsung via httpx (HTTP status {response.status_code})")
+                            return None
+                        async with aiofiles.open(output_path, "wb") as f:
+                            async for chunk in response.aiter_bytes(8192):
+                                await f.write(chunk)
                 return output_path
 
         except Exception as e:
@@ -1486,7 +1497,7 @@ class MediaDownloader:
                 logger.debug(f"Durasi video (ffprobe): {duration:.1f}s")
                 return duration
         except FileNotFoundError:
-            logger.warning("ffprobe.exe tidak ditemukan di PATH — mencoba fallback via ffmpeg...")
+            logger.warning("ffprobe tidak ditemukan di PATH — mencoba fallback via ffmpeg...")
         except Exception as e:
             logger.warning(f"ffprobe error ({e}) — mencoba fallback duration probe via ffmpeg...")
 
@@ -1507,7 +1518,7 @@ class MediaDownloader:
                 logger.debug(f"Durasi video (ffmpeg fallback): {duration:.1f}s")
                 return duration
         except FileNotFoundError:
-            logger.error("ffmpeg.exe tidak ditemukan di PATH.")
+            logger.error("ffmpeg tidak ditemukan di PATH.")
         except Exception as e:
             logger.warning(f"ffmpeg duration probe error: {e}")
 

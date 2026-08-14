@@ -150,9 +150,10 @@ class BaseScraper(ABC):
     @staticmethod
     def get_brave_path() -> Optional[str]:
         """
-        Deteksi otomatis path Brave browser ATAU Google Chrome di Windows OS.
-        Membantu mengurangi duplikasi pencarian path di setiap subclass scraper.
-        Mendukung override via variabel lingkungan BROWSER_EXECUTABLE_PATH atau BRAVE_EXECUTABLE_PATH.
+        Deteksi otomatis path browser di Windows dan Linux/Debian.
+        Mendukung override via BROWSER_EXECUTABLE_PATH atau BRAVE_EXECUTABLE_PATH.
+        Di Linux/Docker: deteksi system Chromium terlebih dahulu sebelum fallback ke
+        Playwright built-in (agar tidak re-download browser tiap deploy).
         """
         # 1. Cek explicit override dari env
         for env_key in ["BROWSER_EXECUTABLE_PATH", "BRAVE_EXECUTABLE_PATH"]:
@@ -160,7 +161,26 @@ class BaseScraper(ABC):
             if env_val and os.path.exists(env_val):
                 return env_val
 
-        # 2. Daftar path Brave Browser
+        import platform
+        system = platform.system()
+
+        if system == "Linux":
+            # Debian/Ubuntu server: deteksi Chromium dan Chrome system-wide
+            linux_paths = [
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+                "/snap/bin/chromium",
+            ]
+            for path in linux_paths:
+                if os.path.exists(path):
+                    logger.info(f"Linux system browser ditemukan: {path}")
+                    return path
+            # Tidak ada system browser → Playwright unduh Chromium sendiri (normal untuk Docker)
+            return None
+
+        # 2. Windows: Brave Browser
         brave_paths = [
             r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
             r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
@@ -172,7 +192,7 @@ class BaseScraper(ABC):
             if os.path.exists(path):
                 return path
 
-        # 3. Fallback ke Google Chrome jika Brave tidak ditemukan
+        # 3. Windows: Fallback ke Google Chrome
         chrome_paths = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -192,18 +212,30 @@ class BaseScraper(ABC):
         """
         Bangun kwarg launch browser Playwright terpusat dengan dukungan proxy opsional.
         Format proxy: 'http://username:password@ip:port' atau 'http://ip:port'
+
+        PENTING — Flag Linux/Docker wajib:
+        --disable-dev-shm-usage: Cegah crash SIGBUS di Docker. Default /dev/shm Docker
+            hanya 64MB. Chromium pakai shared memory untuk rendering. Tanpa flag ini,
+            scraping halaman media-heavy (Instagram grid, TikTok profile) = SIGBUS crash.
+            Dengan flag ini Chromium pakai /tmp sebagai fallback shared memory.
+        --disable-gpu: Tidak ada GPU di headless server — skip GPU init yang bisa hang.
         """
         brave_path = BaseScraper.get_brave_path()
         launch_kwargs: dict = {
             "args": [
                 "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
+                "--no-sandbox",               # Wajib di Docker (no root namespace)
+                "--disable-setuid-sandbox",   # Wajib di Docker
+                "--disable-dev-shm-usage",    # KRITIS: cegah SIGBUS crash di Docker/Debian
+                "--disable-gpu",              # Tidak ada GPU di headless server
+                "--disable-software-rasterizer",
                 "--disable-infobars",
                 "--window-position=0,0",
                 "--ignore-certificate-errors",
                 "--disable-web-security",
                 "--disable-features=IsolateOrigins,site-per-process",
+                "--no-first-run",
+                "--no-default-browser-check",
             ],
         }
         if brave_path:

@@ -78,7 +78,8 @@ class TikTokScraper(BaseScraper):
         )
 
         # DEEP STEALTH INJECTION: Menyamarkan seluruh properti headless object agar dikira browser manusia asli
-        assert self._context is not None
+        if self._context is None:
+            raise RuntimeError("Browser context gagal diinisialisasi oleh Playwright — new_context() return None")
         await self._context.add_init_script("""
             () => {
                 // 1. Clear Webdriver flag
@@ -270,17 +271,22 @@ class TikTokScraper(BaseScraper):
         return match.group(1) if match else ""
 
     async def close(self) -> None:
-        """Tutup browser Playwright."""
-        try:
-            if self._context:
-                await self._context.close()
-            if self._browser:
-                await self._browser.close()
-            if self._playwright:
-                await self._playwright.stop()
-        except Exception as e:
-            logger.warning(f"Error saat menutup browser TikTok: {e}")
-        finally:
-            self._context = None
-            self._browser = None
-            self._playwright = None
+        """Tutup browser Playwright dengan aman + timeout anti-hang untuk headless server."""
+        async def _safe_close(coro, label: str) -> None:
+            try:
+                await asyncio.wait_for(coro, timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout menutup {label} — lanjutkan shutdown")
+            except Exception as e:
+                logger.warning(f"Error menutup {label}: {e}")
+
+        if self._context:
+            await _safe_close(self._context.close(), "TikTok browser context")
+        if self._browser:
+            await _safe_close(self._browser.close(), "TikTok browser")
+        if self._playwright:
+            await _safe_close(self._playwright.stop(), "TikTok playwright")
+
+        self._context = None
+        self._browser = None
+        self._playwright = None
