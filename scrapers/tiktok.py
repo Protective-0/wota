@@ -133,7 +133,6 @@ class TikTokScraper(BaseScraper):
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=60000)
 
             # 1. First Pass: Coba ekstrak postingan langsung dari data rehydration JSON (__UNIVERSAL_DATA_FOR_REHYDRATION__ / SIGI_STATE)
-            # Ini sangat cepat dan kebal terhadap perubahan selector DOM / virtual scrolling
             logger.info("Membaca data rehydration JSON TikTok dari halaman profil...")
             rehydration_urls = await page.evaluate(r"""
                 (targetUsername) => {
@@ -145,7 +144,7 @@ class TikTokScraper(BaseScraper):
                         try {
                             const data = JSON.parse(scriptEl.textContent);
                             
-                            // 1. Cek defaultScope user-detail itemList
+                            // 1. Cek defaultScope user-detail itemList (hanya milik profil ini)
                             const defaultScope = data.__DEFAULT_SCOPE__ || {};
                             const userDetail = defaultScope['webapp.user-detail'] || defaultScope['webapp.userDetail'] || {};
                             const itemList = userDetail.itemList || [];
@@ -153,21 +152,12 @@ class TikTokScraper(BaseScraper):
                                 if (id) foundUrls.add(`https://www.tiktok.com/@${u}/video/${id}`);
                             }
                             
-                            // 2. Cek ItemModule (SIGI_STATE / legacy)
+                            // 2. Cek ItemModule (SIGI_STATE / legacy) — verifikasi author cocok
                             const itemModule = data.ItemModule || {};
                             for (const [id, item] of Object.entries(itemModule)) {
-                                if (id) foundUrls.add(`https://www.tiktok.com/@${u}/video/${id}`);
-                            }
-                            
-                            // 3. Fallback regex search untuk post ID 19-digit jika struktur JSON nested
-                            const text = scriptEl.textContent;
-                            const matches = text.match(/"id"\s*:\s*"(\d{15,22})"/g);
-                            if (matches) {
-                                for (const m of matches) {
-                                    const idMatch = m.match(/\d{15,22}/);
-                                    if (idMatch) {
-                                        foundUrls.add(`https://www.tiktok.com/@${u}/video/${idMatch[0]}`);
-                                    }
+                                const author = (item.author || item.authorName || '').toLowerCase().replace('@', '');
+                                if (!author || author === u) {
+                                    foundUrls.add(`https://www.tiktok.com/@${u}/video/${id}`);
                                 }
                             }
                         } catch (e) {}
@@ -206,11 +196,14 @@ class TikTokScraper(BaseScraper):
                     closeBtns.forEach(b => { try { b.click(); } catch(e){} });
                 }""")
 
-                # Ambil snapshot URL dari DOM dengan selector yang lebih toleran
+                # Ambil snapshot URL dari DOM — hanya ambil video asli milik username target (skip repost / recommended)
                 urls_snapshot = await page.evaluate("""
                     (targetUsername) => {
                         const u = targetUsername.toLowerCase().replace('@', '');
-                        const links = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"], [data-e2e="user-post-item"] a, [data-e2e="user-post-item-desc"] a');
+                        const grid = document.querySelector('[data-e2e="user-post-item-list"]') || 
+                                     document.querySelector('[data-testid="user-post-item-list"]') || 
+                                     document;
+                        const links = grid.querySelectorAll('a[href*="/video/"], a[href*="/photo/"], [data-e2e="user-post-item"] a, [data-e2e="user-post-item-desc"] a');
                         const results = [];
                         
                         for (const a of links) {
@@ -219,8 +212,17 @@ class TikTokScraper(BaseScraper):
                             if (href.startsWith('/')) {
                                 href = 'https://www.tiktok.com' + href;
                             }
-                            if (href.includes('/video/') || href.includes('/photo/')) {
+                            const lower = href.toLowerCase();
+                            
+                            // Filter ketat: Harus milik @username target (bukan repost dari akun lain)
+                            if (lower.includes('/@' + u + '/video/') || lower.includes('/@' + u + '/photo/')) {
                                 results.push(href);
+                            } else if (a.closest('[data-e2e="user-post-item"]')) {
+                                // Jika URL generic /video/123 tanpa @, pastikan element berada di grid post user
+                                const match = href.match(/\\/(video|photo)\\/(\\d+)/);
+                                if (match) {
+                                    results.push(`https://www.tiktok.com/@${u}/${match[1]}/${match[2]}`);
+                                }
                             }
                         }
                         return results;
