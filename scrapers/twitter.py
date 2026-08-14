@@ -152,128 +152,143 @@ class TwitterScraper(BaseScraper):
         finally:
             await page.close()
 
-    async def _scroll_and_collect_tweets(self, page: Page, username: str, profile_url: str, forced: bool = False) -> list[PostMedia]:
+    async def _scroll_and_collect_tweets(
+        self, page: Page, username: str, profile_url: str, forced: bool = False
+    ) -> list[PostMedia]:
         """
-        Scroll tab Media Twitter sambil mengumpulkan PostMedia.
-
-        Smart stop-condition: berhenti scroll jika menemukan tweet yang
-        sudah ada di database. Ini menghemat kuota data dan waktu.
+        Scroll tab Media Twitter menggunakan fast browser JavaScript evaluation
+        dan smart stop-condition (cek database SQLite).
         """
         collected_posts = []
         seen_ids = set()
-        no_new_count = 0  # Counter untuk deteksi akhir feed
-        MAX_NO_NEW = 3  # Berhenti setelah 3x scroll tanpa post baru
-        
-        # Tracking tinggi halaman untuk Hard Limit Protection
+        no_new_count = 0
+        MAX_NO_NEW = 4
         consecutive_same_height_count = 0
-        MAX_SAME_HEIGHT = 2
+        MAX_SAME_HEIGHT = 3
+        scroll_round = 0
+
+        logger.info(f"[🔍 CRAWL] Memulai scroll tab Media Twitter untuk @{username}...")
 
         while no_new_count < MAX_NO_NEW:
-            # Tunggu setidaknya satu container tweet/article muncul (auto-wait) untuk mencegah list kosong []
-            try:
-                await page.locator('article, [data-testid="tweet"], [data-testid="cellInnerDiv"]').first.wait_for(state="attached", timeout=10000)
-            except Exception:
-                pass
+            scroll_round += 1
 
-            # Ambil semua tweet container menggunakan stable data-testid atau tag article setelah hard wait 3 detik
-            await page.wait_for_timeout(3000)
-            tweet_containers = await page.locator('article, [data-testid="tweet"], [data-testid="cellInnerDiv"]').all()
+            # Evaluasi langsung di context Javascript browser (super cepat, 0 round-trip latency)
+            tweets_snapshot = await page.evaluate(
+                """
+                (targetUsername) => {
+                    const u = targetUsername.toLowerCase();
+                    const articles = document.querySelectorAll('article[data-testid="tweet"], [data-testid="tweet"], article');
+                    const results = [];
+
+                    for (const article of articles) {
+                        // Cari link status update milik username target
+                        const links = article.querySelectorAll('a[href*="/status/"]');
+                        let statusHref = null;
+                        for (const l of links) {
+                            const h = l.getAttribute('href') || l.href || '';
+                            if (h.toLowerCase().includes('/' + u + '/status/')) {
+                                statusHref = h;
+                                break;
+                            }
+                        }
+                        if (!statusHref) continue;
+
+                        const timeEl = article.querySelector('time');
+                        const timestamp = timeEl ? timeEl.getAttribute('datetime') : null;
+
+                        const textEl = article.querySelector('[data-testid="tweetText"]');
+                        const caption = textEl ? textEl.innerText : '';
+
+                        // Ekstrak URL gambar langsung jika ada (Twitter media image)
+                        const mediaImgs = Array.from(article.querySelectorAll('img[src*="media"], img[src*="pbs.twimg.com/media/"]'))
+                            .map(img => img.src)
+                            .filter(src => src && !src.includes('profile_images') && !src.includes('emoji'));
+
+                        results.push({
+                            href: statusHref,
+                            timestamp: timestamp,
+                            caption: caption,
+                            media_urls: mediaImgs
+                        });
+                    }
+                    return results;
+                }
+                """,
+                username,
+            )
+
             new_found = 0
             should_stop = False
 
-            for container in tweet_containers:
-                try:
-                    # Find any link pointing to a status update within this container block
-                    status_links = await container.locator('a[href*="/status/"]').all()
-                    
-                    for link in status_links:
-                        href = await link.get_attribute("href")
-                        if not href:
-                            continue
-
-                        target_user_lower = username.lower()
-                        href_lower = href.lower()
-
-                        # Enforce ownership check safely
-                        if f"/{target_user_lower}/status/" not in href_lower:
-                            continue
-
-                        tweet_id = self._extract_tweet_id(href)
-                        if not tweet_id or tweet_id in seen_ids:
-                            continue
-
-                        seen_ids.add(tweet_id)
-                        tweet_url = f"https://x.com/{username}/status/{tweet_id}"
-
-                        # STOP-CONDITION: Cek SQLite — jika tweet ini sudah didownload,
-                        # berarti kita sudah sampai di batas resume terakhir.
-                        # Hentikan scroll untuk menghemat waktu dan kuota data.
-                        # KECUALI jika forced=True.
-                        if not forced and await self.db.check_post_exists(tweet_id, self.PLATFORM):
-                            logger.info(
-                                f"Stop-condition: tweet {tweet_id} sudah di DB. "
-                                f"Berhenti scroll — resume point ditemukan."
-                            )
-                            should_stop = True
-                            break
-
-                        # Extract timestamp safely as an optional field
-                        post_timestamp = None
-                        time_el = container.locator('time').first
-                        if await time_el.count() > 0:
-                            post_timestamp = await time_el.get_attribute("datetime")
-
-                        tweet_caption = ""
-                        try:
-                            text_el = container.locator('[data-testid="tweetText"]').first
-                            if await text_el.count() > 0:
-                                tweet_caption = await text_el.inner_text()
-                        except Exception:
-                            pass
-
-                        collected_posts.append(
-                            PostMedia(
-                                post_id=tweet_id,
-                                post_url=tweet_url,
-                                profile_url=profile_url,
-                                platform=self.PLATFORM,
-                                media_type=MediaType.UNKNOWN,
-                                caption=tweet_caption,
-                                timestamp=post_timestamp,
-                                cookies_file=str(self.netscape_cookie_path) if self.netscape_cookie_path.exists() else None,
-                            )
-                        )
-                        new_found += 1
-                    if should_stop:
-                        break
-                except Exception:
+            for item in tweets_snapshot:
+                href = item["href"]
+                tweet_id = self._extract_tweet_id(href)
+                if not tweet_id or tweet_id in seen_ids:
                     continue
+
+                seen_ids.add(tweet_id)
+                tweet_url = f"https://x.com/{username}/status/{tweet_id}"
+
+                # STOP-CONDITION: Cek SQLite jika tweet ini sudah pernah di-scrape
+                if not forced and await self.db.check_post_exists(tweet_id, self.PLATFORM):
+                    logger.info(
+                        f"Stop-condition: tweet {tweet_id} sudah di DB. "
+                        f"Berhenti scroll — resume point ditemukan."
+                    )
+                    should_stop = True
+                    break
+
+                # Bersihkan URL media Twitter ke kualitas terbaik
+                cleaned_media_urls = []
+                for m_url in item.get("media_urls", []):
+                    if "pbs.twimg.com/media/" in m_url:
+                        base = m_url.split("?")[0]
+                        cleaned_media_urls.append(f"{base}?format=jpg&name=orig")
+                    else:
+                        cleaned_media_urls.append(m_url)
+
+                collected_posts.append(
+                    PostMedia(
+                        post_id=tweet_id,
+                        post_url=tweet_url,
+                        profile_url=profile_url,
+                        platform=self.PLATFORM,
+                        media_type=MediaType.UNKNOWN,
+                        caption=item.get("caption", ""),
+                        timestamp=item.get("timestamp"),
+                        media_urls=cleaned_media_urls if cleaned_media_urls else None,
+                        cookies_file=str(self.netscape_cookie_path)
+                        if self.netscape_cookie_path.exists()
+                        else None,
+                    )
+                )
+                new_found += 1
 
             if should_stop:
                 break
 
-            if new_found == 0:
-                no_new_count += 1
-                logger.debug(f"Tidak ada tweet baru ({no_new_count}/{MAX_NO_NEW})")
+            if new_found > 0:
+                logger.info(
+                    f"[🔍 CRAWL] Scroll #{scroll_round}: +{new_found} tweet media baru ditemukan (Total: {len(collected_posts)})"
+                )
+                no_new_count = 0
             else:
-                no_new_count = 0  # Reset counter jika ada yang baru
+                no_new_count += 1
+                logger.debug(f"Tidak ada tweet baru pada scroll #{scroll_round} ({no_new_count}/{MAX_NO_NEW})")
 
             # Simpan tinggi halaman sebelum scroll
             last_height = await page.evaluate("document.body.scrollHeight")
 
             # Scroll ke bawah untuk lazy loading
-            await page.evaluate("window.scrollBy(0, window.innerHeight * 3)")
-            await asyncio.sleep(random.uniform(2, 4))
+            await page.evaluate("window.scrollBy(0, window.innerHeight * 2.5)")
+            await asyncio.sleep(random.uniform(1.5, 2.5))
 
             # Cek tinggi halaman setelah scroll
             new_height = await page.evaluate("document.body.scrollHeight")
             if new_height == last_height:
                 consecutive_same_height_count += 1
-                logger.debug(
-                    f"Scroll height tidak bertambah ({consecutive_same_height_count}/{MAX_SAME_HEIGHT})"
-                )
                 if consecutive_same_height_count >= MAX_SAME_HEIGHT:
-                    logger.info("Hard Limit Protection terpicu: Tinggi halaman mentok. Keluar loop.")
+                    logger.info("Hard Limit Protection: Tinggi halaman mentok, mencapai akhir timeline.")
                     break
             else:
                 consecutive_same_height_count = 0
