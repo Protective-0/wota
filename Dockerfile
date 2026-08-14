@@ -2,19 +2,19 @@
 # Dockerfile — Discord Media Scraper Bot
 # ============================================================
 
-# 1. Base image Python slim
-FROM python:3.11-slim
+# 1. Base image resmi Playwright Python (Chromium & dependensi Linux sudah terpasang)
+FROM mcr.microsoft.com/playwright/python:v1.49.0-noble
 
 # 2. Environment variables untuk runtime
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DEBIAN_FRONTEND=noninteractive \
-    BROWSER_HEADED=false
+    BROWSER_HEADED=false \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# 3. Install dependensi sistem dasar & FFmpeg
+# 3. Install FFmpeg untuk yt-dlp & gallery-dl
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -25,14 +25,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 6. Install browser Chromium & dependensi sistem Linux Playwright
-RUN playwright install --with-deps chromium
-
-# 7. Copy seluruh source code project
+# 6. Copy seluruh source code project
 COPY . .
 
-# 8. Siapkan direktori penyimpanan data/temporer
-RUN mkdir -p temp_media sessions config
+# 7. Siapkan direktori penyimpanan data/temporer
+RUN mkdir -p data temp_media sessions config
 
-# 9. Jalankan bot Discord
+# 8. Jalankan bot Discord
 CMD ["python", "bot.py"]
