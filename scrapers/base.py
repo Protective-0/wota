@@ -258,58 +258,89 @@ class BaseScraper(ABC):
         cookies_to_inject: list[dict] = []
         source = ""  # Untuk logging: "json" atau "env"
 
-        # ── Prioritas 1: Full JSON cookie jar dari config/cookies/<platform>.json ──
+        # ── Prioritas 1: File cookie dari config/cookies/<platform>.json atau <platform>.txt ──
         BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         COOKIE_DIR = os.path.join(BASE_DIR, "config", "cookies")
-        cookie_file = Path(os.path.join(COOKIE_DIR, f"{platform}.json"))
+        cookie_candidates = [
+            Path(os.path.join(COOKIE_DIR, f"{platform}.json")),
+            Path(os.path.join(COOKIE_DIR, f"{platform}.txt")),
+        ]
 
-        if cookie_file.exists():
+        for cookie_file in cookie_candidates:
+            if not cookie_file.exists():
+                continue
+
             try:
                 async with aiofiles.open(cookie_file, "r", encoding="utf-8") as f:
-                    content = await f.read()
-                json_cookies = json.loads(content)
+                    content = (await f.read()).strip()
 
-                if json_cookies and isinstance(json_cookies, list):
-                    # Normalisasi properti cookie dari ekstensi Cookie-Editor / Get cookies.txt
-                    valid_cookies = []
-                    for c in json_cookies:
-                        if isinstance(c, dict) and "name" in c and "value" in c:
-                            norm_c: dict = {
-                                "name": str(c["name"]).strip(),
-                                "value": str(c["value"]).strip(),
-                                "domain": str(c.get("domain", "")).strip(),
-                                "path": str(c.get("path", "/")).strip(),
+                if not content:
+                    continue
+
+                valid_cookies = []
+
+                # Format A: JSON Array (Cookie-Editor format)
+                if content.startswith("[") or content.startswith("{"):
+                    json_data = json.loads(content)
+                    if isinstance(json_data, dict):
+                        json_data = [json_data]
+                    if isinstance(json_data, list):
+                        for c in json_data:
+                            if isinstance(c, dict) and "name" in c and "value" in c:
+                                norm_c: dict = {
+                                    "name": str(c["name"]).strip(),
+                                    "value": str(c["value"]).strip(),
+                                    "domain": str(c.get("domain", "")).strip(),
+                                    "path": str(c.get("path", "/")).strip(),
+                                }
+                                if "secure" in c:
+                                    norm_c["secure"] = bool(c["secure"])
+                                if "httpOnly" in c:
+                                    norm_c["httpOnly"] = bool(c["httpOnly"])
+                                if "sameSite" in c and c["sameSite"]:
+                                    ss = str(c["sameSite"]).capitalize()
+                                    if ss in ("Strict", "Lax", "None"):
+                                        norm_c["sameSite"] = ss
+                                exp = c.get("expirationDate") or c.get("expires")
+                                if exp:
+                                    try:
+                                        norm_c["expires"] = int(float(exp))
+                                    except (ValueError, TypeError):
+                                        pass
+                                valid_cookies.append(norm_c)
+                else:
+                    # Format B: Netscape HTTP Cookie format (Get cookies.txt format)
+                    for line in content.splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        parts = line.split("\t")
+                        if len(parts) >= 7:
+                            domain, include_sub, path, secure, expires, name, value = parts[:7]
+                            norm_c = {
+                                "name": name.strip(),
+                                "value": value.strip(),
+                                "domain": domain.strip(),
+                                "path": path.strip() or "/",
+                                "secure": secure.upper() == "TRUE",
+                                "httpOnly": True,
                             }
-                            if "secure" in c:
-                                norm_c["secure"] = bool(c["secure"])
-                            if "httpOnly" in c:
-                                norm_c["httpOnly"] = bool(c["httpOnly"])
-                            
-                            # Normalisasi sameSite untuk Playwright
-                            if "sameSite" in c and c["sameSite"]:
-                                ss = str(c["sameSite"]).capitalize()
-                                if ss in ("Strict", "Lax", "None"):
-                                    norm_c["sameSite"] = ss
-                            
-                            # Normalisasi expires / expirationDate
-                            exp = c.get("expirationDate") or c.get("expires")
-                            if exp:
-                                try:
-                                    norm_c["expires"] = int(float(exp))
-                                except (ValueError, TypeError):
-                                    pass
-
+                            if expires and expires.isdigit():
+                                exp_int = int(expires)
+                                if exp_int > 0:
+                                    norm_c["expires"] = exp_int
                             valid_cookies.append(norm_c)
 
-                    if valid_cookies:
-                        cookies_to_inject = valid_cookies
-                        source = "json"
-                        logger.info(
-                            f"[⚙️ SYSTEM] Cookie {platform} dimuat dari full JSON jar: {cookie_file.name} "
-                            f"({len(valid_cookies)} cookies)."
-                        )
+                if valid_cookies:
+                    cookies_to_inject = valid_cookies
+                    source = "file"
+                    logger.info(
+                        f"[⚙️ SYSTEM] Cookie {platform} berhasil dimuat dari file: {cookie_file.name} "
+                        f"({len(valid_cookies)} cookies)."
+                    )
+                    break
             except Exception as e:
-                logger.warning(f"Gagal membaca JSON cookie {platform}: {e} — fallback ke .env")
+                logger.warning(f"Gagal membaca file cookie {platform} ({cookie_file.name}): {e}")
 
         # ── Prioritas 2: Fallback ke .env session token ──
         if not cookies_to_inject:
