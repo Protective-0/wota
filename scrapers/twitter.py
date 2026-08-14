@@ -276,22 +276,14 @@ class TwitterScraper(BaseScraper):
                 no_new_count += 1
                 logger.debug(f"Tidak ada tweet baru pada scroll #{scroll_round} ({no_new_count}/{MAX_NO_NEW})")
 
-            # Simpan tinggi halaman sebelum scroll
-            last_height = await page.evaluate("document.body.scrollHeight")
+            # Simpan data sebelum scroll
+            await page.evaluate("window.scrollBy(0, 1600)")
+            await asyncio.sleep(random.uniform(2.5, 3.5))
 
-            # Scroll ke bawah untuk lazy loading
-            await page.evaluate("window.scrollBy(0, window.innerHeight * 2.5)")
-            await asyncio.sleep(random.uniform(1.5, 2.5))
-
-            # Cek tinggi halaman setelah scroll
-            new_height = await page.evaluate("document.body.scrollHeight")
-            if new_height == last_height:
-                consecutive_same_height_count += 1
-                if consecutive_same_height_count >= MAX_SAME_HEIGHT:
-                    logger.info("Hard Limit Protection: Tinggi halaman mentok, mencapai akhir timeline.")
-                    break
-            else:
-                consecutive_same_height_count = 0
+            # Hard stop protection: jika sudah 35 putaran scroll tanpa batas
+            if scroll_round >= 35:
+                logger.info(f"Batas maksimal 35 putaran scroll tercapai untuk @{username}.")
+                break
 
         return collected_posts
 

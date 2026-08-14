@@ -514,8 +514,12 @@ class MediaDownloader:
 
             page = await context.new_page()
             try:
-                await page.goto(post_url, wait_until="domcontentloaded")
-                await asyncio.sleep(4) # Beri waktu render gambar
+                await page.goto(post_url, wait_until="domcontentloaded", timeout=25000)
+                try:
+                    await page.wait_for_selector('article, [data-testid="tweet"], img[src*="pbs.twimg.com/media/"]', timeout=12000)
+                except Exception:
+                    pass
+                await asyncio.sleep(2.5) # Beri jeda render gambar
 
                 # Ambil caption/teks tweet
                 try:
@@ -527,20 +531,18 @@ class MediaDownloader:
 
                 # Ambil timestamp tweet
                 try:
-                    time_el = await page.query_selector('article time')
+                    time_el = await page.query_selector('article time, time')
                     if time_el:
                         ytdl_timestamp = await time_el.get_attribute("datetime")
                 except Exception as e:
                     logger.warning(f"Gagal mengambil timestamp di Twitter fallback: {e}")
 
-                # Kumpulkan URL gambar pbs.twimg.com dari tweet utama saja
+                # Kumpulkan semua URL gambar pbs.twimg.com dari tweet
                 img_srcs = await page.evaluate("""() => {
-                    const mainTweet = document.querySelector('article[role="article"], [data-testid="tweet"]');
-                    if (mainTweet) {
-                        const imgs = mainTweet.querySelectorAll('img[src*="pbs.twimg.com/media/"]');
-                        return Array.from(imgs).map(img => img.src);
-                    }
-                    return [];
+                    const imgs = document.querySelectorAll('img[src*="pbs.twimg.com/media/"], [data-testid="tweetPhoto"] img, article img[src*="twimg"]');
+                    return Array.from(imgs)
+                        .map(img => img.src)
+                        .filter(src => src && src.includes('pbs.twimg.com/media/') && !src.includes('profile_images') && !src.includes('emoji'));
                 }""")
                 unique_images = []
                 seen_urls = set()
@@ -550,11 +552,13 @@ class MediaDownloader:
                         clean_src = src.split("?")[0]
                         if clean_src not in seen_urls:
                             seen_urls.add(clean_src)
-                            # Gunakan format kualitas tinggi (name=orig atau name=large)
-                            if "name=" in src:
-                                high_res = re.sub(r"name=\w+", "name=large", src)
+                            # Gunakan format kualitas original
+                            if "format=" in src:
+                                high_res = re.sub(r"name=\w+", "name=orig", src)
+                                if "name=" not in high_res:
+                                    high_res += "&name=orig"
                             else:
-                                high_res = f"{src}&name=large"
+                                high_res = f"{clean_src}?format=jpg&name=orig"
                             unique_images.append(high_res)
 
             finally:
@@ -1319,11 +1323,22 @@ class MediaDownloader:
         output_path = self.temp_dir / filename
         # FIX: temp_dir may be wiped by /reset_bot mid-session — always ensure it exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        if "pbs.twimg.com" in media_url or "twimg.com" in media_url or "twitter.com" in media_url or "x.com" in media_url:
+            referer = "https://x.com/"
+        elif "instagram.com" in media_url or "cdninstagram.com" in media_url:
+            referer = "https://www.instagram.com/"
+        elif "tiktok.com" in media_url or "tiktokcdn.com" in media_url:
+            referer = "https://www.tiktok.com/"
+        else:
+            referer = ""
+
         default_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer": "https://www.tiktok.com/",
-            "Accept": "*/*"
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         }
+        if referer:
+            default_headers["Referer"] = referer
+
         req_headers = {**default_headers, **(headers or {})}
 
         try:
