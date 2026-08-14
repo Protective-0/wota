@@ -91,9 +91,16 @@ class DatabaseManager:
 
     async def initialize(self) -> None:
         """Buka koneksi DB dan buat tabel jika belum ada."""
-        # Pastikan direktori DB sudah ada
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        db_path_obj = Path(self.db_path)
 
+        # Jika path yang dituju ternyata sebuah direktori (misal karena folder mount Docker),
+        # simpan file database di dalam direktori tersebut
+        if db_path_obj.exists() and db_path_obj.is_dir():
+            db_path_obj = db_path_obj / "bot_data.db"
+        else:
+            db_path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+        self.db_path = str(db_path_obj)
         self._db = await aiosqlite.connect(self.db_path, timeout=30.0)
         self._db.row_factory = aiosqlite.Row  # Hasil query bisa diakses seperti dict
 
