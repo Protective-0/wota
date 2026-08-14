@@ -1,0 +1,15 @@
+services:
+  discord-bot:
+    build: .
+    image: discord-bot:latest
+    container_name: discord_media_bot
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - BROWSER_HEADED=false
+    volumes:
+      - ./bot_data.db:/app/bot_data.db
+      - ./config:/app/config
+      - ./sessions:/app/sessions
+      - ./temp_media:/app/temp_media

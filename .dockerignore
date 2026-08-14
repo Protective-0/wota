@@ -1,0 +1,45 @@
+# ============================================================
+# Docker Ignore — Discord Media Scraper Bot
+# ============================================================
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Git metadata
+.git
+.gitignore
+
+# Python virtual environment & cache
+venv/
+.venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+bot_data.db
+data/
+
+# Log files
+*.log
+logs/
+
+# Sessions & Temporary files
+sessions/*
+!sessions/.gitkeep
+temp_media/*
+!temp_media/.gitkeep
+config/cookies/*
+!config/cookies/.gitkeep
+
+# IDE settings & documentation
+.vscode/
+.idea/
+README.md

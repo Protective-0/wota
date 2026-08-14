@@ -1,0 +1,53 @@
+# ============================================================
+# Git Ignore — Discord Media Scraper Bot
+# ============================================================
+
+# Environment variables & Secrets (JANGAN DI-COMMIT)
+.env
+.env.local
+.env.*.local
+
+# Database SQLite Lokal
+*.db
+*.sqlite
+*.sqlite3
+bot_data.db
+data/
+
+# Sessions & Cookies Netscape (Sensitive Auth Data)
+sessions/*
+!sessions/.gitkeep
+config/cookies/*
+!config/cookies/.gitkeep
+
+# Folder Temporer Media
+temp_media/*
+!temp_media/.gitkeep
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# IDE & Editor Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs & Debugging
+*.log
+logs/
+
+# Operating System Files
+.DS_Store
+Thumbs.db
