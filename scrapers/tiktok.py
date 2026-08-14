@@ -132,7 +132,7 @@ class TikTokScraper(BaseScraper):
             # background XHR polling yang membuat networkidle tidak pernah tercapai
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=60000)
 
-            # 1. First Pass: Coba ekstrak postingan langsung dari data rehydration JSON (__UNIVERSAL_DATA_FOR_REHYDRATION__ / SIGI_STATE)
+            # 1. First Pass: Coba ekstrak postingan dari data rehydration JSON
             logger.info("Membaca data rehydration JSON TikTok dari halaman profil...")
             rehydration_urls = await page.evaluate(r"""
                 (targetUsername) => {
@@ -140,28 +140,50 @@ class TikTokScraper(BaseScraper):
                     const foundUrls = new Set();
                     
                     const scriptEl = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__') || document.getElementById('SIGI_STATE');
-                    if (scriptEl && scriptEl.textContent) {
-                        try {
-                            const data = JSON.parse(scriptEl.textContent);
-                            
-                            // 1. Cek defaultScope user-detail itemList (hanya milik profil ini)
-                            const defaultScope = data.__DEFAULT_SCOPE__ || {};
-                            const userDetail = defaultScope['webapp.user-detail'] || defaultScope['webapp.userDetail'] || {};
-                            const itemList = userDetail.itemList || [];
-                            for (const id of itemList) {
-                                if (id) foundUrls.add(`https://www.tiktok.com/@${u}/video/${id}`);
-                            }
-                            
-                            // 2. Cek ItemModule (SIGI_STATE / legacy) — verifikasi author cocok
-                            const itemModule = data.ItemModule || {};
-                            for (const [id, item] of Object.entries(itemModule)) {
-                                const author = (item.author || item.authorName || '').toLowerCase().replace('@', '');
-                                if (!author || author === u) {
+                    if (!scriptEl || !scriptEl.textContent) return [];
+                    
+                    try {
+                        const data = JSON.parse(scriptEl.textContent);
+                        const defaultScope = data.__DEFAULT_SCOPE__ || {};
+                        
+                        // Cara 1: webapp.user-detail → userPost.itemList (array of objects)
+                        const userDetail = defaultScope['webapp.user-detail'] || defaultScope['webapp.userDetail'] || {};
+                        const userPost = userDetail.userPost || {};
+                        const postItems = userPost.itemList || userDetail.itemList || [];
+                        
+                        for (const item of postItems) {
+                            if (!item) continue;
+                            const id = typeof item === 'string' ? item : (item.id || item.itemId || '');
+                            if (!id) continue;
+                            // Deteksi tipe: photo slide jika ada imagePost / imageList
+                            const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
+                            const type = isPhoto ? 'photo' : 'video';
+                            foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                        }
+                        
+                        // Cara 2: ItemModule / ItemList (SIGI_STATE dan format lama)
+                        const itemModule = data.ItemModule || {};
+                        for (const [id, item] of Object.entries(itemModule)) {
+                            if (typeof item !== 'object') continue;
+                            const author = (item.author || item.authorName || '').toLowerCase().replace('@', '');
+                            if (author && author !== u) continue;  // skip jika jelas bukan milik target
+                            const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
+                            const type = isPhoto ? 'photo' : 'video';
+                            foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                        }
+                        
+                        // Cara 3: Search dalam ItemList array (beberapa versi API)
+                        const itemListArr = data.ItemList || {};
+                        for (const section of Object.values(itemListArr)) {
+                            if (!section || !Array.isArray(section.list)) continue;
+                            for (const id of section.list) {
+                                if (id && typeof id === 'string') {
                                     foundUrls.add(`https://www.tiktok.com/@${u}/video/${id}`);
                                 }
                             }
-                        } catch (e) {}
-                    }
+                        }
+                        
+                    } catch (e) {}
                     return Array.from(foundUrls);
                 }
             """, username)
@@ -208,42 +230,22 @@ class TikTokScraper(BaseScraper):
                         const results = [];
                         const seenIds = new Set();
                         
-                        // 1. Target spesifik card post di grid video profil
-                        const postItems = document.querySelectorAll('[data-e2e="user-post-item"], [data-e2e="user-post-item-desc"], [data-testid="user-post-item"], div[class*="ItemContainer"], div[class*="PostItem"]');
-                        
-                        for (const item of postItems) {
-                            const link = item.querySelector('a[href*="/video/"], a[href*="/photo/"]') || item.closest('a') || (item.tagName === 'A' ? item : null);
-                            if (link) {
-                                const href = link.getAttribute('href') || link.href || '';
+                        // Hanya ambil link yang BENAR-BENAR ada @username di dalam href (original post)
+                        const allLinks = document.querySelectorAll('a[href]');
+                        for (const a of allLinks) {
+                            const href = a.getAttribute('href') || a.href || '';
+                            // Hanya terima link yang berisi @username target secara eksplisit
+                            const lower = href.toLowerCase();
+                            const hasUsername = lower.includes('/@' + u + '/video/') || lower.includes('/@' + u + '/photo/');
+                            if (hasUsername) {
                                 const match = href.match(/\\/(video|photo)\\/(\\d{15,22})/);
-                                if (match) {
-                                    const type = match[1];
-                                    const id = match[2];
-                                    if (!seenIds.has(id)) {
-                                        seenIds.add(id);
-                                        results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                                    }
+                                if (match && !seenIds.has(match[2])) {
+                                    seenIds.add(match[2]);
+                                    const cleanHref = href.split('?')[0];
+                                    results.push(cleanHref.startsWith('http') ? cleanHref : 'https://www.tiktok.com' + cleanHref);
                                 }
                             }
                         }
-                        
-                        // 2. Fallback: Scan semua link video/photo di halaman jika selector card berubah
-                        if (results.length === 0) {
-                            const allLinks = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
-                            for (const a of allLinks) {
-                                const href = a.getAttribute('href') || a.href || '';
-                                const match = href.match(/\\/(video|photo)\\/(\\d{15,22})/);
-                                if (match) {
-                                    const type = match[1];
-                                    const id = match[2];
-                                    if (!seenIds.has(id)) {
-                                        seenIds.add(id);
-                                        results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                                    }
-                                }
-                            }
-                        }
-                        
                         return results;
                     }
                 """, username)
