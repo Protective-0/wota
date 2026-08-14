@@ -180,6 +180,11 @@ class TikTokScraper(BaseScraper):
             # Tunggu elemen feed TikTok muncul (toleransi jika sudah ada dari rehydration)
             logger.info("Menunggu feed DOM TikTok siap...")
             try:
+                # Pastikan tab Videos aktif (bukan tab Repost / Favorit)
+                await page.evaluate("""() => {
+                    const vTab = document.querySelector('[data-e2e="videos-tab"], [data-e2e="user-post-tab"], [role="tab"]:first-child');
+                    if (vTab) vTab.click();
+                }""")
                 await page.wait_for_selector('a[href*="/video/"], a[href*="/photo/"], [data-e2e="user-post-item"]', timeout=8000)
             except Exception:
                 logger.debug("Selector feed DOM TikTok timeout; lanjut dengan scrolling.")
