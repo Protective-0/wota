@@ -201,35 +201,49 @@ class TikTokScraper(BaseScraper):
                     closeBtns.forEach(b => { try { b.click(); } catch(e){} });
                 }""")
 
-                # Ambil snapshot URL dari DOM — hanya ambil video asli milik username target (skip repost / recommended)
+                # Ambil snapshot URL dari DOM grid postingan profil
                 urls_snapshot = await page.evaluate("""
                     (targetUsername) => {
                         const u = targetUsername.toLowerCase().replace('@', '');
-                        const grid = document.querySelector('[data-e2e="user-post-item-list"]') || 
-                                     document.querySelector('[data-testid="user-post-item-list"]') || 
-                                     document;
-                        const links = grid.querySelectorAll('a[href*="/video/"], a[href*="/photo/"], [data-e2e="user-post-item"] a, [data-e2e="user-post-item-desc"] a');
                         const results = [];
+                        const seenIds = new Set();
                         
-                        for (const a of links) {
-                            let href = a.href || a.getAttribute('href') || '';
-                            if (!href) continue;
-                            if (href.startsWith('/')) {
-                                href = 'https://www.tiktok.com' + href;
-                            }
-                            const lower = href.toLowerCase();
-                            
-                            // Filter ketat: Harus milik @username target (bukan repost dari akun lain)
-                            if (lower.includes('/@' + u + '/video/') || lower.includes('/@' + u + '/photo/')) {
-                                results.push(href);
-                            } else if (a.closest('[data-e2e="user-post-item"]')) {
-                                // Jika URL generic /video/123 tanpa @, pastikan element berada di grid post user
-                                const match = href.match(/\\/(video|photo)\\/(\\d+)/);
+                        // 1. Target spesifik card post di grid video profil
+                        const postItems = document.querySelectorAll('[data-e2e="user-post-item"], [data-e2e="user-post-item-desc"], [data-testid="user-post-item"], div[class*="ItemContainer"], div[class*="PostItem"]');
+                        
+                        for (const item of postItems) {
+                            const link = item.querySelector('a[href*="/video/"], a[href*="/photo/"]') || item.closest('a') || (item.tagName === 'A' ? item : null);
+                            if (link) {
+                                const href = link.getAttribute('href') || link.href || '';
+                                const match = href.match(/\\/(video|photo)\\/(\\d{15,22})/);
                                 if (match) {
-                                    results.push(`https://www.tiktok.com/@${u}/${match[1]}/${match[2]}`);
+                                    const type = match[1];
+                                    const id = match[2];
+                                    if (!seenIds.has(id)) {
+                                        seenIds.add(id);
+                                        results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                                    }
                                 }
                             }
                         }
+                        
+                        // 2. Fallback: Scan semua link video/photo di halaman jika selector card berubah
+                        if (results.length === 0) {
+                            const allLinks = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
+                            for (const a of allLinks) {
+                                const href = a.getAttribute('href') || a.href || '';
+                                const match = href.match(/\\/(video|photo)\\/(\\d{15,22})/);
+                                if (match) {
+                                    const type = match[1];
+                                    const id = match[2];
+                                    if (!seenIds.has(id)) {
+                                        seenIds.add(id);
+                                        results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                                    }
+                                }
+                            }
+                        }
+                        
                         return results;
                     }
                 """, username)
