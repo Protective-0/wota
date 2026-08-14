@@ -12,7 +12,8 @@
 *.sqlite
 *.sqlite3
 bot_data.db
-data/
+data/*
+!data/.gitkeep
 
 # Sessions & Cookies Netscape (Sensitive Auth Data)
 sessions/*

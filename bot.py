@@ -104,7 +104,7 @@ except ValueError:
 
 TEMP_DIR = os.getenv("TEMP_DIR", "./temp_media")
 SESSION_DIR = os.getenv("SESSION_DIR", "./sessions")
-DB_PATH = os.getenv("DB_PATH", "./bot_data.db")
+DB_PATH = os.getenv("DB_PATH", "./data/bot_data.db")
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "10"))
 SEND_DELAY = float(os.getenv("SEND_DELAY_SECONDS", "3"))
 BROWSER_HEADED = os.getenv("BROWSER_HEADED", "true").lower() == "true"

@@ -9,7 +9,7 @@ services:
     environment:
       - BROWSER_HEADED=false
     volumes:
-      - ./bot_data.db:/app/bot_data.db
+      - ./data:/app/data
       - ./config:/app/config
       - ./sessions:/app/sessions
       - ./temp_media:/app/temp_media
