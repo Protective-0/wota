@@ -251,72 +251,97 @@ class BaseScraper(ABC):
         Injeksi cookie ke Playwright context + export Netscape untuk yt-dlp.
 
         Prioritas sumber:
-          1. .env session token (INSTAGRAM_SESSION_ID, TIKTOK_SESSION_ID, TWITTER_AUTH_TOKEN+CT0)
-          2. Static JSON file dari config/cookies/<platform>.json
+          1. Full JSON cookie jar dari config/cookies/<platform>.json (hasil export browser)
+          2. Fallback ke .env session token (INSTAGRAM_SESSION_ID, TIKTOK_SESSION_ID, TWITTER_AUTH_TOKEN+CT0)
           3. Tidak ada keduanya → log error, return None (akun di-skip)
         """
         cookies_to_inject: list[dict] = []
-        source = ""  # Untuk logging: "env" atau "json"
+        source = ""  # Untuk logging: "json" atau "env"
 
-        # ── Prioritas 1: Bangun cookie dari .env session token ──
-        token_specs = self.ENV_TOKEN_MAP.get(platform, [])
-        if token_specs:
-            env_cookies = []
-            all_present = True
+        # ── Prioritas 1: Full JSON cookie jar dari config/cookies/<platform>.json ──
+        BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        COOKIE_DIR = os.path.join(BASE_DIR, "config", "cookies")
+        cookie_file = Path(os.path.join(COOKIE_DIR, f"{platform}.json"))
 
-            for spec in token_specs:
-                token_value = os.getenv(spec["env_key"])
-                if token_value:
-                    # Bersihkan whitespace tak sengaja agar Playwright tidak error
-                    env_cookies.append(
-                        {
-                            "name": spec["name"],
-                            "value": token_value.strip(),
-                            "domain": spec["domain"],
-                            "path": "/",
-                            "secure": True,
-                            "httpOnly": True,
-                        }
-                    )
-                else:
-                    all_present = False
+        if cookie_file.exists():
+            try:
+                async with aiofiles.open(cookie_file, "r", encoding="utf-8") as f:
+                    content = await f.read()
+                json_cookies = json.loads(content)
 
-            # Hanya pakai .env jika SEMUA token untuk platform ini ada
-            if all_present and env_cookies:
-                cookies_to_inject = env_cookies
-                source = "env"
-                logger.info(
-                    f"[⚙️ SYSTEM] Cookie {platform} dibangun dari .env session token "
-                    f"({len(env_cookies)} cookie)."
-                )
+                if json_cookies and isinstance(json_cookies, list):
+                    # Normalisasi properti cookie dari ekstensi Cookie-Editor / Get cookies.txt
+                    valid_cookies = []
+                    for c in json_cookies:
+                        if isinstance(c, dict) and "name" in c and "value" in c:
+                            norm_c: dict = {
+                                "name": str(c["name"]).strip(),
+                                "value": str(c["value"]).strip(),
+                                "domain": str(c.get("domain", "")).strip(),
+                                "path": str(c.get("path", "/")).strip(),
+                            }
+                            if "secure" in c:
+                                norm_c["secure"] = bool(c["secure"])
+                            if "httpOnly" in c:
+                                norm_c["httpOnly"] = bool(c["httpOnly"])
+                            
+                            # Normalisasi sameSite untuk Playwright
+                            if "sameSite" in c and c["sameSite"]:
+                                ss = str(c["sameSite"]).capitalize()
+                                if ss in ("Strict", "Lax", "None"):
+                                    norm_c["sameSite"] = ss
+                            
+                            # Normalisasi expires / expirationDate
+                            exp = c.get("expirationDate") or c.get("expires")
+                            if exp:
+                                try:
+                                    norm_c["expires"] = int(float(exp))
+                                except (ValueError, TypeError):
+                                    pass
 
-        # ── Prioritas 2: Fallback ke static JSON file ──
-        if not cookies_to_inject:
-            BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            COOKIE_DIR = os.path.join(BASE_DIR, "config", "cookies")
-            os.makedirs(COOKIE_DIR, exist_ok=True)
+                            valid_cookies.append(norm_c)
 
-            cookie_file = Path(os.path.join(COOKIE_DIR, f"{platform}.json"))
-
-            if cookie_file.exists():
-                try:
-                    async with aiofiles.open(cookie_file, "r", encoding="utf-8") as f:
-                        content = await f.read()
-                    json_cookies = json.loads(content)
-
-                    if json_cookies:
-                        cookies_to_inject = json_cookies
+                    if valid_cookies:
+                        cookies_to_inject = valid_cookies
                         source = "json"
                         logger.info(
-                            f"[⚙️ SYSTEM] Cookie {platform} dimuat dari JSON file: {cookie_file.name}"
+                            f"[⚙️ SYSTEM] Cookie {platform} dimuat dari full JSON jar: {cookie_file.name} "
+                            f"({len(valid_cookies)} cookies)."
+                        )
+            except Exception as e:
+                logger.warning(f"Gagal membaca JSON cookie {platform}: {e} — fallback ke .env")
+
+        # ── Prioritas 2: Fallback ke .env session token ──
+        if not cookies_to_inject:
+            token_specs = self.ENV_TOKEN_MAP.get(platform, [])
+            if token_specs:
+                env_cookies = []
+                all_present = True
+
+                for spec in token_specs:
+                    token_value = os.getenv(spec["env_key"])
+                    if token_value:
+                        # Bersihkan whitespace tak sengaja agar Playwright tidak error
+                        env_cookies.append(
+                            {
+                                "name": spec["name"],
+                                "value": token_value.strip(),
+                                "domain": spec["domain"],
+                                "path": "/",
+                                "secure": True,
+                                "httpOnly": True,
+                            }
                         )
                     else:
-                        logger.warning(
-                            f"[⚠️ WARN  ] File JSON cookie {platform} kosong."
-                        )
-                except (json.JSONDecodeError, IOError) as e:
-                    logger.error(
-                        f"[❌ ERROR  ] Gagal membaca JSON cookie {platform}: {e}"
+                        all_present = False
+
+                # Hanya pakai .env jika SEMUA token untuk platform ini ada
+                if all_present and env_cookies:
+                    cookies_to_inject = env_cookies
+                    source = "env"
+                    logger.info(
+                        f"[⚙️ SYSTEM] Cookie {platform} dibangun dari .env session token "
+                        f"({len(env_cookies)} cookie)."
                     )
 
         # ── Tidak ada sumber auth sama sekali ──
