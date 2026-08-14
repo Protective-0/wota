@@ -79,6 +79,39 @@ def clear_directory_contents(dir_path: str | Path) -> None:
         except Exception as e:
             logger.warning(f"Gagal menghapus {item}: {e}")
 
+
+async def safe_defer(interaction: discord.Interaction, ephemeral: bool = False) -> bool:
+    """Defer interaksi dengan aman agar tidak crash jika token Discord 3s timeout."""
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+            return True
+    except Exception as e:
+        logger.warning(f"Interaction defer timeout/error: {e}")
+    return False
+
+
+async def safe_reply(
+    interaction: discord.Interaction,
+    text: str,
+    fallback_channel: Optional[Any] = None,
+    ephemeral: bool = False,
+) -> None:
+    """Kirim respon interaksi dengan fallback pengiriman langsung ke channel jika interaksi expired."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(text, ephemeral=ephemeral)
+    except Exception as e:
+        logger.warning(f"Interaction response error: {e}")
+        if fallback_channel:
+            try:
+                await fallback_channel.send(text)
+            except Exception as ch_err:
+                logger.warning(f"Fallback channel send error: {ch_err}")
+
+
 # ──────────────────────────────────────────────
 # Load Konfigurasi dari .env
 # ──────────────────────────────────────────────
@@ -188,13 +221,12 @@ class MediaScraperBot(commands.Bot):
             platform: Optional[str] = None,
         ):
             if interaction.user.id != ALLOWED_USER_ID:
-                await interaction.response.send_message(
-                    "⛔ Akses Ditolak: Hanya untuk Administrator.", ephemeral=True
+                await safe_reply(
+                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator.", ephemeral=True
                 )
                 return
 
-            # Defer immediately — DB write can take >3s, interaction token expires without this
-            await interaction.response.defer()
+            await safe_defer(interaction)
 
             try:
                 clean_username, detected_platform = extract_username_and_platform(
@@ -210,16 +242,18 @@ class MediaScraperBot(commands.Bot):
                 elif detected_platform == "twitter":
                     profile_url = f"https://x.com/{clean_username}"
                 else:
-                    await interaction.followup.send("❌ Platform tidak dikenali.", ephemeral=True)
+                    await safe_reply(interaction, "❌ Platform tidak dikenali.", fallback_channel=channel, ephemeral=True)
                     return
 
                 await self.db.add_monitored_account(
                     clean_username, detected_platform, channel.id, last_scraped_id=""
                 )
 
-                await interaction.followup.send(
+                await safe_reply(
+                    interaction,
                     f"✅ Berhasil mendaftarkan **@{clean_username}** ({detected_platform}) ke channel {channel.mention}.\n"
-                    f"⏳ Pemrosesan seluruh postingan historis sedang berjalan di background."
+                    f"⏳ Pemrosesan seluruh postingan historis sedang berjalan di background.",
+                    fallback_channel=channel
                 )
 
                 task = asyncio.create_task(
@@ -233,7 +267,7 @@ class MediaScraperBot(commands.Bot):
                 logger.error(
                     f"[❌ ERROR  ] Gagal memproses registrasi /add: {e}", exc_info=True
                 )
-                await interaction.followup.send(f"❌ Gagal memproses registrasi: {e}")
+                await safe_reply(interaction, f"❌ Gagal memproses registrasi: {e}", fallback_channel=channel)
 
         # Registrasi Slash Command /insta
         @self.tree.command(
@@ -250,12 +284,12 @@ class MediaScraperBot(commands.Bot):
             channel: discord.TextChannel,
         ):
             if interaction.user.id != ALLOWED_USER_ID:
-                await interaction.response.send_message(
-                    "⛔ Akses Ditolak: Hanya untuk Administrator.", ephemeral=True
+                await safe_reply(
+                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator.", ephemeral=True
                 )
                 return
 
-            await interaction.response.defer()
+            await safe_defer(interaction)
 
             try:
                 clean_username, _ = extract_username_and_platform(username)
@@ -265,9 +299,11 @@ class MediaScraperBot(commands.Bot):
                     clean_username, "instagram", channel.id, last_scraped_id=""
                 )
 
-                await interaction.followup.send(
+                await safe_reply(
+                    interaction,
                     f"✅ Berhasil mendaftarkan Instagram **@{clean_username}** ke channel {channel.mention}.\n"
-                    f"⏳ Pemrosesan seluruh postingan historis sedang berjalan di background."
+                    f"⏳ Pemrosesan seluruh postingan historis sedang berjalan di background.",
+                    fallback_channel=channel
                 )
 
                 task = asyncio.create_task(
@@ -282,7 +318,7 @@ class MediaScraperBot(commands.Bot):
                     f"[❌ ERROR  ] Gagal memproses registrasi /insta: {e}",
                     exc_info=True,
                 )
-                await interaction.followup.send(f"❌ Gagal memproses registrasi: {e}")
+                await safe_reply(interaction, f"❌ Gagal memproses registrasi: {e}", fallback_channel=channel)
 
         # Registrasi Slash Command /tiktok
         @self.tree.command(
@@ -299,12 +335,12 @@ class MediaScraperBot(commands.Bot):
             channel: discord.TextChannel,
         ):
             if interaction.user.id != ALLOWED_USER_ID:
-                await interaction.response.send_message(
-                    "⛔ Akses Ditolak: Hanya untuk Administrator.", ephemeral=True
+                await safe_reply(
+                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator.", ephemeral=True
                 )
                 return
 
-            await interaction.response.defer()
+            await safe_defer(interaction)
 
             try:
                 clean_username, _ = extract_username_and_platform(username)
@@ -314,9 +350,11 @@ class MediaScraperBot(commands.Bot):
                     clean_username, "tiktok", channel.id, last_scraped_id=""
                 )
 
-                await interaction.followup.send(
+                await safe_reply(
+                    interaction,
                     f"✅ Berhasil mendaftarkan TikTok **@{clean_username}** ke channel {channel.mention}.\n"
-                    f"⏳ Pemrosesan seluruh postingan historis sedang berjalan di background."
+                    f"⏳ Pemrosesan seluruh postingan historis sedang berjalan di background.",
+                    fallback_channel=channel
                 )
 
                 task = asyncio.create_task(
@@ -331,7 +369,7 @@ class MediaScraperBot(commands.Bot):
                     f"[❌ ERROR  ] Gagal memproses registrasi /tiktok: {e}",
                     exc_info=True,
                 )
-                await interaction.followup.send(f"❌ Gagal memproses registrasi: {e}")
+                await safe_reply(interaction, f"❌ Gagal memproses registrasi: {e}", fallback_channel=channel)
 
         # Registrasi Slash Command /x
         @self.tree.command(
@@ -348,12 +386,12 @@ class MediaScraperBot(commands.Bot):
             channel: discord.TextChannel,
         ):
             if interaction.user.id != ALLOWED_USER_ID:
-                await interaction.response.send_message(
-                    "⛔ Akses Ditolak: Hanya untuk Administrator.", ephemeral=True
+                await safe_reply(
+                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator.", ephemeral=True
                 )
                 return
 
-            await interaction.response.defer()
+            await safe_defer(interaction)
 
             try:
                 clean_username, _ = extract_username_and_platform(username)
@@ -363,9 +401,11 @@ class MediaScraperBot(commands.Bot):
                     clean_username, "twitter", channel.id, last_scraped_id=""
                 )
 
-                await interaction.followup.send(
+                await safe_reply(
+                    interaction,
                     f"✅ Berhasil mendaftarkan Twitter/X **@{clean_username}** ke channel {channel.mention}.\n"
-                    f"⏳ Pemrosesan seluruh postingan historis sedang berjalan di background."
+                    f"⏳ Pemrosesan seluruh postingan historis sedang berjalan di background.",
+                    fallback_channel=channel
                 )
 
                 task = asyncio.create_task(
@@ -379,7 +419,7 @@ class MediaScraperBot(commands.Bot):
                 logger.error(
                     f"[❌ ERROR  ] Gagal memproses registrasi /x: {e}", exc_info=True
                 )
-                await interaction.followup.send(f"❌ Gagal memproses registrasi: {e}")
+                await safe_reply(interaction, f"❌ Gagal memproses registrasi: {e}", fallback_channel=channel)
 
         # Registrasi Slash Command /delete
         @self.tree.command(
@@ -389,18 +429,18 @@ class MediaScraperBot(commands.Bot):
         @app_commands.describe(username="Username atau URL profil yang ingin dihapus")
         async def delete_cmd(interaction: discord.Interaction, username: str):
             if interaction.user.id != ALLOWED_USER_ID:
-                await interaction.response.send_message(
-                    "⛔ Akses Ditolak.", ephemeral=True
+                await safe_reply(
+                    interaction, "⛔ Akses Ditolak.", ephemeral=True
                 )
                 return
             try:
                 clean_username, platform = extract_username_and_platform(username)
                 await self.db.delete_monitored_account(clean_username, platform)
-                await interaction.response.send_message(
-                    f"🗑️ Akun **@{clean_username}** telah dihapus dari daftar monitoring."
+                await safe_reply(
+                    interaction, f"🗑️ Akun **@{clean_username}** telah dihapus dari daftar monitoring."
                 )
             except Exception as e:
-                await interaction.response.send_message(f"❌ Gagal menghapus akun: {e}")
+                await safe_reply(interaction, f"❌ Gagal menghapus akun: {e}")
 
         # Registrasi Slash Command /reset_account
         @self.tree.command(
@@ -410,19 +450,20 @@ class MediaScraperBot(commands.Bot):
         @app_commands.describe(username="Username atau URL profil yang ingin di-reset")
         async def reset_account(interaction: discord.Interaction, username: str):
             if interaction.user.id != ALLOWED_USER_ID:
-                await interaction.response.send_message(
-                    "⛔ Akses Ditolak.", ephemeral=True
+                await safe_reply(
+                    interaction, "⛔ Akses Ditolak.", ephemeral=True
                 )
                 return
             try:
                 clean_username, platform = extract_username_and_platform(username)
                 await self.db.reset_account_history(clean_username, platform)
-                await interaction.response.send_message(
+                await safe_reply(
+                    interaction,
                     f"🔄 Riwayat scrape untuk **@{clean_username}** telah di-reset. Scrape berikutnya akan mengunduh ulang."
                 )
             except Exception as e:
-                await interaction.response.send_message(
-                    f"❌ Gagal mereset riwayat: {e}"
+                await safe_reply(
+                    interaction, f"❌ Gagal mereset riwayat: {e}"
                 )
 
         # Registrasi Slash Command /reset_bot
@@ -432,14 +473,14 @@ class MediaScraperBot(commands.Bot):
         )
         async def reset_bot(interaction: discord.Interaction):
             if interaction.user.id != ALLOWED_USER_ID:
-                await interaction.response.send_message(
-                    "⛔ Akses Ditolak.", ephemeral=True
+                await safe_reply(
+                    interaction, "⛔ Akses Ditolak.", ephemeral=True
                 )
                 return
 
-            await interaction.response.defer(ephemeral=False)
-            await interaction.followup.send(
-                "⏳ Memulai pembersihan sistem secara menyeluruh..."
+            await safe_defer(interaction)
+            await safe_reply(
+                interaction, "⏳ Memulai pembersihan sistem secara menyeluruh..."
             )
 
             try:
@@ -452,12 +493,12 @@ class MediaScraperBot(commands.Bot):
 
                 self.queue.release()
 
-                await interaction.followup.send(
-                    "✅ **Reset Bot Sukses Total!** Seluruh database, sesi cookies, dan file temporer telah dibersihkan secara bersih."
+                await safe_reply(
+                    interaction, "✅ **Reset Bot Sukses Total!** Seluruh database, sesi cookies, dan file temporer telah dibersihkan secara bersih."
                 )
             except Exception as e:
                 logger.error(f"[❌ ERROR  ] Reset bot error: {e}", exc_info=True)
-                await interaction.followup.send(f"❌ Reset gagal: `{str(e)[:200]}`")
+                await safe_reply(interaction, f"❌ Reset gagal: `{str(e)[:200]}`")
 
         # Registrasi Slash Command /force — master switch untuk scan manual
         @self.tree.command(
@@ -465,32 +506,30 @@ class MediaScraperBot(commands.Bot):
             description="Memaksa bot melakukan scan menyeluruh ke semua akun saat ini juga",
         )
         async def force_scan(interaction: discord.Interaction):
-            # Admin check FIRST — defer with ephemeral=True so error stays private
             if interaction.user.id != ALLOWED_USER_ID:
-                await interaction.response.send_message(
-                    "❌ Anda tidak memiliki izin.", ephemeral=True
+                await safe_reply(
+                    interaction, "❌ Anda tidak memiliki izin.", ephemeral=True
                 )
                 return
 
-            # Amankan token interaksi dari timeout 3 detik
-            await interaction.response.defer(ephemeral=False)
+            await safe_defer(interaction)
 
             if self.is_scanning:
-                await interaction.followup.send(
-                    "⚠️ Scan masih berjalan. Harap tunggu."
+                await safe_reply(
+                    interaction, "⚠️ Scan masih berjalan. Harap tunggu."
                 )
                 return
 
-            await interaction.followup.send(
-                "🚀 Memulai proses *Force Scan* ke semua akun..."
+            await safe_reply(
+                interaction, "🚀 Memulai proses *Force Scan* ke semua akun..."
             )
 
             # FIX: is_scanning check moved INSIDE scan_lock to prevent TOCTOU race
             # where two /force calls both pass the check before either sets is_scanning=True
             async with self.scan_lock:
                 if self.is_scanning:
-                    await interaction.followup.send(
-                        "⚠️ Scan masih berjalan. Harap tunggu."
+                    await safe_reply(
+                        interaction, "⚠️ Scan masih berjalan. Harap tunggu."
                     )
                     return
 
@@ -498,8 +537,8 @@ class MediaScraperBot(commands.Bot):
                 try:
                     accounts = await self.db.get_all_monitored_accounts()
                     if not accounts:
-                        await interaction.edit_original_response(
-                            content="❌ Database kosong. Tambahkan akun terlebih dahulu."
+                        await safe_reply(
+                            interaction, "❌ Database kosong. Tambahkan akun terlebih dahulu."
                         )
                         return
 
