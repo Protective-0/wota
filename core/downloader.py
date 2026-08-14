@@ -284,8 +284,8 @@ class MediaDownloader:
 
         loop = asyncio.get_running_loop()
 
-        # Deteksi awal apakah ini post gambar Twitter atau Instagram photo post (/p/)
-        is_twitter_photo = ("twitter.com" in post_url or "x.com" in post_url) and (is_video is not True or "/photo/" in post_url)
+        # Deteksi awal apakah ini post gambar Twitter /photo/ atau Instagram photo post (/p/)
+        is_twitter_photo = ("twitter.com" in post_url or "x.com" in post_url) and ("/photo/" in post_url)
         is_instagram_photo = ("instagram.com" in post_url) and ("/p/" in post_url) and (is_video is not True)
         # FIX: yt-dlp throws `Unsupported URL` for every TikTok /photo/ URL \u2014 no recovery path.
         # Bypass yt-dlp entirely for photo mode and go straight to carousel extractors.
@@ -495,6 +495,12 @@ class MediaDownloader:
 
             auth_token = os.getenv("TWITTER_AUTH_TOKEN")
             ct0 = os.getenv("TWITTER_CT0")
+            if cookies_file and Path(cookies_file).exists():
+                parsed_c = self._parse_netscape_cookies(cookies_file)
+                if not auth_token and "auth_token" in parsed_c:
+                    auth_token = parsed_c["auth_token"]
+                if not ct0 and "ct0" in parsed_c:
+                    ct0 = parsed_c["ct0"]
 
             # Optimization: reuse existing browser instance from self.get_browser() instead of spawning new async_playwright() instances
             browser = await self.get_browser()
@@ -504,7 +510,7 @@ class MediaDownloader:
                 locale="id-ID"
             )
 
-            if auth_token and ct0:
+            if auth_token or ct0:
                 await context.add_cookies([
                     {"name": "auth_token", "value": auth_token.strip(), "domain": ".x.com", "path": "/"},
                     {"name": "ct0", "value": ct0.strip(), "domain": ".x.com", "path": "/"},

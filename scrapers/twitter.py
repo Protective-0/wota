@@ -107,10 +107,10 @@ class TwitterScraper(BaseScraper):
             logger.error(f"Username Twitter tidak valid: {profile_url}")
             return
 
-        # Gunakan tab "Media" langsung untuk efisiensi
-        # (hanya tweet yang memiliki foto/video)
-        media_tab_url = f"https://x.com/{username}/media"
-        logger.info(f"Mulai crawl Twitter Media tab: {media_tab_url}")
+        # Gunakan timeline profil utama langsung (https://x.com/username)
+        # Tab /media sering hanya merender thumbnail grid atau gagal lazy load di headless browser
+        timeline_url = f"https://x.com/{username}"
+        logger.info(f"Mulai crawl timeline Twitter: {timeline_url}")
 
         if self._context is None:
             raise RuntimeError("Browser context is not initialized")
@@ -118,26 +118,25 @@ class TwitterScraper(BaseScraper):
 
         try:
             try:
-                logger.info(f"[🔍 CRAWL] Membuka Tab Media Twitter target: {media_tab_url}")
-                # FIX: added wait_until="domcontentloaded" — "load" hangs forever on
-                # Twitter SPA which has infinite background XHR polling
-                await page.goto(media_tab_url, wait_until="domcontentloaded", timeout=20000)
+                logger.info(f"[🔍 CRAWL] Membuka Timeline Twitter target: {timeline_url}")
+                # domcontentloaded: hindari timeout karena infinite XHR polling Twitter
+                await page.goto(timeline_url, wait_until="domcontentloaded", timeout=20000)
                 
-                # Target the structural primaryColumn backbone container and wait for tweet selector explicitly
+                # Target primaryColumn dan tunggu selector tweet muncul
                 await page.wait_for_selector('[data-testid="primaryColumn"]', state="attached", timeout=15000)
                 try:
                     await page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
                 except Exception:
-                    logger.warning("Tweet selector tidak muncul dalam 15s (mungkin akun tidak memiliki media).")
+                    logger.warning("Tweet selector tidak muncul dalam 15s — mencoba lanjut scroll.")
             except Exception as e:
-                logger.error(f"[❌ ERROR  ] Gagal memuat Tab Media Twitter atau struktur halaman korup: {e}")
-                return # Terminate early safely without throwing unhandled exceptions
+                logger.error(f"[❌ ERROR  ] Gagal memuat Timeline Twitter atau struktur halaman korup: {e}")
+                return
 
             if "i/flow/login" in page.url or "login" in page.url:
                 logger.error("[❌ ERROR  ] Sesi Cookie .env Anda EXPIRED!")
                 return
 
-            # 3. Mulai proses scrolling dan ekstrasi data asli...
+            # Mulai proses scrolling dan ekstraksi data asli
             all_posts = await self._scroll_and_collect_tweets(page, username, profile_url, forced=forced)
 
             logger.info(
@@ -167,7 +166,7 @@ class TwitterScraper(BaseScraper):
         MAX_SAME_HEIGHT = 3
         scroll_round = 0
 
-        logger.info(f"[🔍 CRAWL] Memulai scroll tab Media Twitter untuk @{username}...")
+        logger.info(f"[🔍 CRAWL] Memulai scroll timeline Twitter untuk @{username}...")
 
         while no_new_count < MAX_NO_NEW:
             scroll_round += 1
@@ -200,15 +199,24 @@ class TwitterScraper(BaseScraper):
                         const caption = textEl ? textEl.innerText : '';
 
                         // Ekstrak URL gambar langsung jika ada (Twitter media image)
-                        const mediaImgs = Array.from(article.querySelectorAll('img[src*="media"], img[src*="pbs.twimg.com/media/"]'))
+                        const mediaImgs = Array.from(article.querySelectorAll('img[src*="pbs.twimg.com/media/"], [data-testid="tweetPhoto"] img'))
                             .map(img => img.src)
                             .filter(src => src && !src.includes('profile_images') && !src.includes('emoji'));
+
+                        // Cek apakah ada video atau gif
+                        const hasVideo = !!article.querySelector('video, [data-testid="videoPlayer"], [data-testid="videoComponent"]');
+
+                        // Filter: HANYA ambil tweet yang memiliki media (foto atau video)
+                        if (mediaImgs.length === 0 && !hasVideo) {
+                            continue; // Lewati tweet teks biasa tanpa media
+                        }
 
                         results.push({
                             href: statusHref,
                             timestamp: timestamp,
                             caption: caption,
-                            media_urls: mediaImgs
+                            media_urls: mediaImgs,
+                            is_video: hasVideo
                         });
                     }
                     return results;
@@ -238,14 +246,23 @@ class TwitterScraper(BaseScraper):
                     should_stop = True
                     break
 
-                # Bersihkan URL media Twitter ke kualitas terbaik
+                # Bersihkan URL media Twitter ke kualitas original tertinggi (name=orig)
                 cleaned_media_urls = []
                 for m_url in item.get("media_urls", []):
                     if "pbs.twimg.com/media/" in m_url:
-                        base = m_url.split("?")[0]
-                        cleaned_media_urls.append(f"{base}?format=jpg&name=orig")
+                        clean_src = m_url.split("?")[0]
+                        if "format=" in m_url:
+                            high_res = re.sub(r"name=\w+", "name=orig", m_url)
+                            if "name=" not in high_res:
+                                high_res += "&name=orig"
+                        else:
+                            high_res = f"{clean_src}?format=jpg&name=orig"
+                        cleaned_media_urls.append(high_res)
                     else:
                         cleaned_media_urls.append(m_url)
+
+                is_video = item.get("is_video", False)
+                media_type = MediaType.VIDEO if is_video else MediaType.PHOTO
 
                 collected_posts.append(
                     PostMedia(
@@ -253,10 +270,10 @@ class TwitterScraper(BaseScraper):
                         post_url=tweet_url,
                         profile_url=profile_url,
                         platform=self.PLATFORM,
-                        media_type=MediaType.UNKNOWN,
+                        media_type=media_type,
                         caption=item.get("caption", ""),
                         timestamp=item.get("timestamp"),
-                        media_urls=cleaned_media_urls if cleaned_media_urls else None,
+                        media_urls=cleaned_media_urls if cleaned_media_urls else [],
                         cookies_file=str(self.netscape_cookie_path)
                         if self.netscape_cookie_path.exists()
                         else None,
