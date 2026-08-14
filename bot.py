@@ -190,6 +190,9 @@ class MediaScraperBot(commands.Bot):
         )
         # Strong reference set: mencegah background task di-GC sebelum selesai
         self._active_tasks: set = set()
+        # Single sequential task queue untuk mencegah task scraping tumpang tindih
+        self._job_queue: asyncio.Queue = asyncio.Queue()
+        self._worker_task: Optional[asyncio.Task] = None
         # Channel object di-resolve saat on_ready
         self._target_channel: Any = None
 
@@ -250,20 +253,23 @@ class MediaScraperBot(commands.Bot):
                     clean_username, detected_platform, channel.id, last_scraped_id=""
                 )
 
+                q_size = self._job_queue.qsize() + 1
+                status_text = (
+                    "Langsung diproses sekarang."
+                    if q_size == 1 and not self.queue.is_busy
+                    else f"Masuk antrean urutan ke-#{q_size} (diproses berurutan, tidak numpuk)."
+                )
+
                 await safe_reply(
                     interaction,
                     f"✅ Berhasil mendaftarkan **@{clean_username}** ({detected_platform}) ke channel {channel.mention}.\n"
-                    f"⏳ Pemrosesan seluruh postingan historis sedang berjalan di background.",
+                    f"⏳ {status_text}",
                     fallback_channel=channel
                 )
 
-                task = asyncio.create_task(
-                    self._run_initial_historical_scrape(
-                        clean_username, detected_platform, profile_url, channel.id
-                    )
+                await self._job_queue.put(
+                    (clean_username, detected_platform, profile_url, channel.id)
                 )
-                self._active_tasks.add(task)
-                task.add_done_callback(self._on_task_done)
             except Exception as e:
                 logger.error(
                     f"[❌ ERROR  ] Gagal memproses registrasi /add: {e}", exc_info=True
@@ -300,20 +306,23 @@ class MediaScraperBot(commands.Bot):
                     clean_username, "instagram", channel.id, last_scraped_id=""
                 )
 
+                q_size = self._job_queue.qsize() + 1
+                status_text = (
+                    "Langsung diproses sekarang."
+                    if q_size == 1 and not self.queue.is_busy
+                    else f"Masuk antrean urutan ke-#{q_size} (diproses berurutan, tidak numpuk)."
+                )
+
                 await safe_reply(
                     interaction,
                     f"✅ Berhasil mendaftarkan Instagram **@{clean_username}** ke channel {channel.mention}.\n"
-                    f"⏳ Pemrosesan seluruh postingan historis sedang berjalan di background.",
+                    f"⏳ {status_text}",
                     fallback_channel=channel
                 )
 
-                task = asyncio.create_task(
-                    self._run_initial_historical_scrape(
-                        clean_username, "instagram", profile_url, channel.id
-                    )
+                await self._job_queue.put(
+                    (clean_username, "instagram", profile_url, channel.id)
                 )
-                self._active_tasks.add(task)
-                task.add_done_callback(self._on_task_done)
             except Exception as e:
                 logger.error(
                     f"[❌ ERROR  ] Gagal memproses registrasi /insta: {e}",
@@ -351,20 +360,23 @@ class MediaScraperBot(commands.Bot):
                     clean_username, "tiktok", channel.id, last_scraped_id=""
                 )
 
+                q_size = self._job_queue.qsize() + 1
+                status_text = (
+                    "Langsung diproses sekarang."
+                    if q_size == 1 and not self.queue.is_busy
+                    else f"Masuk antrean urutan ke-#{q_size} (diproses berurutan, tidak numpuk)."
+                )
+
                 await safe_reply(
                     interaction,
                     f"✅ Berhasil mendaftarkan TikTok **@{clean_username}** ke channel {channel.mention}.\n"
-                    f"⏳ Pemrosesan seluruh postingan historis sedang berjalan di background.",
+                    f"⏳ {status_text}",
                     fallback_channel=channel
                 )
 
-                task = asyncio.create_task(
-                    self._run_initial_historical_scrape(
-                        clean_username, "tiktok", profile_url, channel.id
-                    )
+                await self._job_queue.put(
+                    (clean_username, "tiktok", profile_url, channel.id)
                 )
-                self._active_tasks.add(task)
-                task.add_done_callback(self._on_task_done)
             except Exception as e:
                 logger.error(
                     f"[❌ ERROR  ] Gagal memproses registrasi /tiktok: {e}",
@@ -402,20 +414,23 @@ class MediaScraperBot(commands.Bot):
                     clean_username, "twitter", channel.id, last_scraped_id=""
                 )
 
+                q_size = self._job_queue.qsize() + 1
+                status_text = (
+                    "Langsung diproses sekarang."
+                    if q_size == 1 and not self.queue.is_busy
+                    else f"Masuk antrean urutan ke-#{q_size} (diproses berurutan, tidak numpuk)."
+                )
+
                 await safe_reply(
                     interaction,
                     f"✅ Berhasil mendaftarkan Twitter/X **@{clean_username}** ke channel {channel.mention}.\n"
-                    f"⏳ Pemrosesan seluruh postingan historis sedang berjalan di background.",
+                    f"⏳ {status_text}",
                     fallback_channel=channel
                 )
 
-                task = asyncio.create_task(
-                    self._run_initial_historical_scrape(
-                        clean_username, "twitter", profile_url, channel.id
-                    )
+                await self._job_queue.put(
+                    (clean_username, "twitter", profile_url, channel.id)
                 )
-                self._active_tasks.add(task)
-                task.add_done_callback(self._on_task_done)
             except Exception as e:
                 logger.error(
                     f"[❌ ERROR  ] Gagal memproses registrasi /x: {e}", exc_info=True
@@ -491,6 +506,14 @@ class MediaScraperBot(commands.Bot):
                 # 2. Wipes directories safely (Docker volume safe)
                 await asyncio.to_thread(clear_directory_contents, TEMP_DIR)
                 await asyncio.to_thread(clear_directory_contents, SESSION_DIR)
+
+                # Kosongkan antrean job yang tertunda
+                while not self._job_queue.empty():
+                    try:
+                        self._job_queue.get_nowait()
+                        self._job_queue.task_done()
+                    except (asyncio.QueueEmpty, ValueError):
+                        break
 
                 self.queue.release()
 
@@ -644,17 +667,31 @@ class MediaScraperBot(commands.Bot):
             await interaction.response.send_message("▶️ Patrol loop di-resume.")
             logger.info("[🤖 SATPAM] Patrol loop di-resume oleh admin.")
 
-    def _on_task_done(self, task: asyncio.Task) -> None:
-        """Discard completed task and log any unhandled exception."""
-        self._active_tasks.discard(task)
-        if not task.cancelled() and task.exception():
-            logger.error(
-                f"[❌ ERROR  ] Background task failed with exception: {task.exception()}",
-                exc_info=task.exception(),
-            )
+    async def _job_worker(self) -> None:
+        """Worker background tunggal untuk memproses antrean scraping 1 per 1 secara berurutan."""
+        logger.info("[⚙️ SYSTEM] Background Job Worker aktif (Mode Serial FIFO: 1 task pada satu waktu).")
+        while True:
+            try:
+                job = await self._job_queue.get()
+                username, platform, profile_url, channel_id = job
+                logger.info(
+                    f"[📦 QUEUE ] Mengambil task dari antrean: @{username} ({platform}) — "
+                    f"Sisa antrean: {self._job_queue.qsize()}"
+                )
+                await self._run_initial_historical_scrape(
+                    username, platform, profile_url, channel_id
+                )
+                self._job_queue.task_done()
+                logger.info(f"[📦 QUEUE ] Selesai memproses task: @{username} ({platform}).")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[❌ ERROR  ] Kesalahan fatal di Job Worker: {e}", exc_info=True)
 
     async def close(self) -> None:
         """Cleanup resources sebelum bot disconnect."""
+        if self._worker_task:
+            self._worker_task.cancel()
         self.patrol_loop.cancel()
         await self.db.close()
         try:
@@ -685,6 +722,10 @@ class MediaScraperBot(commands.Bot):
             logger.info(f"[⚙️ SYSTEM] Berhasil sync {len(synced)} slash commands secara global ke Discord.")
         except Exception as e:
             logger.error(f"[❌ ERROR  ] Gagal sync slash commands di on_ready: {e}")
+
+        # Start single sequential background worker
+        if not self._worker_task or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._job_worker())
 
         # Start patrol background loop
         if not self.patrol_loop.is_running():
@@ -857,8 +898,8 @@ class MediaScraperBot(commands.Bot):
             logger.info("[🤖 SATPAM] Patrol di-pause. Skip siklus ini.")
             return
 
-        if self.is_scanning:
-            logger.info("[🤖 SATPAM] Scan lain sedang berjalan. Skip siklus ini.")
+        if self.is_scanning or self.queue.is_busy or not self._job_queue.empty():
+            logger.info("[🤖 SATPAM] Sedang ada task scraping/antrean aktif. Menunda siklus patrol agar tidak bertabrakan.")
             return
 
         # Hanya ambil akun yang siap dipatroli (historical dump selesai)
@@ -868,12 +909,8 @@ class MediaScraperBot(commands.Bot):
             return
 
         logger.info(f"[🤖 SATPAM] Memulai patroli {len(accounts)} akun...")
-        # FIX: wrap is_scanning mutation inside scan_lock.
-        # Without the lock, two concurrent callers (patrol_loop + /force) can both pass
-        # the `if self.is_scanning` guard above before either sets is_scanning=True,
-        # resulting in double scan execution.
         async with self.scan_lock:
-            if self.is_scanning:
+            if self.is_scanning or self.queue.is_busy or not self._job_queue.empty():
                 logger.info("[🤖 SATPAM] Scan baru terdeteksi saat acquire lock. Skip.")
                 return
             self.is_scanning = True

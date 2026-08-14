@@ -130,72 +130,125 @@ class TikTokScraper(BaseScraper):
             logger.info(f"Membuka halaman profil TikTok: {canonical_url}")
             # domcontentloaded: lebih cepat dari networkidle — TikTok punya infinite
             # background XHR polling yang membuat networkidle tidak pernah tercapai
-            # sehingga hang selama 60 detik penuh sebelum timeout.
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=60000)
 
-            # Tunggu elemen feed TikTok yang stabil muncul sebelum mulai scroll.
-            logger.info("Menunggu feed TikTok siap...")
-            try:
-                await page.wait_for_selector('a[href*="/video/"], a[href*="/photo/"]', timeout=15000)
-            except Exception:
-                logger.warning("Selector feed TikTok tidak muncul dalam batas timeout; lanjutkan dengan fallback.")
+            # 1. First Pass: Coba ekstrak postingan langsung dari data rehydration JSON (__UNIVERSAL_DATA_FOR_REHYDRATION__ / SIGI_STATE)
+            # Ini sangat cepat dan kebal terhadap perubahan selector DOM / virtual scrolling
+            logger.info("Membaca data rehydration JSON TikTok dari halaman profil...")
+            rehydration_urls = await page.evaluate(r"""
+                (targetUsername) => {
+                    const u = targetUsername.toLowerCase().replace('@', '');
+                    const foundUrls = new Set();
+                    
+                    const scriptEl = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__') || document.getElementById('SIGI_STATE');
+                    if (scriptEl && scriptEl.textContent) {
+                        try {
+                            const data = JSON.parse(scriptEl.textContent);
+                            
+                            // 1. Cek defaultScope user-detail itemList
+                            const defaultScope = data.__DEFAULT_SCOPE__ || {};
+                            const userDetail = defaultScope['webapp.user-detail'] || defaultScope['webapp.userDetail'] || {};
+                            const itemList = userDetail.itemList || [];
+                            for (const id of itemList) {
+                                if (id) foundUrls.add(`https://www.tiktok.com/@${u}/video/${id}`);
+                            }
+                            
+                            // 2. Cek ItemModule (SIGI_STATE / legacy)
+                            const itemModule = data.ItemModule || {};
+                            for (const [id, item] of Object.entries(itemModule)) {
+                                if (id) foundUrls.add(`https://www.tiktok.com/@${u}/video/${id}`);
+                            }
+                            
+                            // 3. Fallback regex search untuk post ID 19-digit jika struktur JSON nested
+                            const text = scriptEl.textContent;
+                            const matches = text.match(/"id"\s*:\s*"(\d{15,22})"/g);
+                            if (matches) {
+                                for (const m of matches) {
+                                    const idMatch = m.match(/\d{15,22}/);
+                                    if (idMatch) {
+                                        foundUrls.add(`https://www.tiktok.com/@${u}/video/${idMatch[0]}`);
+                                    }
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                    return Array.from(foundUrls);
+                }
+            """, username)
 
-            # 3. PERBAIKAN SCROLL: Menggunakan deteksi tinggi halaman + ekstraksi real-time (DOM virtualization bypass)
-            logger.info("Memulai proses scrolling dan pencatatan feed TikTok...")
             collected_urls = []
             seen_urls = set()
+
+            for r_url in rehydration_urls:
+                if r_url not in seen_urls:
+                    collected_urls.append(r_url)
+                    seen_urls.add(r_url)
+
+            if rehydration_urls:
+                logger.info(f"Rehydration JSON TikTok: {len(rehydration_urls)} postingan terdeteksi langsung dari script.")
+
+            # Tunggu elemen feed TikTok muncul (toleransi jika sudah ada dari rehydration)
+            logger.info("Menunggu feed DOM TikTok siap...")
+            try:
+                await page.wait_for_selector('a[href*="/video/"], a[href*="/photo/"], [data-e2e="user-post-item"]', timeout=8000)
+            except Exception:
+                logger.debug("Selector feed DOM TikTok timeout; lanjut dengan scrolling.")
+
+            # 2. Second Pass: Scrolling DOM & ekstraksi link postingan
+            logger.info("Memulai proses scrolling dan pencatatan feed DOM TikTok...")
             last_height = await page.evaluate("document.body.scrollHeight")
             no_new_scroll_matches = 0
 
-            while no_new_scroll_matches < 5:  # Allow 5 stable scroll breathers before exiting
-                # 1. Ambil snapshot URL terarah dari browser context
+            while no_new_scroll_matches < 5:
+                # Tutup dialog modal / cookie banner jika muncul
+                await page.evaluate("""() => {
+                    const closeBtns = document.querySelectorAll('[data-e2e="modal-close-inner-button"], [aria-label="Close"], button[aria-label="Close"], .tiktok-modal__close');
+                    closeBtns.forEach(b => { try { b.click(); } catch(e){} });
+                }""")
+
+                # Ambil snapshot URL dari DOM dengan selector yang lebih toleran
                 urls_snapshot = await page.evaluate("""
                     (targetUsername) => {
-                        // Scope exclusively to the main profile timeline feed grid container
-                        const gridContainer = document.querySelector('[data-testid="user-post-item-list"]') || document;
-                        const links = gridContainer.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
+                        const u = targetUsername.toLowerCase().replace('@', '');
+                        const links = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"], [data-e2e="user-post-item"] a, [data-e2e="user-post-item-desc"] a');
+                        const results = [];
                         
-                        return Array.from(links)
-                            .map(a => a.href)
-                            .filter(href => {
-                                const lowerHref = href.toLowerCase();
-                                const u = targetUsername.toLowerCase();
-                                return lowerHref.includes('/@' + u + '/video/') || 
-                                       lowerHref.includes('/' + u + '/video/') ||
-                                       lowerHref.includes('/@' + u + '/photo/') ||
-                                       lowerHref.includes('/' + u + '/photo/');
-                            });
+                        for (const a of links) {
+                            let href = a.href || a.getAttribute('href') || '';
+                            if (!href) continue;
+                            if (href.startsWith('/')) {
+                                href = 'https://www.tiktok.com' + href;
+                            }
+                            if (href.includes('/video/') || href.includes('/photo/')) {
+                                results.push(href);
+                            }
+                        }
+                        return results;
                     }
                 """, username)
 
                 new_added = 0
                 for href in urls_snapshot:
                     clean_url = href.split("?")[0]
-                    # Fix TikTok relative URLs
                     if clean_url.startswith('/'):
                         clean_url = f"https://www.tiktok.com{clean_url}"
-                        
-                    # NOTE: do NOT rewrite /photo/ → /video/ here.
-                    # download_post uses "/photo/" in the URL to trigger carousel-first
-                    # fallback. Rewriting it would route photo posts to yt-dlp video
-                    # extraction first, causing the 15s rehydration timeout on every slide.
 
-                    # Cek duplikasi O(1) menggunakan set
                     if clean_url not in seen_urls:
                         collected_urls.append(clean_url)
                         seen_urls.add(clean_url)
                         new_added += 1
 
-                # 2. Scroll ke bawah untuk memancing data baru
+                # Scroll ke bawah
+                await page.evaluate("window.scrollBy(0, 1600)")
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(3.5)
+                await asyncio.sleep(3.0)
 
                 new_height = await page.evaluate("document.body.scrollHeight")
                 if new_height == last_height and new_added == 0:
                     no_new_scroll_matches += 1
                 else:
                     no_new_scroll_matches = 0
-                    
+
                 last_height = new_height
 
             logger.info(
