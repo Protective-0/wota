@@ -128,8 +128,6 @@ class TikTokScraper(BaseScraper):
 
         try:
             logger.info(f"Membuka halaman profil TikTok: {canonical_url}")
-            # domcontentloaded: lebih cepat dari networkidle — TikTok punya infinite
-            # background XHR polling yang membuat networkidle tidak pernah tercapai
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(2.5)
 
@@ -141,58 +139,76 @@ class TikTokScraper(BaseScraper):
             except Exception as e:
                 logger.warning(f"Refresh halaman TikTok timeout/gagal: {e} — lanjut proses...")
 
-            # 1. First Pass: Coba ekstrak postingan dari data rehydration JSON
+            # Proteksi: Pastikan browser tidak dialihkan ke akun login sendiri (@zefriofaizin)
+            if username.lower() not in page.url.lower():
+                logger.warning(
+                    f"Browser dialihkan ke '{page.url}' (bukan @{username}), menavigasi paksa ke {canonical_url}..."
+                )
+                await page.goto(canonical_url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2.0)
+
+            # 1. First Pass: Coba ekstrak postingan dari data rehydration JSON + Browser API Fetch via secUid
             logger.info("Membaca data rehydration JSON TikTok dari halaman profil...")
             rehydration_urls = await page.evaluate(r"""
-                (targetUsername) => {
+                async (targetUsername) => {
                     const u = targetUsername.toLowerCase().replace('@', '');
                     const foundUrls = new Set();
+                    let secUid = null;
                     
                     const scriptEl = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__') || document.getElementById('SIGI_STATE');
-                    if (!scriptEl || !scriptEl.textContent) return [];
+                    if (scriptEl && scriptEl.textContent) {
+                        try {
+                            const data = JSON.parse(scriptEl.textContent);
+                            const defaultScope = data.__DEFAULT_SCOPE__ || {};
+                            const userDetail = defaultScope['webapp.user-detail'] || defaultScope['webapp.userDetail'] || {};
+                            const userInfo = userDetail.userInfo || {};
+                            const user = userInfo.user || {};
+                            secUid = user.secUid || user.sec_uid || null;
+                            
+                            // Cara 1: userPost.itemList
+                            const userPost = userDetail.userPost || {};
+                            const postItems = userPost.itemList || userDetail.itemList || [];
+                            for (const item of postItems) {
+                                if (!item) continue;
+                                const id = typeof item === 'string' ? item : (item.id || item.itemId || '');
+                                if (!id) continue;
+                                const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
+                                const type = isPhoto ? 'photo' : 'video';
+                                foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                            }
+                            
+                            // Cara 2: ItemModule / ItemList
+                            const itemModule = data.ItemModule || {};
+                            for (const [id, item] of Object.entries(itemModule)) {
+                                if (typeof item !== 'object') continue;
+                                const author = (item.author || item.authorName || '').toLowerCase().replace('@', '');
+                                if (author && author !== u) continue;
+                                const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
+                                const type = isPhoto ? 'photo' : 'video';
+                                foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                            }
+                        } catch (e) {}
+                    }
                     
-                    try {
-                        const data = JSON.parse(scriptEl.textContent);
-                        const defaultScope = data.__DEFAULT_SCOPE__ || {};
-                        
-                        // Cara 1: webapp.user-detail → userPost.itemList (array of objects)
-                        const userDetail = defaultScope['webapp.user-detail'] || defaultScope['webapp.userDetail'] || {};
-                        const userPost = userDetail.userPost || {};
-                        const postItems = userPost.itemList || userDetail.itemList || [];
-                        
-                        for (const item of postItems) {
-                            if (!item) continue;
-                            const id = typeof item === 'string' ? item : (item.id || item.itemId || '');
-                            if (!id) continue;
-                            // Deteksi tipe: photo slide jika ada imagePost / imageList
-                            const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
-                            const type = isPhoto ? 'photo' : 'video';
-                            foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                        }
-                        
-                        // Cara 2: ItemModule / ItemList (SIGI_STATE dan format lama)
-                        const itemModule = data.ItemModule || {};
-                        for (const [id, item] of Object.entries(itemModule)) {
-                            if (typeof item !== 'object') continue;
-                            const author = (item.author || item.authorName || '').toLowerCase().replace('@', '');
-                            if (author && author !== u) continue;  // skip jika jelas bukan milik target
-                            const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
-                            const type = isPhoto ? 'photo' : 'video';
-                            foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                        }
-                        
-                        // Cara 3: Search dalam ItemList array (beberapa versi API)
-                        const itemListArr = data.ItemList || {};
-                        for (const section of Object.values(itemListArr)) {
-                            if (!section || !Array.isArray(section.list)) continue;
-                            for (const id of section.list) {
-                                if (id && typeof id === 'string') {
-                                    foundUrls.add(`https://www.tiktok.com/@${u}/video/${id}`);
+                    // Cara 3: Browser Internal API Fetch menggunakan secUid
+                    if (secUid) {
+                        try {
+                            const apiRes = await window.fetch(`https://www.tiktok.com/api/post/item_list/?aid=1988&secUid=${secUid}&count=35&cursor=0`, {
+                                headers: { 'Accept': 'application/json, text/plain, */*' }
+                            });
+                            const apiJson = await apiRes.json();
+                            const items = apiJson.itemList || [];
+                            for (const item of items) {
+                                const id = item.id;
+                                if (id) {
+                                    const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
+                                    const type = isPhoto ? 'photo' : 'video';
+                                    foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
                                 }
                             }
-                        }
-                        
-                    } catch (e) {}
+                        } catch (e) {}
+                    }
+                    
                     return Array.from(foundUrls);
                 }
             """, username)
@@ -206,14 +222,14 @@ class TikTokScraper(BaseScraper):
                     seen_urls.add(r_url)
 
             if rehydration_urls:
-                logger.info(f"Rehydration JSON TikTok: {len(rehydration_urls)} postingan terdeteksi langsung dari script.")
+                logger.info(f"Rehydration/API TikTok: {len(rehydration_urls)} postingan terdeteksi langsung dari script/API.")
 
             # Tunggu elemen feed TikTok muncul (toleransi jika sudah ada dari rehydration)
             logger.info("Menunggu feed DOM TikTok siap...")
             try:
-                # Pastikan tab Videos aktif (bukan tab Repost / Favorit)
+                # Pastikan tab Videos aktif (JANGAN pakai role=tab:first-child karena mengenai sidebar profile sendiri)
                 await page.evaluate("""() => {
-                    const vTab = document.querySelector('[data-e2e="videos-tab"], [data-e2e="user-post-tab"], [role="tab"]:first-child');
+                    const vTab = document.querySelector('[data-e2e="videos-tab"], [data-e2e="user-post-tab"]');
                     if (vTab) vTab.click();
                 }""")
                 await page.wait_for_selector('a[href*="/video/"], a[href*="/photo/"], [data-e2e="user-post-item"]', timeout=8000)
