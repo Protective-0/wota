@@ -1598,8 +1598,28 @@ class MediaScraperBot(commands.Bot):
                 session_dir=SESSION_DIR,
                 headed=BROWSER_HEADED,
             )
-        else:
-            raise ValueError(f"Platform tidak dikenali: {platform}")
+    async def close(self) -> None:
+        """Graceful shutdown hook untuk membersihkan worker task, browser, dan DB."""
+        logger.info("[⚙️ SYSTEM] Menutup bot dan membersihkan seluruh background worker & subprocess...")
+        if self._worker_task and not self._worker_task.done():
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+
+        if hasattr(self.downloader, "_browser") and self.downloader._browser:
+            try:
+                await self.downloader._browser.close()
+            except Exception:
+                pass
+        if hasattr(self.downloader, "_playwright") and self.downloader._playwright:
+            try:
+                await self.downloader._playwright.stop()
+            except Exception:
+                pass
+
+        await super().close()
 
 
 # ──────────────────────────────────────────────
