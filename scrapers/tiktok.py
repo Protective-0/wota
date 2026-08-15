@@ -147,77 +147,63 @@ class TikTokScraper(BaseScraper):
                 await page.goto(canonical_url, wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(2.0)
 
-            # 1. First Pass: Coba ekstrak postingan dari data rehydration JSON + Browser API Fetch via secUid
+            # 1. First Pass: Coba ekstrak postingan dari data rehydration JSON
             logger.info("Membaca data rehydration JSON TikTok dari halaman profil...")
-            rehydration_data = await page.evaluate(r"""
-                async (targetUsername) => {
-                    const u = targetUsername.toLowerCase().replace('@', '');
-                    const foundUrls = new Set();
-                    let secUid = null;
-                    let videoCount = 0;
-                    
-                    const scriptEl = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__') || document.getElementById('SIGI_STATE');
-                    if (scriptEl && scriptEl.textContent) {
-                        try {
-                            const data = JSON.parse(scriptEl.textContent);
-                            const defaultScope = data.__DEFAULT_SCOPE__ || {};
-                            const userDetail = defaultScope['webapp.user-detail'] || defaultScope['webapp.userDetail'] || {};
-                            const userInfo = userDetail.userInfo || {};
-                            const user = userInfo.user || {};
-                            const stats = userInfo.stats || {};
-                            secUid = user.secUid || user.sec_uid || null;
-                            videoCount = stats.videoCount || stats.video_count || 0;
-                            
-                            // Cara 1: userPost.itemList
-                            const userPost = userDetail.userPost || {};
-                            const postItems = userPost.itemList || userDetail.itemList || [];
-                            for (const item of postItems) {
-                                if (!item) continue;
-                                const id = typeof item === 'string' ? item : (item.id || item.itemId || '');
-                                if (!id) continue;
-                                const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
-                                const type = isPhoto ? 'photo' : 'video';
-                                foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                            }
-                            
-                            // Cara 2: ItemModule / ItemList
-                            const itemModule = data.ItemModule || {};
-                            for (const [id, item] of Object.entries(itemModule)) {
-                                if (typeof item !== 'object') continue;
-                                const author = (item.author || item.authorName || '').toLowerCase().replace('@', '');
-                                if (author && author !== u) continue;
-                                const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
-                                const type = isPhoto ? 'photo' : 'video';
-                                foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                            }
-                        } catch (e) {}
-                    }
-                    
-                    // Cara 3: Browser Internal API Fetch menggunakan secUid
-                    if (secUid) {
-                        try {
-                            const apiRes = await window.fetch(`https://www.tiktok.com/api/post/item_list/?aid=1988&secUid=${secUid}&count=35&cursor=0`, {
-                                headers: { 'Accept': 'application/json, text/plain, */*' }
-                            });
-                            const apiJson = await apiRes.json();
-                            const items = apiJson.itemList || [];
-                            for (const item of items) {
-                                const id = item.id;
-                                if (id) {
+            rehydration_data = {}
+            try:
+                rehydration_data = await page.evaluate(r"""
+                    (targetUsername) => {
+                        const u = targetUsername.toLowerCase().replace('@', '');
+                        const foundUrls = new Set();
+                        let videoCount = 0;
+                        
+                        const scriptEl = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__') || document.getElementById('SIGI_STATE');
+                        if (scriptEl && scriptEl.textContent) {
+                            try {
+                                const data = JSON.parse(scriptEl.textContent);
+                                const defaultScope = data.__DEFAULT_SCOPE__ || {};
+                                const userDetail = defaultScope['webapp.user-detail'] || defaultScope['webapp.userDetail'] || {};
+                                const userInfo = userDetail.userInfo || {};
+                                const stats = userInfo.stats || {};
+                                videoCount = stats.videoCount || stats.video_count || 0;
+                                
+                                // Cara 1: userPost.itemList
+                                const userPost = userDetail.userPost || {};
+                                const postItems = userPost.itemList || userDetail.itemList || [];
+                                for (const item of postItems) {
+                                    if (!item) continue;
+                                    const id = typeof item === 'string' ? item : (item.id || item.itemId || '');
+                                    if (!id) continue;
                                     const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
                                     const type = isPhoto ? 'photo' : 'video';
                                     foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
                                 }
-                            }
-                        } catch (e) {}
+                                
+                                // Cara 2: ItemModule / ItemList
+                                const itemModule = data.ItemModule || {};
+                                for (const [id, item] of Object.entries(itemModule)) {
+                                    if (typeof item !== 'object') continue;
+                                    const author = (item.author || item.authorName || '').toLowerCase().replace('@', '');
+                                    if (author && author !== u) continue;
+                                    const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
+                                    const type = isPhoto ? 'photo' : 'video';
+                                    foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                                }
+                            } catch (e) {}
+                        }
+                        
+                        return {
+                            urls: Array.from(foundUrls),
+                            videoCount: videoCount
+                        };
                     }
-                    
-                    return {
-                        urls: Array.from(foundUrls),
-                        videoCount: videoCount
-                    };
-                }
-            """, username)
+                """, username)
+            except Exception as e:
+                logger.warning(f"Gagal membaca rehydration data: {e}")
+                rehydration_data = {}
+
+            if not isinstance(rehydration_data, dict):
+                rehydration_data = {}
 
             collected_urls = []
             seen_urls = set()
@@ -233,7 +219,7 @@ class TikTokScraper(BaseScraper):
                     seen_urls.add(r_url)
 
             if rehydration_urls:
-                logger.info(f"Rehydration/API TikTok: {len(rehydration_urls)} postingan terdeteksi langsung dari script/API.")
+                logger.info(f"Rehydration/API TikTok: {len(rehydration_urls)} postingan terdeteksi langsung dari script.")
 
             # Tunggu elemen feed TikTok muncul (toleransi jika sudah ada dari rehydration)
             logger.info("Menunggu feed DOM TikTok siap...")
@@ -247,10 +233,10 @@ class TikTokScraper(BaseScraper):
             except Exception:
                 logger.debug("Selector feed DOM TikTok timeout; lanjut dengan scrolling.")
 
-            # 2. Second Pass: Scrolling DOM & ekstraksi link postingan (bounded loop max 8 scroll)
+            # 2. Second Pass: Scrolling DOM & ekstraksi link postingan (bounded loop max 6 scroll)
             logger.info("Memulai proses scrolling dan pencatatan feed DOM TikTok...")
             consecutive_empty_scrolls = 0
-            max_scroll_attempts = 8  # Cukup 8x scroll (maksimal ~20 detik)
+            max_scroll_attempts = 6
 
             for scroll_idx in range(1, max_scroll_attempts + 1):
                 # Tutup dialog modal / cookie banner jika muncul
@@ -259,34 +245,31 @@ class TikTokScraper(BaseScraper):
                     closeBtns.forEach(b => { try { b.click(); } catch(e){} });
                 }""")
 
-                # Ambil snapshot URL HANYA dari container grid resmi postingan user
+                # Ambil snapshot URL dari card grid postingan profil
                 urls_snapshot = await page.evaluate("""
                     (targetUsername) => {
                         const u = targetUsername.toLowerCase().replace('@', '');
                         const results = [];
                         const seenIds = new Set();
                         
-                        // 1. Target HANYA elemen di dalam grid video resmi profil user (bukan rekomendasi/sidebar)
-                        const grid = document.querySelector('[data-e2e="user-post-item-list"]') || 
-                                     document.querySelector('[data-testid="user-post-item-list"]');
-                        
-                        if (grid) {
-                            const postCards = grid.querySelectorAll('[data-e2e="user-post-item"], [data-e2e="user-post-item-desc"]');
-                            for (const card of postCards) {
-                                const link = card.tagName === 'A' ? card : card.querySelector('a[href*="/video/"], a[href*="/photo/"]');
-                                if (link) {
-                                    const href = link.getAttribute('href') || link.href || '';
-                                    const match = href.match(/\\/(video|photo)\\/(\\d{15,22})/);
-                                    if (match && !seenIds.has(match[2])) {
-                                        seenIds.add(match[2]);
-                                        const type = match[1];
-                                        const id = match[2];
-                                        results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                                    }
+                        // 1. Ekstrak dari seluruh card container khusus post di grid
+                        const postCards = document.querySelectorAll('[data-e2e="user-post-item"], [data-e2e="user-post-item-desc"], [data-e2e="user-post-item-list"] a, div[class*="DivItemContainer"]');
+                        for (const card of postCards) {
+                            const link = card.tagName === 'A' ? card : card.querySelector('a[href*="/video/"], a[href*="/photo/"]');
+                            if (link) {
+                                const href = link.getAttribute('href') || link.href || '';
+                                const match = href.match(/\\/(video|photo)\\/(\\d{15,22})/);
+                                if (match && !seenIds.has(match[2])) {
+                                    seenIds.add(match[2]);
+                                    const type = match[1];
+                                    const id = match[2];
+                                    results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
                                 }
                             }
-                        } else {
-                            // Fallback jika container list tidak bernama data-e2e: cari card yang strictly punya author @username
+                        }
+                        
+                        // 2. Tambahan fallback: cek semua link <a> dengan format @username target
+                        if (results.length === 0) {
                             const allLinks = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
                             for (const a of allLinks) {
                                 const href = a.getAttribute('href') || a.href || '';
@@ -325,19 +308,24 @@ class TikTokScraper(BaseScraper):
                     consecutive_empty_scrolls += 1
                     logger.debug(f"Scroll pass {scroll_idx}/{max_scroll_attempts}: tidak ada postingan baru ({consecutive_empty_scrolls}/3)")
 
-                # Jika sudah mencapai target videoCount akun, berhenti scroll seketika
+                # Jika sudah mencapai target videoCount yang tertera di profil, potong dan berhenti seketika
                 if expected_video_count > 0 and len(collected_urls) >= expected_video_count:
+                    collected_urls = collected_urls[:expected_video_count]
                     logger.info(f"Semua {len(collected_urls)}/{expected_video_count} postingan akun @{username} sudah lengkap terkumpul.")
                     break
 
                 # Jika 3x scroll berturut-turut tidak ada post baru, akhiri loop
-                if consecutive_empty_scrolls >= 3:
+                if consecutive_empty_scrolls >= 2:
                     logger.info("Feed TikTok sudah mencapai akhir / tidak ada postingan baru.")
                     break
 
                 # Scroll ke bawah secara terukur
                 await page.evaluate("window.scrollBy(0, 1200)")
                 await asyncio.sleep(2.0)
+
+            # Safety cap jika ada videoCount terdeteksi
+            if expected_video_count > 0 and len(collected_urls) > expected_video_count:
+                collected_urls = collected_urls[:expected_video_count]
 
             logger.info(
                 f"Ditemukan total {len(collected_urls)} postingan URL dari profil TikTok @{username}"
