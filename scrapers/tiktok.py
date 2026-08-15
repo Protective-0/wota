@@ -131,6 +131,15 @@ class TikTokScraper(BaseScraper):
             # domcontentloaded: lebih cepat dari networkidle — TikTok punya infinite
             # background XHR polling yang membuat networkidle tidak pernah tercapai
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(2.5)
+
+            # Auto-reload halaman untuk bypass captcha interstitial dan inisialisasi sesi penuh
+            logger.info("Melakukan auto-refresh halaman TikTok untuk bypass captcha & inisialisasi...")
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=60000)
+                await asyncio.sleep(2.0)
+            except Exception as e:
+                logger.warning(f"Refresh halaman TikTok timeout/gagal: {e} — lanjut proses...")
 
             # 1. First Pass: Coba ekstrak postingan dari data rehydration JSON
             logger.info("Membaca data rehydration JSON TikTok dari halaman profil...")
@@ -230,22 +239,38 @@ class TikTokScraper(BaseScraper):
                         const results = [];
                         const seenIds = new Set();
                         
-                        // Hanya ambil link yang BENAR-BENAR ada @username di dalam href (original post)
-                        const allLinks = document.querySelectorAll('a[href]');
-                        for (const a of allLinks) {
-                            const href = a.getAttribute('href') || a.href || '';
-                            // Hanya terima link yang berisi @username target secara eksplisit
-                            const lower = href.toLowerCase();
-                            const hasUsername = lower.includes('/@' + u + '/video/') || lower.includes('/@' + u + '/photo/');
-                            if (hasUsername) {
+                        // 1. Ekstrak dari card container khusus post user di grid
+                        const postCards = document.querySelectorAll('[data-e2e="user-post-item"], [data-e2e="user-post-item-desc"], [data-e2e="user-post-item-list"] a, div[class*="DivItemContainer"]');
+                        for (const card of postCards) {
+                            const link = card.tagName === 'A' ? card : card.querySelector('a[href*="/video/"], a[href*="/photo/"]');
+                            if (link) {
+                                const href = link.getAttribute('href') || link.href || '';
                                 const match = href.match(/\\/(video|photo)\\/(\\d{15,22})/);
                                 if (match && !seenIds.has(match[2])) {
                                     seenIds.add(match[2]);
-                                    const cleanHref = href.split('?')[0];
-                                    results.push(cleanHref.startsWith('http') ? cleanHref : 'https://www.tiktok.com' + cleanHref);
+                                    const type = match[1];
+                                    const id = match[2];
+                                    results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
                                 }
                             }
                         }
+                        
+                        // 2. Tambahan: cek semua link <a> yang memiliki @username target secara spesifik
+                        const allLinks = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
+                        for (const a of allLinks) {
+                            const href = a.getAttribute('href') || a.href || '';
+                            const lower = href.toLowerCase();
+                            if (lower.includes('/@' + u + '/video/') || lower.includes('/@' + u + '/photo/')) {
+                                const match = href.match(/\\/(video|photo)\\/(\\d{15,22})/);
+                                if (match && !seenIds.has(match[2])) {
+                                    seenIds.add(match[2]);
+                                    const type = match[1];
+                                    const id = match[2];
+                                    results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                                }
+                            }
+                        }
+                        
                         return results;
                     }
                 """, username)
