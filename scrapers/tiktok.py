@@ -220,12 +220,12 @@ class TikTokScraper(BaseScraper):
             except Exception:
                 logger.debug("Selector feed DOM TikTok timeout; lanjut dengan scrolling.")
 
-            # 2. Second Pass: Scrolling DOM & ekstraksi link postingan
+            # 2. Second Pass: Scrolling DOM & ekstraksi link postingan (bounded loop max 8 scroll)
             logger.info("Memulai proses scrolling dan pencatatan feed DOM TikTok...")
-            last_height = await page.evaluate("document.body.scrollHeight")
-            no_new_scroll_matches = 0
+            consecutive_empty_scrolls = 0
+            max_scroll_attempts = 8  # Cukup 8x scroll (maksimal ~20 detik)
 
-            while no_new_scroll_matches < 5:
+            for scroll_idx in range(1, max_scroll_attempts + 1):
                 # Tutup dialog modal / cookie banner jika muncul
                 await page.evaluate("""() => {
                     const closeBtns = document.querySelectorAll('[data-e2e="modal-close-inner-button"], [aria-label="Close"], button[aria-label="Close"], .tiktok-modal__close');
@@ -286,18 +286,21 @@ class TikTokScraper(BaseScraper):
                         seen_urls.add(clean_url)
                         new_added += 1
 
-                # Scroll ke bawah
-                await page.evaluate("window.scrollBy(0, 1600)")
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(3.0)
-
-                new_height = await page.evaluate("document.body.scrollHeight")
-                if new_height == last_height and new_added == 0:
-                    no_new_scroll_matches += 1
+                if new_added > 0:
+                    consecutive_empty_scrolls = 0
+                    logger.info(f"Scroll pass {scroll_idx}/{max_scroll_attempts}: +{new_added} postingan (total terkumpul: {len(collected_urls)})")
                 else:
-                    no_new_scroll_matches = 0
+                    consecutive_empty_scrolls += 1
+                    logger.debug(f"Scroll pass {scroll_idx}/{max_scroll_attempts}: tidak ada postingan baru ({consecutive_empty_scrolls}/3)")
 
-                last_height = new_height
+                # Jika 3x scroll berturut-turut tidak ada post baru, akhiri loop
+                if consecutive_empty_scrolls >= 3:
+                    logger.info("Feed TikTok sudah mencapai akhir / tidak ada postingan baru.")
+                    break
+
+                # Scroll ke bawah secara terukur
+                await page.evaluate("window.scrollBy(0, 1200)")
+                await asyncio.sleep(2.0)
 
             logger.info(
                 f"Ditemukan total {len(collected_urls)} postingan URL dari profil TikTok @{username}"
