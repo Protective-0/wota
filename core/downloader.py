@@ -342,23 +342,22 @@ class MediaDownloader:
                     logger.error(f"Semua extractor TikTok /photo/ habis untuk {post_url}")
         elif is_instagram_photo:
             # Bypass yt-dlp langsung ke gallery-dl secara async untuk Instagram photo (/p/) jika bukan video
-
             logger.info(f"Instagram photo post terdeteksi (/p/) — bypass yt-dlp, langsung ke gallery-dl...")
             gdl_files = await self._run_gallery_dl_async(post_url, cookies_file or "")
             if gdl_files:
                 return gdl_files, "", None
             logger.warning("gallery-dl tidak menghasilkan file untuk /p/, fallback ke yt-dlp...")
             try:
-                downloaded_files, real_caption, ytdl_timestamp = await loop.run_in_executor(
-                    None, self._run_ytdlp, post_url, ydl_opts
+                downloaded_files, real_caption, ytdl_timestamp = await self._run_ytdlp_async(
+                    post_url, post_id, cookies_file
                 )
             except Exception as e:
                 yt_error = str(e)
                 download_failed = True
         else:
             try:
-                downloaded_files, real_caption, ytdl_timestamp = await loop.run_in_executor(
-                    None, self._run_ytdlp, post_url, ydl_opts
+                downloaded_files, real_caption, ytdl_timestamp = await self._run_ytdlp_async(
+                    post_url, post_id, cookies_file
                 )
 
                 # NOTE: /photo/ URLs no longer reach this branch \u2014 is_tiktok_photo bypasses yt-dlp above.
@@ -1052,6 +1051,85 @@ class MediaDownloader:
         except Exception as he:
             logger.error(f"TikTok CDN httpx error: {he}")
             return None
+
+    async def _run_ytdlp_async(
+        self,
+        url: str,
+        post_id: str,
+        cookies_file: Optional[str] = None,
+        out_tmpl: Optional[str] = None,
+    ) -> tuple[list[Path], str, Optional[str]]:
+        """
+        Download media menggunakan yt-dlp via isolated async subprocess.
+        Kebal terhadap SIGSEGV / crash interpreter Python (code 139) karena berjalan
+        di proses terpisah yang diisolasi oleh OS.
+        """
+        out_template = out_tmpl or str(self.temp_dir / f"{post_id}_%(autonumber)s.%(ext)s")
+        cmd = [
+            "yt-dlp",
+            "--no-warnings",
+            "--no-overwrites",
+            "--format", "best[ext=mp4]/bestvideo+bestaudio/best",
+            "-o", out_template,
+            "--print", "after_move:title",
+            "--print", "after_move:description",
+            "--print", "after_move:upload_date",
+        ]
+
+        if cookies_file and Path(cookies_file).exists():
+            cmd += ["--cookies", cookies_file]
+
+        if "tiktok.com" in url:
+            cmd += [
+                "--add-header", f"User-Agent:{SHARED_USER_AGENT}",
+                "--add-header", "Referer:https://www.tiktok.com/",
+            ]
+        elif "x.com" in url or "twitter.com" in url:
+            cmd += [
+                "--add-header", f"User-Agent:{SHARED_USER_AGENT}",
+                "--add-header", "Referer:https://x.com/",
+            ]
+
+        cmd.append(url)
+
+        before = set(self.temp_dir.rglob("*.*"))
+        caption = ""
+        timestamp = None
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180.0)
+
+            if stdout:
+                lines = [line.strip() for line in stdout.decode(errors="ignore").splitlines() if line.strip()]
+                if lines:
+                    caption = lines[0]
+                    if len(lines) > 1 and lines[1] and lines[1] != "NA":
+                        caption = lines[1]
+                    for l in lines:
+                        if len(l) == 8 and l.isdigit():
+                            try:
+                                from datetime import datetime, timezone
+                                dt = datetime.strptime(l, "%Y%m%d").replace(tzinfo=timezone.utc)
+                                timestamp = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                                break
+                            except Exception:
+                                pass
+
+            after = set(self.temp_dir.rglob("*.*"))
+            new_files = [f for f in (after - before) if f.is_file() and f.name.startswith(post_id)]
+            return new_files, caption, timestamp
+
+        except asyncio.TimeoutError:
+            logger.error(f"yt-dlp subprocess timeout setelah 180s untuk {url}")
+            return [], "", None
+        except Exception as e:
+            logger.error(f"yt-dlp subprocess error untuk {url}: {e}")
+            return [], "", None
 
     def _run_ytdlp(self, url: str, opts: dict) -> tuple[list[Path], str, Optional[str]]:
         """
