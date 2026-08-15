@@ -709,11 +709,37 @@ class MediaDownloader:
                 locale="en-US"
             )
 
-            # Inject cookies jika ada
-            if tiktok_session_id:
-                await context.add_cookies([
-                    {"name": "sessionid", "value": tiktok_session_id.strip(), "domain": ".tiktok.com", "path": "/"}
-                ])
+            # Inject cookies lengkap jika ada (dari cookies_file Netscape atau .env)
+            cookies_to_add = []
+            if cookies_file and Path(cookies_file).exists():
+                try:
+                    async with aiofiles.open(cookies_file, "r", encoding="utf-8") as f:
+                        async for line in f:
+                            if line.startswith("#") or not line.strip():
+                                continue
+                            parts = line.strip().split("\t")
+                            if len(parts) >= 7:
+                                domain, _, path, secure, _, name, value = parts[:7]
+                                cookies_to_add.append({
+                                    "name": name.strip(),
+                                    "value": value.strip(),
+                                    "domain": domain.strip(),
+                                    "path": path.strip() or "/",
+                                    "secure": secure.upper() == "TRUE",
+                                })
+                except Exception as e:
+                    logger.warning(f"Gagal parse Netscape cookie untuk Playwright fallback: {e}")
+
+            if not cookies_to_add and tiktok_session_id:
+                cookies_to_add.append({
+                    "name": "sessionid",
+                    "value": tiktok_session_id.strip(),
+                    "domain": ".tiktok.com",
+                    "path": "/",
+                })
+
+            if cookies_to_add:
+                await context.add_cookies(cookies_to_add)
 
             page = await context.new_page()
             await page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
@@ -814,11 +840,37 @@ class MediaDownloader:
                 locale="en-US"
             )
 
-            # Inject cookies jika ada
-            if tiktok_session_id:
-                await context.add_cookies([
-                    {"name": "sessionid", "value": tiktok_session_id.strip(), "domain": ".tiktok.com", "path": "/"}
-                ])
+            # Inject cookies lengkap jika ada (dari cookies_file Netscape atau .env)
+            cookies_to_add = []
+            if cookies_file and Path(cookies_file).exists():
+                try:
+                    async with aiofiles.open(cookies_file, "r", encoding="utf-8") as f:
+                        async for line in f:
+                            if line.startswith("#") or not line.strip():
+                                continue
+                            parts = line.strip().split("\t")
+                            if len(parts) >= 7:
+                                domain, _, path, secure, _, name, value = parts[:7]
+                                cookies_to_add.append({
+                                    "name": name.strip(),
+                                    "value": value.strip(),
+                                    "domain": domain.strip(),
+                                    "path": path.strip() or "/",
+                                    "secure": secure.upper() == "TRUE",
+                                })
+                except Exception as e:
+                    logger.warning(f"Gagal parse Netscape cookie untuk Playwright fallback: {e}")
+
+            if not cookies_to_add and tiktok_session_id:
+                cookies_to_add.append({
+                    "name": "sessionid",
+                    "value": tiktok_session_id.strip(),
+                    "domain": ".tiktok.com",
+                    "path": "/",
+                })
+
+            if cookies_to_add:
+                await context.add_cookies(cookies_to_add)
 
             page = await context.new_page()
             

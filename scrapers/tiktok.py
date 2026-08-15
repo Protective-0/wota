@@ -242,24 +242,47 @@ class TikTokScraper(BaseScraper):
                     closeBtns.forEach(b => { try { b.click(); } catch(e){} });
                 }""")
 
-                # Ambil snapshot URL dari semua tag <a> video/photo di halaman
+                # Ambil snapshot URL dari card grid postingan profil (hanya post milik user target)
                 urls_snapshot = await page.evaluate("""
                     (targetUsername) => {
                         const u = targetUsername.toLowerCase().replace('@', '');
                         const results = [];
                         const seenIds = new Set();
                         
-                        // Cari semua tag <a> yang menuju ke video atau photo
-                        const links = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"], a[href*="/v/"]');
-                        for (const a of links) {
-                            const href = a.getAttribute('href') || a.href || '';
-                            const match = href.match(/\\/(video|photo|v)\\/(\\d{15,22})/);
-                            if (match) {
-                                const type = match[1] === 'photo' ? 'photo' : 'video';
-                                const id = match[2];
-                                if (!seenIds.has(id)) {
-                                    seenIds.add(id);
-                                    results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                        // 1. Ekstrak HANYA dari card container user post di grid
+                        const cards = document.querySelectorAll('[data-e2e="user-post-item"], [data-e2e="user-post-item-desc"]');
+                        for (const card of cards) {
+                            const link = card.tagName === 'A' ? card : card.querySelector('a[href*="/video/"], a[href*="/photo/"], a[href*="/v/"]');
+                            if (link) {
+                                const href = link.getAttribute('href') || link.href || '';
+                                const match = href.match(/\\/(video|photo|v)\\/(\\d{15,22})/);
+                                if (match) {
+                                    const type = match[1] === 'photo' ? 'photo' : 'video';
+                                    const id = match[2];
+                                    if (!seenIds.has(id)) {
+                                        seenIds.add(id);
+                                        results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // 2. Fallback: jika selector data-e2e tidak ada, cari link yang EKSPLISIT mengandung @username
+                        if (results.length === 0) {
+                            const allLinks = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
+                            for (const a of allLinks) {
+                                const href = a.getAttribute('href') || a.href || '';
+                                const lower = href.toLowerCase();
+                                if (lower.includes('/@' + u + '/video/') || lower.includes('/@' + u + '/photo/')) {
+                                    const match = href.match(/\\/(video|photo)\\/(\\d{15,22})/);
+                                    if (match) {
+                                        const type = match[1] === 'photo' ? 'photo' : 'video';
+                                        const id = match[2];
+                                        if (!seenIds.has(id)) {
+                                            seenIds.add(id);
+                                            results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                                        }
+                                    }
                                 }
                             }
                         }
