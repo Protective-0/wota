@@ -35,6 +35,7 @@ import aiofiles  # Async file I/O — tidak blokir event loop saat baca file bes
 import discord
 
 from .downloader import MediaDownloader
+from .utils import TAG_DISCORD, TAG_WARN, TAG_ERROR, TAG_SUCCESS, fmt_size
 
 logger = logging.getLogger(__name__)
 
@@ -107,16 +108,17 @@ class MediaSender:
             return False
 
         discord_file = discord.File(file_path)
+        file_size = file_path.stat().st_size
         try:
             await self.channel.send(
                 file=discord_file,
             )
-            logger.info(f"Video terkirim ke Discord: {file_path.name}")
+            logger.info(f"{TAG_DISCORD} Video terkirim: {file_path.name} ({fmt_size(file_size)})")
         except discord.HTTPException as e:
-            logger.error(f"Discord HTTP error saat kirim video {file_path.name}: {e}")
+            logger.error(f"{TAG_ERROR} Discord HTTP error kirim video {file_path.name}: {e}")
             return False
         except Exception as e:
-            logger.error(f"Error tidak terduga saat kirim video {file_path.name}: {e}")
+            logger.error(f"{TAG_ERROR} Error tak terduga kirim video {file_path.name}: {e}")
             return False
         finally:
             discord_file.close()
@@ -145,8 +147,8 @@ class MediaSender:
         if file_size > self.max_file_bytes:
             size_mb = file_size / (1024 * 1024)
             logger.warning(
-                f"File {file_path.name} ({size_mb:.1f}MB) melebihi limit "
-                f"Discord ({self.max_file_size_mb}MB)"
+                f"{TAG_WARN} {file_path.name} ({size_mb:.1f}MB) melebihi "
+                f"limit Discord ({self.max_file_size_mb}MB) — skip."
             )
             # Kirim notifikasi teks bahwa file terlalu besar
             await self.send_text(
@@ -158,16 +160,17 @@ class MediaSender:
             return False
 
         discord_file = discord.File(file_path)
+        file_size = file_path.stat().st_size
         try:
             await self.channel.send(
                 file=discord_file,
             )
-            logger.info(f"Terkirim ke Discord: {file_path.name}")
+            logger.info(f"{TAG_DISCORD} Media terkirim: {file_path.name} ({fmt_size(file_size)})")
         except discord.HTTPException as e:
-            logger.error(f"Discord HTTP error saat kirim {file_path.name}: {e}")
+            logger.error(f"{TAG_ERROR} Discord HTTP error kirim {file_path.name}: {e}")
             return False
         except Exception as e:
-            logger.error(f"Error tidak terduga saat kirim {file_path.name}: {e}")
+            logger.error(f"{TAG_ERROR} Error tak terduga kirim {file_path.name}: {e}")
             return False
         finally:
             discord_file.close()
@@ -221,7 +224,7 @@ class MediaSender:
             else:
                 skipped += 1
                 logger.warning(
-                    f"Skip {path.name}: {path.stat().st_size / (1024*1024):.1f}MB "
+                    f"{TAG_WARN} Skip {path.name}: {fmt_size(path.stat().st_size)} "
                     f"> {self.max_file_size_mb}MB limit"
                 )
 
@@ -244,10 +247,11 @@ class MediaSender:
         for idx, chunk in enumerate(chunks):
             # Bangun list discord.File langsung dari path
             discord_files = [discord.File(p) for p in chunk]
+            chunk_total_bytes = sum(p.stat().st_size for p in chunk)
 
             logger.info(
-                f"Mengirim carousel chunk {idx + 1}/{total_chunks} "
-                f"({len(discord_files)} file)"
+                f"{TAG_DISCORD} Upload carousel [{idx + 1}/{total_chunks}] "
+                f"— {len(discord_files)} file ({fmt_size(chunk_total_bytes)})"
             )
 
             try:
@@ -256,9 +260,9 @@ class MediaSender:
                     files=discord_files,
                 )
                 sent_messages.append(sent_message)
-                logger.info(f"Carousel chunk {idx + 1}/{total_chunks} terkirim")
+                logger.info(f"{TAG_DISCORD} Carousel [{idx + 1}/{total_chunks}] terkirim.")
             except discord.HTTPException as e:
-                logger.error(f"Discord error carousel chunk {idx + 1}: {e}")
+                logger.error(f"{TAG_ERROR} Discord error carousel chunk {idx + 1}: {e}")
                 all_success = False
             finally:
                 # Tutup fp dari file discord agar tidak lock di Windows
@@ -279,8 +283,8 @@ class MediaSender:
                 try:
                     await message.delete()
                 except discord.HTTPException as e:
-                    logger.error(f"Could not roll back carousel message: {e}")
-            logger.warning("Carousel partial delivery; retaining files for recovery")
+                    logger.error(f"{TAG_ERROR} Gagal rollback carousel message: {e}")
+            logger.warning(f"{TAG_WARN} Carousel partial delivery — file dipertahankan untuk recovery.")
         return all_success
 
     # ──────────────────────────────────────────────
@@ -372,8 +376,9 @@ class MediaSender:
         # Send header embed BEFORE media attachments so caption metadata renders above attachments in Discord channel
         try:
             await self.channel.send(embed=divider_embed)
+            logger.info(f"{TAG_DISCORD} Header embed terkirim untuk post @{clean_user}.")
         except discord.HTTPException as e:
-            logger.error(f"Failed to send post header metadata embed: {e}")
+            logger.error(f"{TAG_ERROR} Gagal kirim header embed: {e}")
 
         if len(file_paths) == 1:
             # Single media
@@ -403,4 +408,4 @@ class MediaSender:
         try:
             await self.channel.send(content=text[:2000])
         except discord.HTTPException as e:
-            logger.error(f"Gagal kirim pesan teks: {e}")
+            logger.error(f"{TAG_ERROR} Gagal kirim pesan teks: {e}")

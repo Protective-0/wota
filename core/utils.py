@@ -1,11 +1,174 @@
 """
 core/utils.py
-Fungsi helper terpusat untuk ekstraksi username, deteksi platform, dan manipulasi URL.
+Fungsi helper terpusat untuk ekstraksi username, deteksi platform, manipulasi URL,
+dan unified logging system dengan ANSI color support untuk terminal Linux/Docker.
 """
 
+import logging
 import re
+import os
+import sys
+from typing import Optional
 
+# ──────────────────────────────────────────────
+# ANSI Color Codes (Linux/Docker terminal support)
+# ──────────────────────────────────────────────
+
+# Detect if terminal supports color (Linux/Docker: yes; Windows without ANSI: no)
+_USE_COLOR = (
+    sys.stdout.isatty()
+    or os.getenv("FORCE_COLOR", "").lower() in ("1", "true", "yes")
+    or os.getenv("TERM", "") not in ("", "dumb")
+)
+
+# Reset
+RESET  = "\033[0m"  if _USE_COLOR else ""
+BOLD   = "\033[1m"  if _USE_COLOR else ""
+DIM    = "\033[2m"  if _USE_COLOR else ""
+
+# Foreground colors
+BLACK   = "\033[30m" if _USE_COLOR else ""
+RED     = "\033[31m" if _USE_COLOR else ""
+GREEN   = "\033[32m" if _USE_COLOR else ""
+YELLOW  = "\033[33m" if _USE_COLOR else ""
+BLUE    = "\033[34m" if _USE_COLOR else ""
+MAGENTA = "\033[35m" if _USE_COLOR else ""
+CYAN    = "\033[36m" if _USE_COLOR else ""
+WHITE   = "\033[37m" if _USE_COLOR else ""
+
+# Bright variants
+BRIGHT_RED     = "\033[91m" if _USE_COLOR else ""
+BRIGHT_GREEN   = "\033[92m" if _USE_COLOR else ""
+BRIGHT_YELLOW  = "\033[93m" if _USE_COLOR else ""
+BRIGHT_BLUE    = "\033[94m" if _USE_COLOR else ""
+BRIGHT_MAGENTA = "\033[95m" if _USE_COLOR else ""
+BRIGHT_CYAN    = "\033[96m" if _USE_COLOR else ""
+BRIGHT_WHITE   = "\033[97m" if _USE_COLOR else ""
+
+
+# ──────────────────────────────────────────────
+# Tag Constants (use in logger calls)
+# ──────────────────────────────────────────────
+TAG_PATROL  = "[🤖 PATROL]"
+TAG_QUEUE   = "[📦 QUEUE ]"
+TAG_CRAWL   = "[🔍 CRAWL ]"
+TAG_DOWN    = "[📥 DOWN  ]"
+TAG_COMPR   = "[🗜️  COMPR ]"
+TAG_DISCORD = "[📤 DISCORD]"
+TAG_SYSTEM  = "[⚙️  SYSTEM]"
+TAG_SUCCESS = "[✅ SUCCESS]"
+TAG_WARN    = "[⚠️  WARN  ]"
+TAG_ERROR   = "[❌ ERROR  ]"
+
+
+# ──────────────────────────────────────────────
+# Colored Formatter
+# ──────────────────────────────────────────────
+
+# Map log level → (level_color, message_color)
+_LEVEL_COLORS: dict[int, tuple[str, str]] = {
+    logging.DEBUG:    (DIM + WHITE,          DIM + WHITE),
+    logging.INFO:     (BRIGHT_CYAN,          WHITE),
+    logging.WARNING:  (BRIGHT_YELLOW,        BRIGHT_YELLOW),
+    logging.ERROR:    (BRIGHT_RED,           BRIGHT_RED),
+    logging.CRITICAL: (BOLD + BRIGHT_RED,    BOLD + BRIGHT_RED),
+}
+
+# Tag substring → highlight color for the tag badge
+_TAG_COLORS: dict[str, str] = {
+    "PATROL":  BRIGHT_BLUE,
+    "QUEUE":   MAGENTA,
+    "CRAWL":   BRIGHT_CYAN,
+    "DOWN":    GREEN,
+    "COMPR":   YELLOW,
+    "DISCORD": BRIGHT_MAGENTA,
+    "SYSTEM":  CYAN,
+    "SUCCESS": BRIGHT_GREEN,
+    "WARN":    BRIGHT_YELLOW,
+    "ERROR":   BRIGHT_RED,
+}
+
+
+class ColoredFormatter(logging.Formatter):
+    """
+    Custom formatter: colorizes timestamp, level, and tag badge for
+    Linux/Docker terminal output.
+
+    Format: YYYY-MM-DD HH:MM:SS | LEVEL   | [TAG] message
+    """
+
+    BASE_FORMAT = "%(asctime)s | %(levelname)-7s | %(message)s"
+    DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+    def format(self, record: logging.LogRecord) -> str:  # noqa: A003
+        level_color, msg_color = _LEVEL_COLORS.get(record.levelno, ("", ""))
+
+        # Format timestamp in dim white
+        self.datefmt = self.DATE_FORMAT
+        base = super().format(record)
+
+        if not _USE_COLOR:
+            return base
+
+        # Rebuild with colors applied to each segment
+        # base → "2026-08-15 01:23:45 | INFO    | [TAG] message"
+        parts = base.split(" | ", maxsplit=2)
+        if len(parts) != 3:
+            return base
+
+        ts_part, lvl_part, msg_part = parts
+
+        # Colorize timestamp
+        colored_ts = f"{DIM}{WHITE}{ts_part}{RESET}"
+
+        # Colorize level
+        colored_lvl = f"{level_color}{lvl_part}{RESET}"
+
+        # Colorize tag badge inside message (e.g., [🤖 PATROL])
+        colored_msg = msg_part
+        for tag_key, tag_color in _TAG_COLORS.items():
+            if tag_key in msg_part:
+                # Highlight just the bracket badge, leave rest in msg_color
+                import re as _re
+                colored_msg = _re.sub(
+                    r"(\[[\W\w]{1,3}" + tag_key + r"[\W\s]*\])",
+                    lambda m: f"{tag_color}{BOLD}{m.group(0)}{RESET}{msg_color}",
+                    msg_part,
+                    count=1,
+                )
+                break
+
+        colored_msg = f"{msg_color}{colored_msg}{RESET}"
+
+        return f"{colored_ts} | {colored_lvl} | {colored_msg}"
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    """
+    Configure root logging with ColoredFormatter.
+    Call once from bot.py entrypoint before any module imports loggers.
+
+    Suppresses noisy third-party loggers.
+    """
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(ColoredFormatter(ColoredFormatter.BASE_FORMAT))
+
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    # Remove default handlers to prevent duplicate output
+    root.handlers.clear()
+    root.addHandler(handler)
+
+    # Suppress noisy third-party loggers
+    for noisy in ("httpx", "httpcore", "discord", "playwright", "aiosqlite", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+# ──────────────────────────────────────────────
 # Regex pattern deteksi URL profil
+# ──────────────────────────────────────────────
+
 TIKTOK_PROFILE_REGEX = re.compile(
     r"https?://(?:www\.)?tiktok\.com/@[\w.-]+/?(?:\?[^/\s]*)?",
     re.IGNORECASE,
@@ -67,3 +230,19 @@ def extract_username_and_platform(input_str: str) -> tuple[str, str]:
         username = username[1:]
 
     return username.lower(), platform
+
+
+def fmt_size(size_bytes: int) -> str:
+    """Format byte size ke string human-readable (KB/MB)."""
+    if size_bytes >= 1_048_576:
+        return f"{size_bytes / 1_048_576:.1f}MB"
+    return f"{size_bytes / 1024:.1f}KB"
+
+
+def fmt_duration(seconds: float) -> str:
+    """Format detik ke string human-readable (e.g. '2.3s' atau '1m 12s')."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    mins = int(seconds // 60)
+    secs = seconds % 60
+    return f"{mins}m {secs:.0f}s"

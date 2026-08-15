@@ -25,8 +25,14 @@ from yt_dlp.utils import DownloadError
 import gallery_dl.job
 import gallery_dl.config
 import aiofiles  # Async file I/O untuk mencegah blocking event loop
+import time as _time
 
 logger = logging.getLogger(__name__)
+
+from .utils import (
+    TAG_DOWN, TAG_COMPR, TAG_SYSTEM, TAG_WARN, TAG_ERROR, TAG_SUCCESS, TAG_CRAWL,
+    fmt_size, fmt_duration,
+)
 
 # ──────────────────────────────────────────────
 # Konstanta Kompresi
@@ -214,11 +220,14 @@ class MediaDownloader:
                 else:
                     image_urls, caption = [], ""
             except Exception as e:
-                logger.error(f"Gagal memproses manual carousel untuk {post_url}: {e}")
+                logger.error(f"{TAG_ERROR} Gagal memproses manual carousel untuk {post_url}: {e}")
                 image_urls, caption = [], ""
 
             if image_urls:
-                logger.info(f"TikTok Carousel terdeteksi ({len(image_urls)} foto) — mulai download async paralel...")
+                logger.info(
+                    f"{TAG_DOWN} TikTok Carousel terdeteksi ({len(image_urls)} foto) "
+                    f"\u2014 bypass yt-dlp, download CDN langsung..."
+                )
                 
                 cookies_dict = {c["name"]: c["value"] for c in browser_cookies}
                 if cookies_file:
@@ -242,7 +251,10 @@ class MediaDownloader:
 
         # Intersepsi langsung Twitter/X photo post atau pre-extracted media_urls
         if ("twitter.com" in post_url or "x.com" in post_url) and media_urls:
-            logger.info(f"Twitter direct media URLs terdeteksi ({len(media_urls)} item) — bypass yt-dlp...")
+            logger.info(
+                f"{TAG_DOWN} Twitter direct media URLs: {len(media_urls)} item "
+                f"\u2014 bypass yt-dlp, CDN langsung."
+            )
             headers = {"User-Agent": SHARED_USER_AGENT}
             async def _dl_tw(idx, u):
                 ext = "jpg"
@@ -302,7 +314,10 @@ class MediaDownloader:
         elif is_tiktok_photo:
             # TikTok /photo/ \u2014 yt-dlp always fails with `Unsupported URL` on this path.
             # Skip yt-dlp entirely: try lightweight rehydration first, then Playwright.
-            logger.info(f"TikTok photo post terdeteksi (/photo/) \u2014 bypass yt-dlp langsung ke carousel extractor...")
+            logger.info(
+                f"{TAG_DOWN} TikTok /photo/ terdeteksi "
+                f"\u2014 bypass yt-dlp, coba lightweight rehydration extractor."
+            )
             try:
                 result = await self._extract_tiktok_carousel_urls(post_url, cookies_file)
                 image_urls, fallback_cap = result if isinstance(result, tuple) and len(result) == 2 else ([], "")
@@ -310,7 +325,7 @@ class MediaDownloader:
                 image_urls, fallback_cap = [], ""
 
             if image_urls:
-                logger.info(f"TikTok /photo/ lightweight extractor: {len(image_urls)} foto ditemukan")
+                logger.info(f"{TAG_DOWN} TikTok /photo/ lightweight: {len(image_urls)} foto ditemukan.")
                 cookies_dict = self._parse_netscape_cookies(cookies_file) if cookies_file else {}
                 tk_headers = {"User-Agent": SHARED_USER_AGENT, "Referer": "https://www.tiktok.com/"}
                 async def _dl_photo_bypass(idx, img_url):
@@ -323,10 +338,10 @@ class MediaDownloader:
 
             if not downloaded_files:
                 # Lightweight returned nothing \u2014 escalate to Playwright carousel (full browser)
-                logger.warning("TikTok /photo/ lightweight kosong, mencoba Playwright carousel fallback...")
+                logger.warning(f"{TAG_WARN} TikTok /photo/ lightweight kosong \u2014 fallback ke Playwright carousel.")
                 image_urls_pw, browser_caption_pw, browser_cookies_pw = await self._extract_tiktok_carousel_via_browser(post_url, cookies_file)
                 if image_urls_pw:
-                    logger.info(f"TikTok /photo/ Playwright carousel: {len(image_urls_pw)} foto ditemukan")
+                    logger.info(f"{TAG_DOWN} TikTok /photo/ Playwright carousel: {len(image_urls_pw)} foto ditemukan.")
                     cookies_dict = {c["name"]: c["value"] for c in browser_cookies_pw}
                     if cookies_file:
                         cookies_dict.update(self._parse_netscape_cookies(cookies_file))
@@ -339,10 +354,13 @@ class MediaDownloader:
                     if browser_caption_pw:
                         real_caption = browser_caption_pw
                 else:
-                    logger.error(f"Semua extractor TikTok /photo/ habis untuk {post_url}")
+                    logger.error(f"{TAG_ERROR} Semua extractor TikTok /photo/ habis untuk {post_url}.")
         elif is_instagram_photo:
             # Bypass yt-dlp langsung ke gallery-dl secara async untuk Instagram photo (/p/) jika bukan video
-            logger.info(f"Instagram photo post terdeteksi (/p/) — bypass yt-dlp, langsung ke gallery-dl...")
+            logger.info(
+                f"{TAG_DOWN} Instagram /p/ terdeteksi "
+                f"\u2014 bypass yt-dlp, routing ke gallery-dl."
+            )
             gdl_files = await self._run_gallery_dl_async(post_url, cookies_file or "")
             if gdl_files:
                 return gdl_files, "", None
@@ -366,7 +384,7 @@ class MediaDownloader:
                 if not downloaded_files and ("twitter.com" in post_url or "x.com" in post_url):
                     download_failed = True
                 elif not downloaded_files and "tiktok.com" in post_url:
-                    logger.warning("yt-dlp tidak menghasilkan file TikTok, mencoba lightweight carousel extractor...")
+                    logger.warning(f"{TAG_WARN} yt-dlp kosong untuk TikTok \u2014 coba lightweight carousel extractor.")
                     try:
                         result = await self._extract_tiktok_carousel_urls(post_url, cookies_file)
                         image_urls, fallback_cap = result if isinstance(result, tuple) and len(result) == 2 else ([], "")
@@ -417,10 +435,10 @@ class MediaDownloader:
                 original_err = e
                 yt_error = str(e)
                 if "twitter.com" in post_url or "x.com" in post_url:
-                    logger.warning(f"yt-dlp gagal download, mencoba Twitter fallback: {yt_error}")
+                    logger.warning(f"{TAG_WARN} yt-dlp gagal untuk Twitter \u2014 fallback image handler: {yt_error}")
                     download_failed = True
                 elif "tiktok.com" in post_url:
-                    logger.warning(f"yt-dlp gagal download TikTok: {yt_error}. Mencoba Carousel Fallback terlebih dahulu...")
+                    logger.warning(f"{TAG_WARN} yt-dlp gagal untuk TikTok \u2014 coba Carousel Fallback: {yt_error}")
 
                     # FIX: Carousel first, then video — photo posts have no <video> element
                     # Step 1: Lightweight rehydration scraper (no browser, fast)
@@ -475,7 +493,7 @@ class MediaDownloader:
                                 # FIX: raise with chained context — original_err preserves yt-dlp root cause
                                 raise RuntimeError(f"TikTok CDN download gagal untuk {post_url}") from original_err
                         else:
-                            logger.error("Semua fallback TikTok habis — tidak ada media yang bisa diunduh.")
+                            logger.error(f"{TAG_ERROR} Semua fallback TikTok habis \u2014 tidak ada media yang bisa diunduh.")
                             # FIX: same — chain from original yt-dlp error, not raw `raise e`
                             raise RuntimeError(f"Semua fallback TikTok habis untuk {post_url}") from original_err
                 elif "No video could be found" in yt_error or "No video formats found" in yt_error:
@@ -487,7 +505,7 @@ class MediaDownloader:
 
         # Twitter Image Fallback Handler
         if download_failed and ("twitter.com" in post_url or "x.com" in post_url):
-            logger.info(f"[📥 DOWN  ] Menjalankan Twitter Image Fallback Handler untuk: {post_url}")
+            logger.info(f"{TAG_DOWN} Twitter Image Fallback Handler aktif untuk: {post_url}")
             import httpx
             import re
             import aiofiles
@@ -601,9 +619,12 @@ class MediaDownloader:
                                 async with aiofiles.open(out_path, "wb") as f:
                                     await f.write(res.content)
                                 downloaded_files.append(out_path)
-                                logger.info(f"[📥 DOWN  ] Berhasil mengunduh gambar Twitter: {filename}")
+                                logger.info(
+                                    f"{TAG_DOWN} Gambar Twitter terunduh: {filename} "
+                                    f"({fmt_size(out_path.stat().st_size if out_path.exists() else 0)})"
+                                )
                             else:
-                                logger.warning(f"Gagal unduh gambar Twitter {img_url}: status {res.status_code}")
+                                logger.warning(f"{TAG_WARN} Gagal unduh gambar Twitter {img_url}: status {res.status_code}")
                         except Exception as dl_err:
                             logger.error(f"Error download gambar Twitter {img_url}: {dl_err}")
 
@@ -1543,7 +1564,8 @@ class MediaDownloader:
             return file_path, False
 
         logger.info(
-            f"File {file_path.name} ({file_size/1024/1024:.1f}MB) melebihi limit — mulai kompresi"
+            f"{TAG_COMPR} {file_path.name} ({fmt_size(file_size)}) melebihi limit "
+            f"— memulai kompresi ffmpeg..."
         )
 
         # Ambil durasi video menggunakan ffprobe / ffmpeg
@@ -1552,11 +1574,12 @@ class MediaDownloader:
             target_bitrate_bps = self._calculate_target_bitrate(duration)
         else:
             # Fallback jika durasi tidak bisa diketahui: gunakan fallback bitrate 1 Mbps
-            logger.warning("Durasi video tidak terdeteksi — menggunakan fallback bitrate & file size limit")
+            logger.warning(f"{TAG_WARN} Durasi video tidak terdeteksi \u2014 fallback bitrate 1 Mbps.")
             target_bitrate_bps = 1_000_000
 
         # Jalankan kompresi di thread pool (ffmpeg bersifat blocking)
         compressed_path = file_path.with_stem(file_path.stem + "_compressed")
+        t_compress_start = _time.monotonic()
         loop = asyncio.get_running_loop()  # get_running_loop() — tidak deprecated
         success = await loop.run_in_executor(
             None,
@@ -1567,12 +1590,14 @@ class MediaDownloader:
         )
 
         if not success or not compressed_path.exists():
-            logger.error("Kompresi ffmpeg gagal — pakai file original")
+            logger.error(f"{TAG_COMPR} ffmpeg gagal \u2014 pakai file original {file_path.name}.")
             return file_path, True
 
         compressed_size = compressed_path.stat().st_size
+        elapsed = _time.monotonic() - t_compress_start
         logger.info(
-            f"Kompresi selesai: {file_size/1024/1024:.1f}MB → {compressed_size/1024/1024:.1f}MB"
+            f"{TAG_COMPR} Selesai: {fmt_size(file_size)} \u2192 {fmt_size(compressed_size)} "
+            f"({fmt_duration(elapsed)})"
         )
 
         # Hapus file original setelah kompresi berhasil
@@ -1585,8 +1610,8 @@ class MediaDownloader:
         still_over_limit = compressed_size > self.max_file_size_bytes
         if still_over_limit:
             logger.warning(
-                f"File masih {compressed_size/1024/1024:.1f}MB setelah kompresi "
-                f"(safety floor aktif) — akan dikirim sebagai dokumen"
+                f"{TAG_WARN} {file_path.name}: {fmt_size(compressed_size)} setelah kompresi "
+                f"(safety floor aktif) \u2014 kirim sebagai dokumen."
             )
 
         return compressed_path, still_over_limit
@@ -1599,12 +1624,14 @@ class MediaDownloader:
 
         if raw_bitrate < MIN_VIDEO_BITRATE_BPS:
             logger.warning(
-                f"Kalkulasi bitrate ({raw_bitrate:.0f} bps) di bawah safety floor "
-                f"({MIN_VIDEO_BITRATE_BPS} bps). Menggunakan floor value."
+                f"{TAG_COMPR} Kalkulasi bitrate ({raw_bitrate:.0f} bps) di bawah safety floor "
+                f"({MIN_VIDEO_BITRATE_BPS} bps) \u2014 pakai floor value."
             )
             return MIN_VIDEO_BITRATE_BPS
 
-        return int(raw_bitrate // 1000) * 1000
+        result_kbps = int(raw_bitrate // 1000) * 1000
+        logger.debug(f"{TAG_COMPR} Target bitrate: {result_kbps // 1000} kbps (durasi: {duration_seconds:.1f}s)")
+        return result_kbps
 
     async def _get_video_duration(self, file_path: Path) -> Optional[float]:
         """

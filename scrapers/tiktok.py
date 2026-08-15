@@ -27,6 +27,9 @@ from playwright.async_api import (
 
 import aiofiles
 from .base import BaseScraper, MediaType, PostMedia, USER_AGENT
+from core.utils import (
+    TAG_CRAWL, TAG_SYSTEM, TAG_SUCCESS, TAG_WARN, TAG_ERROR, TAG_DOWN
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,40 +118,41 @@ class TikTokScraper(BaseScraper):
 
         username = self._extract_username(profile_url)
         if not username:
-            logger.error(f"Tidak bisa ekstrak username dari URL: {profile_url}")
+            logger.error(f"{TAG_ERROR} Tidak bisa ekstrak username dari URL: {profile_url}")
             return
 
         canonical_url = f"https://www.tiktok.com/@{username}"
         try:
             page = await self._init_browser()
         except Exception as e:
-            logger.error(f"[❌ ERROR  ] Menghentikan scraping profil TikTok karena kesalahan browser/cookie: {e}")
+            logger.error(f"{TAG_ERROR} Gagal init browser/cookie TikTok: {e}")
             self.failed = True
             return
 
         try:
-            logger.info(f"Membuka halaman profil TikTok: {canonical_url}")
+            logger.info(f"{TAG_CRAWL} Membuka halaman profil TikTok: {canonical_url}")
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(2.5)
 
             # Auto-reload halaman untuk bypass captcha interstitial dan inisialisasi sesi penuh
-            logger.info("Melakukan auto-refresh halaman TikTok untuk bypass captcha & inisialisasi...")
+            logger.info(f"{TAG_CRAWL} Auto-refresh untuk bypass captcha & inisialisasi sesi...")
             try:
                 await page.reload(wait_until="domcontentloaded", timeout=60000)
                 await asyncio.sleep(2.0)
             except Exception as e:
-                logger.warning(f"Refresh halaman TikTok timeout/gagal: {e} — lanjut proses...")
+                logger.warning(f"{TAG_WARN} Refresh timeout/gagal: {e} — lanjut proses...")
 
             # Proteksi: Pastikan browser tidak dialihkan ke akun login sendiri (@zefriofaizin)
             if username.lower() not in page.url.lower():
                 logger.warning(
-                    f"Browser dialihkan ke '{page.url}' (bukan @{username}), menavigasi paksa ke {canonical_url}..."
+                    f"{TAG_WARN} Browser dialihkan ke '{page.url}' (bukan @{username}), "
+                    f"navigasi paksa ke {canonical_url}..."
                 )
                 await page.goto(canonical_url, wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(2.0)
 
             # 1. First Pass: Coba ekstrak postingan dari data rehydration JSON
-            logger.info("Membaca data rehydration JSON TikTok dari halaman profil...")
+            logger.info(f"{TAG_CRAWL} Membaca rehydration JSON dari halaman profil @{username}...")
             rehydration_data = {}
             try:
                 rehydration_data = await page.evaluate(r"""
@@ -211,7 +215,7 @@ class TikTokScraper(BaseScraper):
             expected_video_count = int(rehydration_data.get("videoCount", 0))
 
             if expected_video_count > 0:
-                logger.info(f"Target profil TikTok @{username} memiliki total {expected_video_count} video publik.")
+                logger.info(f"{TAG_CRAWL} Target @{username}: {expected_video_count} video publik terdeteksi.")
 
             for r_url in rehydration_urls:
                 if r_url not in seen_urls:
@@ -219,19 +223,22 @@ class TikTokScraper(BaseScraper):
                     seen_urls.add(r_url)
 
             if rehydration_urls:
-                logger.info(f"Rehydration/API TikTok: {len(rehydration_urls)} postingan terdeteksi langsung dari script.")
+                logger.info(
+                    f"{TAG_CRAWL} Rehydration JSON: {len(rehydration_urls)} postingan langsung dari "
+                    f"script tag @{username}."
+                )
 
             # Tunggu elemen feed TikTok muncul (toleransi jika sudah ada dari rehydration)
-            logger.info("Menunggu feed DOM TikTok siap...")
+            logger.info(f"{TAG_CRAWL} Menunggu feed DOM TikTok siap...")
             try:
                 await page.wait_for_selector('a[href*="/video/"], a[href*="/photo/"]', timeout=10000)
             except Exception:
-                logger.debug("Selector feed DOM TikTok timeout; lanjut dengan scrolling.")
+                logger.debug(f"{TAG_CRAWL} Selector feed DOM timeout — lanjut scroll.")
 
             await asyncio.sleep(2.0)
 
             # 2. Second Pass: Scrolling DOM & ekstraksi link postingan (bounded loop max 6 scroll)
-            logger.info("Memulai proses scrolling dan pencatatan feed DOM TikTok...")
+            logger.info(f"{TAG_CRAWL} Mulai scroll+ekstraksi feed @{username} (max {6} pass)...")
             consecutive_empty_scrolls = 0
             max_scroll_attempts = 6
 
@@ -304,20 +311,29 @@ class TikTokScraper(BaseScraper):
 
                 if new_added > 0:
                     consecutive_empty_scrolls = 0
-                    logger.info(f"Scroll pass {scroll_idx}/{max_scroll_attempts}: +{new_added} postingan (total terkumpul: {len(collected_urls)})")
+                    logger.info(
+                        f"{TAG_CRAWL} Scroll [{scroll_idx}/{max_scroll_attempts}]: "
+                        f"+{new_added} URL baru (total: {len(collected_urls)})"
+                    )
                 else:
                     consecutive_empty_scrolls += 1
-                    logger.debug(f"Scroll pass {scroll_idx}/{max_scroll_attempts}: tidak ada postingan baru ({consecutive_empty_scrolls}/3)")
+                    logger.debug(
+                        f"{TAG_CRAWL} Scroll [{scroll_idx}/{max_scroll_attempts}]: "
+                        f"tidak ada URL baru ({consecutive_empty_scrolls}/3 empty)"
+                    )
 
                 # Jika sudah mencapai target videoCount yang tertera di profil, potong dan berhenti seketika
                 if expected_video_count > 0 and len(collected_urls) >= expected_video_count:
                     collected_urls = collected_urls[:expected_video_count]
-                    logger.info(f"Semua {len(collected_urls)}/{expected_video_count} postingan akun @{username} sudah lengkap terkumpul.")
+                    logger.info(
+                        f"{TAG_CRAWL} Target tercapai: {len(collected_urls)}/{expected_video_count} "
+                        f"URL @{username} terkumpul."
+                    )
                     break
 
                 # Jika 3x scroll berturut-turut tidak ada post baru, akhiri loop
                 if consecutive_empty_scrolls >= 3:
-                    logger.info("Feed TikTok sudah mencapai akhir / tidak ada postingan baru.")
+                    logger.info(f"{TAG_CRAWL} 3x scroll kosong berturut — feed @{username} sudah habis.")
                     break
 
                 # Scroll ke bawah secara terukur
@@ -329,7 +345,7 @@ class TikTokScraper(BaseScraper):
                 collected_urls = collected_urls[:expected_video_count]
 
             logger.info(
-                f"Ditemukan total {len(collected_urls)} postingan URL dari profil TikTok @{username}"
+                f"{TAG_CRAWL} Total {len(collected_urls)} URL postingan @{username} berhasil dikumpulkan."
             )
 
             # Optimasi sorting dengan Decorate-Sort-Undecorate (DSU) pattern
@@ -375,18 +391,18 @@ class TikTokScraper(BaseScraper):
             # Log summary: makes "67 found → 0 yielded" visible instead of silent
             if filtered_count > 0 and yield_count == 0:
                 logger.info(
-                    f"TikTok @{username}: {filtered_count}/{len(video_list)} post sudah di DB — "
-                    f"tidak ada postingan baru untuk di-yield."
+                    f"{TAG_CRAWL} @{username}: {filtered_count}/{len(video_list)} post sudah di DB "
+                    f"— tidak ada postingan baru."
                 )
             elif filtered_count > 0:
                 logger.info(
-                    f"TikTok @{username}: {yield_count} post baru di-yield, "
+                    f"{TAG_CRAWL} @{username}: {yield_count} post baru di-yield, "
                     f"{filtered_count} sudah di DB (di-skip)."
                 )
 
 
         except Exception as e:
-            logger.error(f"[❌ ERROR  ] Error saat scraping profil TikTok: {e}")
+            logger.error(f"{TAG_ERROR} Error saat scraping profil TikTok @{username}: {e}")
         finally:
             await self.close()
 

@@ -26,6 +26,7 @@ import aiofiles  # Async file I/O agar save cookies tidak blokir event loop
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from .base import BaseScraper, MediaType, PostMedia, USER_AGENT
+from core.utils import TAG_CRAWL, TAG_SYSTEM, TAG_WARN, TAG_ERROR, TAG_SUCCESS
 
 logger = logging.getLogger(__name__)
 
@@ -133,14 +134,15 @@ class TwitterScraper(BaseScraper):
                 return
 
             if "i/flow/login" in page.url or "login" in page.url:
-                logger.error("[❌ ERROR  ] Sesi Cookie .env Anda EXPIRED!")
+                logger.error(f"{TAG_ERROR} Sesi Cookie expired! Redirect ke login page: {page.url}")
                 return
 
             # Mulai proses scrolling dan ekstraksi data asli
+            logger.info(f"{TAG_CRAWL} Mulai scroll timeline Media Twitter @{username}...")
             all_posts = await self._scroll_and_collect_tweets(page, username, profile_url, forced=forced)
 
             logger.info(
-                f"Total {len(all_posts)} tweet media dikumpulkan dari @{username}"
+                f"{TAG_CRAWL} Selesai: {len(all_posts)} tweet media terkumpul dari @{username}."
             )
 
             # Urutan alami: terbaru ke terlama
@@ -166,7 +168,7 @@ class TwitterScraper(BaseScraper):
         MAX_SAME_HEIGHT = 3
         scroll_round = 0
 
-        logger.info(f"[🔍 CRAWL] Memulai scroll timeline Twitter untuk @{username}...")
+        logger.info(f"{TAG_CRAWL} Memulai scroll loop @{username} (max {35} pass, stop {MAX_NO_NEW}x empty)...")
 
         while no_new_count < MAX_NO_NEW:
             scroll_round += 1
@@ -240,8 +242,8 @@ class TwitterScraper(BaseScraper):
                 # STOP-CONDITION: Cek SQLite jika tweet ini sudah pernah di-scrape
                 if not forced and await self.db.check_post_exists(tweet_id, self.PLATFORM):
                     logger.info(
-                        f"Stop-condition: tweet {tweet_id} sudah di DB. "
-                        f"Berhenti scroll — resume point ditemukan."
+                        f"{TAG_CRAWL} Stop-condition: tweet {tweet_id} sudah di DB — "
+                        f"resume point ditemukan."
                     )
                     should_stop = True
                     break
@@ -286,12 +288,16 @@ class TwitterScraper(BaseScraper):
 
             if new_found > 0:
                 logger.info(
-                    f"[🔍 CRAWL] Scroll #{scroll_round}: +{new_found} tweet media baru ditemukan (Total: {len(collected_posts)})"
+                    f"{TAG_CRAWL} Scroll [{scroll_round}]: +{new_found} tweet baru "
+                    f"(total: {len(collected_posts)})"
                 )
                 no_new_count = 0
             else:
                 no_new_count += 1
-                logger.debug(f"Tidak ada tweet baru pada scroll #{scroll_round} ({no_new_count}/{MAX_NO_NEW})")
+                logger.debug(
+                    f"{TAG_CRAWL} Scroll [{scroll_round}]: tidak ada tweet baru "
+                    f"({no_new_count}/{MAX_NO_NEW})"
+                )
 
             # Simpan data sebelum scroll
             await page.evaluate("window.scrollBy(0, 1600)")
@@ -299,9 +305,10 @@ class TwitterScraper(BaseScraper):
 
             # Hard stop protection: jika sudah 35 putaran scroll tanpa batas
             if scroll_round >= 35:
-                logger.info(f"Batas maksimal 35 putaran scroll tercapai untuk @{username}.")
+                logger.info(f"{TAG_CRAWL} Batas 35 scroll tercapai untuk @{username} — stop.")
                 break
 
+        logger.info(f"{TAG_CRAWL} Scroll selesai @{username}: {len(collected_posts)} tweet media.")
         return collected_posts
 
     def _extract_username(self, url: str) -> str:

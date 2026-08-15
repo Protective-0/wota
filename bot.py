@@ -43,6 +43,14 @@ from core import (
     QueueManager,
     detect_platform,
     extract_username_and_platform,
+    setup_logging,
+    fmt_size,
+    fmt_duration,
+)
+from core.utils import (
+    TAG_PATROL, TAG_QUEUE, TAG_CRAWL, TAG_DOWN,
+    TAG_COMPR, TAG_DISCORD, TAG_SYSTEM, TAG_SUCCESS,
+    TAG_WARN, TAG_ERROR,
 )
 from scrapers import InstagramScraper, TikTokScraper, TwitterScraper
 from scrapers.base import BaseScraper, PostMedia
@@ -50,14 +58,7 @@ from scrapers.base import BaseScraper, PostMedia
 # ──────────────────────────────────────────────
 # Setup Logging
 # ──────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)-7s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("discord").setLevel(logging.WARNING)
-logging.getLogger("playwright").setLevel(logging.WARNING)
+setup_logging(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
@@ -669,24 +670,24 @@ class MediaScraperBot(commands.Bot):
 
     async def _job_worker(self) -> None:
         """Worker background tunggal untuk memproses antrean scraping 1 per 1 secara berurutan."""
-        logger.info("[⚙️ SYSTEM] Background Job Worker aktif (Mode Serial FIFO: 1 task pada satu waktu).")
+        logger.info(f"{TAG_SYSTEM} Background Job Worker aktif (Mode Serial FIFO: 1 task pada satu waktu).")
         while True:
             try:
                 job = await self._job_queue.get()
                 username, platform, profile_url, channel_id = job
                 logger.info(
-                    f"[📦 QUEUE ] Mengambil task dari antrean: @{username} ({platform}) — "
+                    f"{TAG_QUEUE} Mengambil task: @{username} ({platform}) — "
                     f"Sisa antrean: {self._job_queue.qsize()}"
                 )
                 await self._run_initial_historical_scrape(
                     username, platform, profile_url, channel_id
                 )
                 self._job_queue.task_done()
-                logger.info(f"[📦 QUEUE ] Selesai memproses task: @{username} ({platform}).")
+                logger.info(f"{TAG_QUEUE} Selesai: @{username} ({platform}).")
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[❌ ERROR  ] Kesalahan fatal di Job Worker: {e}", exc_info=True)
+                logger.error(f"{TAG_ERROR} Kesalahan fatal di Job Worker: {e}", exc_info=True)
 
     async def close(self) -> None:
         """Cleanup resources sebelum bot disconnect."""
@@ -895,23 +896,23 @@ class MediaScraperBot(commands.Bot):
         (last_scraped_id != '').
         """
         if self.patrol_paused:
-            logger.info("[🤖 SATPAM] Patrol di-pause. Skip siklus ini.")
+            logger.info(f"{TAG_PATROL} Patrol di-pause. Skip siklus ini.")
             return
 
         if self.is_scanning or self.queue.is_busy or not self._job_queue.empty():
-            logger.info("[🤖 SATPAM] Sedang ada task scraping/antrean aktif. Menunda siklus patrol agar tidak bertabrakan.")
+            logger.info(f"{TAG_PATROL} Task aktif/antrean ada — tunda siklus patrol.")
             return
 
         # Hanya ambil akun yang siap dipatroli (historical dump selesai)
         accounts = await self.db.get_patrol_ready_accounts()
         if not accounts:
-            logger.info("[🤖 SATPAM] Tidak ada akun yang siap dipatroli.")
+            logger.info(f"{TAG_PATROL} Tidak ada akun siap dipatroli.")
             return
 
-        logger.info(f"[🤖 SATPAM] Memulai patroli {len(accounts)} akun...")
+        logger.info(f"{TAG_PATROL} Memulai patroli {len(accounts)} akun...")
         async with self.scan_lock:
             if self.is_scanning or self.queue.is_busy or not self._job_queue.empty():
-                logger.info("[🤖 SATPAM] Scan baru terdeteksi saat acquire lock. Skip.")
+                logger.info(f"{TAG_PATROL} Scan baru terdeteksi saat acquire lock. Skip.")
                 return
             self.is_scanning = True
         try:
@@ -1039,7 +1040,7 @@ class MediaScraperBot(commands.Bot):
         """
         try:
             logger.info(
-                f"[⚙️ SYSTEM] Memulai pemrosesan historis awal untuk @{username} ({platform})"
+                f"{TAG_SYSTEM} Memulai historical scrape awal untuk @{username} ({platform})"
             )
             ok = await self._patrol_account(
                 username=username,
@@ -1053,15 +1054,15 @@ class MediaScraperBot(commands.Bot):
             if ok:
                 await self.db.mark_initial_scan_completed(username, platform)
                 logger.info(
-                    f"[✅ SUCCESS] Pemrosesan historis awal selesai untuk @{username} ({platform}). Satpam Mode aktif untuk akun ini."
+                    f"{TAG_SUCCESS} Historical scrape selesai @{username} ({platform}) — Patrol Mode aktif."
                 )
             else:
                 logger.warning(
-                    f"[❌ ERROR  ] Pemrosesan historis awal gagal untuk @{username} ({platform})."
+                    f"{TAG_ERROR} Historical scrape gagal @{username} ({platform})."
                 )
         except Exception as e:
             logger.error(
-                f"[❌ ERROR  ] Error pada pemrosesan historis awal @{username}: {e}",
+                f"{TAG_ERROR} Error historical scrape @{username}: {e}",
                 exc_info=True,
             )
 
@@ -1079,18 +1080,18 @@ class MediaScraperBot(commands.Bot):
         Patroli satu akun tertentu: cari post baru, download, kirim, dan update last_scraped_id.
         Mengembalikan True jika sukses/selesai tanpa error, atau False jika skip/gagal.
         """
-        tag = "[⚡ FORCED]" if forced else "[🤖 SATPAM]"
+        tag = TAG_SYSTEM if forced else TAG_PATROL
         channel = self.get_channel(channel_id)
         if not channel:
             logger.error(
-                f"[❌ ERROR  ] Channel ID {channel_id} untuk @{username} tidak ditemukan! Skip."
+                f"{TAG_ERROR} Channel ID {channel_id} untuk @{username} tidak ditemukan. Skip."
             )
             return False
 
         # Pre-flight: cek apakah auth tersedia (.env token ATAU JSON cookie)
         if not BaseScraper.has_auth_configured(platform):
             logger.error(
-                f"[❌ ERROR  ] Tidak ada autentikasi untuk {platform}! Melewati akun @{username}..."
+                f"{TAG_ERROR} Tidak ada autentikasi untuk {platform}! Skip @{username}."
             )
             return False
 
@@ -1187,10 +1188,17 @@ class MediaScraperBot(commands.Bot):
 
             # Fase 1: Download Semua
             downloaded_data_list = []
-            for post in new_posts:
+            total_new = len(new_posts)
+            for dl_idx, post in enumerate(new_posts, 1):
                 try:
+                    logger.info(f"{TAG_DOWN} [{dl_idx}/{total_new}] Unduh post {post.post_id} ({post.platform})...")
                     files, real_cap, ts = await self._download_post_media_only(post)
                     if files:
+                        total_bytes = sum(f.stat().st_size for f in files if f.exists())
+                        logger.info(
+                            f"{TAG_DOWN} [{dl_idx}/{total_new}] Selesai — "
+                            f"{len(files)} file ({fmt_size(total_bytes)})"
+                        )
                         downloaded_data_list.append({
                             "post": post,
                             "files": files,
@@ -1198,9 +1206,9 @@ class MediaScraperBot(commands.Bot):
                             "timestamp": ts
                         })
                     else:
-                        logger.error(f"[❌ SKIP] Gagal mendownload media untuk post {post.post_id}")
+                        logger.error(f"{TAG_ERROR} [{dl_idx}/{total_new}] Gagal download post {post.post_id}.")
                 except Exception as e:
-                    logger.error(f"[❌ SKIP] Error mendownload post {post.post_id}: {e}")
+                    logger.error(f"{TAG_ERROR} [{dl_idx}/{total_new}] Download error post {post.post_id}: {e}")
                 
                 # Jeda kecil antar download untuk menyamarkan bot
                 await asyncio.sleep(random.uniform(1.0, 3.0))
@@ -1237,7 +1245,7 @@ class MediaScraperBot(commands.Bot):
                             post.post_id, username, post.platform
                         )
                         logger.info(
-                            f"[✅ SUCCESS] ✨ Post ID {post.post_id} berhasil dikirim ke channel {channel_id}"
+                            f"{TAG_SUCCESS} Post {post.post_id} terkirim ke channel {channel_id}."
                         )
                     
                     # Jeda aman antar postingan agar sesuai urutan dan meminimalisir rate limit Discord

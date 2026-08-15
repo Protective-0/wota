@@ -7,7 +7,7 @@ from .database import DatabaseManager
 from .queue_manager import QueueManager
 from .downloader import MediaDownloader
 from .sender import MediaSender
-from .utils import detect_platform, extract_username_and_platform
+from .utils import detect_platform, extract_username_and_platform, setup_logging, fmt_size, fmt_duration
 
 __all__ = [
     "DatabaseManager",
@@ -16,4 +16,7 @@ __all__ = [
     "MediaSender",
     "detect_platform",
     "extract_username_and_platform",
+    "setup_logging",
+    "fmt_size",
+    "fmt_duration",
 ]
