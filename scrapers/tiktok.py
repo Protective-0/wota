@@ -224,14 +224,11 @@ class TikTokScraper(BaseScraper):
             # Tunggu elemen feed TikTok muncul (toleransi jika sudah ada dari rehydration)
             logger.info("Menunggu feed DOM TikTok siap...")
             try:
-                # Pastikan tab Videos aktif (JANGAN pakai role=tab:first-child karena mengenai sidebar profile sendiri)
-                await page.evaluate("""() => {
-                    const vTab = document.querySelector('[data-e2e="videos-tab"], [data-e2e="user-post-tab"]');
-                    if (vTab) vTab.click();
-                }""")
-                await page.wait_for_selector('a[href*="/video/"], a[href*="/photo/"], [data-e2e="user-post-item"]', timeout=8000)
+                await page.wait_for_selector('a[href*="/video/"], a[href*="/photo/"]', timeout=10000)
             except Exception:
                 logger.debug("Selector feed DOM TikTok timeout; lanjut dengan scrolling.")
+
+            await asyncio.sleep(2.0)
 
             # 2. Second Pass: Scrolling DOM & ekstraksi link postingan (bounded loop max 6 scroll)
             logger.info("Memulai proses scrolling dan pencatatan feed DOM TikTok...")
@@ -245,43 +242,24 @@ class TikTokScraper(BaseScraper):
                     closeBtns.forEach(b => { try { b.click(); } catch(e){} });
                 }""")
 
-                # Ambil snapshot URL dari card grid postingan profil
+                # Ambil snapshot URL dari semua tag <a> video/photo di halaman
                 urls_snapshot = await page.evaluate("""
                     (targetUsername) => {
                         const u = targetUsername.toLowerCase().replace('@', '');
                         const results = [];
                         const seenIds = new Set();
                         
-                        // 1. Ekstrak dari seluruh card container khusus post di grid
-                        const postCards = document.querySelectorAll('[data-e2e="user-post-item"], [data-e2e="user-post-item-desc"], [data-e2e="user-post-item-list"] a, div[class*="DivItemContainer"]');
-                        for (const card of postCards) {
-                            const link = card.tagName === 'A' ? card : card.querySelector('a[href*="/video/"], a[href*="/photo/"]');
-                            if (link) {
-                                const href = link.getAttribute('href') || link.href || '';
-                                const match = href.match(/\\/(video|photo)\\/(\\d{15,22})/);
-                                if (match && !seenIds.has(match[2])) {
-                                    seenIds.add(match[2]);
-                                    const type = match[1];
-                                    const id = match[2];
+                        // Cari semua tag <a> yang menuju ke video atau photo
+                        const links = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"], a[href*="/v/"]');
+                        for (const a of links) {
+                            const href = a.getAttribute('href') || a.href || '';
+                            const match = href.match(/\\/(video|photo|v)\\/(\\d{15,22})/);
+                            if (match) {
+                                const type = match[1] === 'photo' ? 'photo' : 'video';
+                                const id = match[2];
+                                if (!seenIds.has(id)) {
+                                    seenIds.add(id);
                                     results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                                }
-                            }
-                        }
-                        
-                        // 2. Tambahan fallback: cek semua link <a> dengan format @username target
-                        if (results.length === 0) {
-                            const allLinks = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
-                            for (const a of allLinks) {
-                                const href = a.getAttribute('href') || a.href || '';
-                                const lower = href.toLowerCase();
-                                if (lower.includes('/@' + u + '/video/') || lower.includes('/@' + u + '/photo/')) {
-                                    const match = href.match(/\\/(video|photo)\\/(\\d{15,22})/);
-                                    if (match && !seenIds.has(match[2])) {
-                                        seenIds.add(match[2]);
-                                        const type = match[1];
-                                        const id = match[2];
-                                        results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                                    }
                                 }
                             }
                         }
@@ -315,7 +293,7 @@ class TikTokScraper(BaseScraper):
                     break
 
                 # Jika 3x scroll berturut-turut tidak ada post baru, akhiri loop
-                if consecutive_empty_scrolls >= 2:
+                if consecutive_empty_scrolls >= 3:
                     logger.info("Feed TikTok sudah mencapai akhir / tidak ada postingan baru.")
                     break
 
