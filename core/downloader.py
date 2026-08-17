@@ -57,28 +57,61 @@ SHARED_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
 def _extract_tiktok_image_urls_from_rehydration(data: dict) -> list[str]:
     """Extract image URLs from TikTok rehydration payload without duplication."""
     image_urls: list[str] = []
+    seen = set()
+
+    def add_url(u: str) -> None:
+        if u and isinstance(u, str) and u.startswith("http") and u not in seen:
+            if not any(bad in u for bad in ("avatar", "profile", "icon", "placeholder", "logo")):
+                seen.add(u)
+                image_urls.append(u)
 
     def search_images(d) -> None:
         if isinstance(d, dict):
-            if "imagePost" in d:
-                img_data = d.get("imagePost")
-                if isinstance(img_data, dict) and "images" in img_data:
-                    for img in img_data["images"]:
-                        urls = img.get("imageURL", {}).get("urlList", [])
-                        if urls:
-                            image_urls.append(urls[0])
-                elif isinstance(img_data, list):
-                    for item in img_data:
-                        if isinstance(item, dict):
-                            urls = item.get("imageURL", {}).get("urlList", [])
-                            if urls:
-                                image_urls.append(urls[0])
-                            elif "url" in item:
-                                image_urls.append(item["url"])
-                        elif isinstance(item, str):
-                            image_urls.append(item)
-            for value in d.values():
-                search_images(value)
+            # Check known TikTok image fields directly
+            for key in ("imagePost", "imagePostInfo", "images", "photo", "photos"):
+                if key in d:
+                    val = d[key]
+                    if isinstance(val, dict):
+                        sub_imgs = val.get("images", []) or val.get("imageURL", {}) or val.get("displayImage", {})
+                        if isinstance(sub_imgs, list):
+                            for img in sub_imgs:
+                                if isinstance(img, dict):
+                                    urls = (
+                                        img.get("imageURL", {}).get("urlList", [])
+                                        or img.get("displayImage", {}).get("urlList", [])
+                                        or img.get("downloadAddr", {}).get("urlList", [])
+                                        or img.get("urlList", [])
+                                    )
+                                    for u in urls:
+                                        add_url(u)
+                                        break
+                                elif isinstance(img, str):
+                                    add_url(img)
+                        elif isinstance(sub_imgs, dict):
+                            urls = sub_imgs.get("urlList", []) or sub_imgs.get("downloadAddr", [])
+                            for u in urls:
+                                add_url(u)
+                                break
+                    elif isinstance(val, list):
+                        for item in val:
+                            if isinstance(item, dict):
+                                urls = (
+                                    item.get("imageURL", {}).get("urlList", [])
+                                    or item.get("displayImage", {}).get("urlList", [])
+                                    or item.get("downloadAddr", {}).get("urlList", [])
+                                    or item.get("urlList", [])
+                                )
+                                for u in urls:
+                                    add_url(u)
+                                    break
+                                if "url" in item and isinstance(item["url"], str):
+                                    add_url(item["url"])
+                            elif isinstance(item, str):
+                                add_url(item)
+
+            for k, value in d.items():
+                if k not in ("music", "author", "shareMeta", "stats"):
+                    search_images(value)
         elif isinstance(d, list):
             for item in d:
                 search_images(item)
@@ -669,16 +702,20 @@ class MediaDownloader:
 
             # Cari script __UNIVERSAL_DATA_FOR_REHYDRATION__ (state rehydration data modern TikTok)
             match = re.search(
-                r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+                r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)</script>',
                 html_content,
             )
             if not match:
                 # Fallback: Cari SIGI_STATE (state rehydration data lama TikTok)
                 match = re.search(
-                    r'<script id="SIGI_STATE"[^>]*>(.*?)</script>', html_content
+                    r'<script id="SIGI_STATE"[^>]*>([\s\S]*?)</script>', html_content
                 )
                 if not match:
-                    return [], ""
+                    match = re.search(
+                        r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', html_content
+                    )
+                    if not match:
+                        return [], ""
 
             data = json.loads(match.group(1))
             image_urls = _extract_tiktok_image_urls_from_rehydration(data)
@@ -726,6 +763,7 @@ class MediaDownloader:
                 viewport={"width": 1280, "height": 900},
                 locale="en-US"
             )
+            await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
             # Inject cookies lengkap jika ada (dari cookies_file Netscape atau .env)
             cookies_to_add = []
@@ -761,73 +799,83 @@ class MediaDownloader:
 
             page = await context.new_page()
             await page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2.5)  # Jeda aman agar React/Swiper component selesai render
 
-            # FIX: reduced from 15000ms → 2000ms; rehydration elements are often absent
-            # on newer TikTok pages — don't burn 15s waiting for a deprecated element
-            rehydration_found = False
-            try:
-                await page.wait_for_selector("#__UNIVERSAL_DATA_FOR_REHYDRATION__, #SIGI_STATE", timeout=2000)
-                rehydration_found = True
-            except Exception:
-                logger.debug("Rehydration element tidak ditemukan dalam 2s — lanjut ke DOM img fallback")
+            # Path A: Try rehydration JSON first from window or script tag
+            json_content = await page.evaluate("""() => {
+                if (window.__UNIVERSAL_DATA_FOR_REHYDRATION__) {
+                    return JSON.stringify(window.__UNIVERSAL_DATA_FOR_REHYDRATION__);
+                }
+                if (window.SIGI_STATE) {
+                    return JSON.stringify(window.SIGI_STATE);
+                }
+                const el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+                if (el) return el.textContent;
+                const sigi = document.getElementById('SIGI_STATE');
+                if (sigi) return sigi.textContent;
+                return null;
+            }""")
 
-            # Path A: Try rehydration JSON first (fast, structured)
-            if rehydration_found:
-                json_content = await page.evaluate("""() => {
-                    const el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
-                    if (el) return el.textContent;
-                    const sigi = document.getElementById('SIGI_STATE');
-                    if (sigi) return sigi.textContent;
-                    return null;
-                }""")
+            if json_content:
+                try:
+                    raw_data = json.loads(json_content)
+                    image_urls = _extract_tiktok_image_urls_from_rehydration(raw_data)
 
-                if json_content:
                     try:
-                        raw_data = json.loads(json_content)
-                        image_urls = _extract_tiktok_image_urls_from_rehydration(raw_data)
+                        default_scope = raw_data.get("__DEFAULT_SCOPE__", {})
+                        video_detail = default_scope.get("webapp.video-detail", {}) or default_scope.get("webapp.videoDetail", {})
+                        if not video_detail:
+                            webapp = default_scope.get("webapp", {})
+                            video_detail = webapp.get("video-detail", {}) or webapp.get("videoDetail", {})
+                        item_struct = video_detail.get("itemInfo", {}).get("itemStruct", {})
+                        caption = item_struct.get("desc") or ""
+                    except Exception:
+                        pass
+                except Exception as json_err:
+                    logger.warning(f"Gagal memparsing rehydration JSON TikTok: {json_err}")
 
-                        try:
-                            default_scope = raw_data.get("__DEFAULT_SCOPE__", {})
-                            video_detail = default_scope.get("webapp.video-detail", {}) or default_scope.get("webapp.videoDetail", {})
-                            if not video_detail:
-                                webapp = default_scope.get("webapp", {})
-                                video_detail = webapp.get("video-detail", {}) or webapp.get("videoDetail", {})
-                            item_struct = video_detail.get("itemInfo", {}).get("itemStruct", {})
-                            caption = item_struct.get("desc") or ""
-                        except Exception:
-                            pass
-                    except Exception as json_err:
-                        logger.warning(f"Gagal memparsing rehydration JSON TikTok: {json_err}")
-
-            # Path B: Direct DOM img-tag scraper — fires immediately when rehydration absent
-            # Targets photomode CDN images rendered directly in the page
+            # Path B: Direct DOM img-tag scraper if rehydration failed
             if not image_urls:
                 logger.debug("Rehydration kosong — scraping img tag photomode dari DOM...")
                 image_urls = await page.evaluate("""() => {
                     const results = new Set();
                     // Selector 1: photomode swiper images
-                    document.querySelectorAll('img[src*="photomode"]').forEach(el => {
-                        if (el.src && !el.src.includes('avatar') && !el.src.includes('cover')) {
-                            results.add(el.src.split('?')[0] + '?' + el.src.split('?')[1]);
+                    document.querySelectorAll('img[src*="photomode"], img[src*="tos-"]').forEach(el => {
+                        if (el.src && !el.src.includes('avatar') && !el.src.includes('cover') && !el.src.includes('icon')) {
+                            results.add(el.src);
                         }
                     });
                     // Selector 2: tplv-photomode srcset images (highest res)
-                    document.querySelectorAll('img[srcset*="photomode"]').forEach(el => {
+                    document.querySelectorAll('img[srcset*="photomode"], img[srcset*="tos-"]').forEach(el => {
                         const srcset = el.srcset || '';
                         const parts = srcset.split(',');
                         if (parts.length) {
                             const last = parts[parts.length - 1].trim().split(' ')[0];
-                            if (last) results.add(last);
+                            if (last && !last.includes('avatar') && !last.includes('icon')) results.add(last);
                         }
                     });
                     // Selector 3: tiktokcdn img tags inside swiper slides
-                    document.querySelectorAll('.swiper-slide img, [class*="PhotoSwiper"] img').forEach(el => {
-                        if (el.src && el.src.startsWith('http')) results.add(el.src);
+                    document.querySelectorAll('.swiper-slide img, [class*="PhotoSwiper"] img, [class*="ImageWrapper"] img, [data-e2e*="image"] img').forEach(el => {
+                        if (el.src && el.src.startsWith('http') && !el.src.includes('avatar') && !el.src.includes('icon')) {
+                            results.add(el.src);
+                        }
                     });
                     return Array.from(results);
                 }""")
                 if image_urls:
                     logger.info(f"DOM img fallback: {len(image_urls)} foto ditemukan dari img tag")
+
+            if not caption:
+                try:
+                    caption = await page.evaluate("""() => {
+                        const metaDesc = document.querySelector('meta[property="og:description"]');
+                        if (metaDesc && metaDesc.content) return metaDesc.content;
+                        const h1 = document.querySelector('h1');
+                        if (h1 && h1.innerText) return h1.innerText.trim();
+                        return '';
+                    }""")
+                except Exception:
+                    pass
 
             browser_cookies = await context.cookies()
             await context.close()
@@ -857,6 +905,7 @@ class MediaDownloader:
                 viewport={"width": 1280, "height": 900},
                 locale="en-US"
             )
+            await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
             # Inject cookies lengkap jika ada (dari cookies_file Netscape atau .env)
             cookies_to_add = []
