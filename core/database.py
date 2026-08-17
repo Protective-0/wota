@@ -104,10 +104,11 @@ class DatabaseManager:
         self._db = await aiosqlite.connect(self.db_path, timeout=30.0)
         self._db.row_factory = aiosqlite.Row  # Hasil query bisa diakses seperti dict
 
-        # Aktifkan WAL mode untuk performa write yang lebih baik dan batasi lockup
+        # Set timeout DULU sebelum mengaktifkan WAL untuk mencegah instant lock pada Linux disk
+        await self._db.execute("PRAGMA busy_timeout = 5000")
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
-        await self._db.execute("PRAGMA busy_timeout = 5000")
+        await self._db.execute("PRAGMA synchronous=NORMAL")
 
         # Jalankan skema DDL untuk membuat semua tabel
         await self._db.executescript(SCHEMA_SQL)
@@ -126,11 +127,14 @@ class DatabaseManager:
         Jika migrasi gagal karena ketidaksesuaian/kerusakan data, rebuild tabel monitored_accounts.
         """
         try:
-            # Dapatkan list kolom saat ini dari tabel monitored_accounts
+            # Dapatkan list kolom saat ini dari tabel monitored_accounts (1x query)
             current_columns = []
+            primary_key = []
             async with self.db.execute("PRAGMA table_info(monitored_accounts)") as cursor:
                 async for row in cursor:
                     current_columns.append(row["name"])
+                    if row["pk"]:
+                        primary_key.append(row["name"])
 
             if not current_columns:
                 logger.info("[⚙️ SYSTEM] Tabel monitored_accounts baru dibuat, tidak memerlukan migrasi.")
@@ -144,21 +148,12 @@ class DatabaseManager:
                 "last_scraped_id": "TEXT",
             }
 
-            needs_rebuild = False
-
-            async with self.db.execute("PRAGMA table_info(monitored_accounts)") as cursor:
-                table_info = [row async for row in cursor]
-            primary_key = [row["name"] for row in table_info if row["pk"]]
-            if primary_key != ["username", "platform"]:
-                needs_rebuild = True
-
-            # Cek juga jika channel_id tidak ada tetapi target_channel_id ada (butuh rebuild/migrasi)
-            if (
-                "channel_id" not in current_columns
+            needs_rebuild = (
+                primary_key != ["username", "platform"]
+                or "channel_id" not in current_columns
                 or "platform" not in current_columns
                 or "initial_scan_completed" not in current_columns
-            ):
-                needs_rebuild = True
+            )
 
             if needs_rebuild:
                 logger.info("[⚙️ SYSTEM] Migrasi memerlukan rekonstruksi tabel monitored_accounts (mengubah primary key / kolom)...")
@@ -176,12 +171,6 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"[❌ ERROR  ] Gagal melakukan migrasi monitored_accounts: {e}. Fallback ke rebuild...", exc_info=True)
             await self._rebuild_monitored_accounts_safely()
-
-    async def _rebuild_monitored_accounts(self) -> None:
-        """
-        Hapus dan buat ulang tabel monitored_accounts secara bersih untuk fault tolerance total.
-        """
-        return await self._rebuild_monitored_accounts_safely()
 
     async def _rebuild_monitored_accounts_safely(self) -> None:
         """Replace legacy schema only after copied rows are safely staged."""

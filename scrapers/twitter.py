@@ -169,8 +169,15 @@ class TwitterScraper(BaseScraper):
         scroll_round = 0
 
         logger.info(f"{TAG_CRAWL} Memulai scroll loop @{username} (max {35} pass, stop {MAX_NO_NEW}x empty)...")
+        import time as _t
+        scroll_start = _t.monotonic()
+        MAX_SCROLL_SECONDS = 180.0  # 3 menit batas waktu scroll safety
 
         while no_new_count < MAX_NO_NEW:
+            if _t.monotonic() - scroll_start > MAX_SCROLL_SECONDS:
+                logger.warning(f"{TAG_WARN} Batas waktu scroll Twitter 180s tercapai untuk @{username} — stop.")
+                break
+
             scroll_round += 1
 
             # Evaluasi langsung di context Javascript browser (super cepat, 0 round-trip latency)

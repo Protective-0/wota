@@ -142,14 +142,18 @@ class TikTokScraper(BaseScraper):
             except Exception as e:
                 logger.warning(f"{TAG_WARN} Refresh timeout/gagal: {e} — lanjut proses...")
 
-            # Proteksi: Pastikan browser tidak dialihkan ke akun login sendiri (@zefriofaizin)
-            if username.lower() not in page.url.lower():
+            # Proteksi: Pastikan browser tidak dialihkan ke login wall, passport, atau akun lain
+            current_url = page.url.lower()
+            if "/login" in current_url or "/passport" in current_url or username.lower() not in current_url:
                 logger.warning(
                     f"{TAG_WARN} Browser dialihkan ke '{page.url}' (bukan @{username}), "
                     f"navigasi paksa ke {canonical_url}..."
                 )
                 await page.goto(canonical_url, wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(2.0)
+                if "/login" in page.url.lower() or "/passport" in page.url.lower():
+                    logger.error(f"{TAG_ERROR} TikTok login wall / passport terdeteksi untuk @{username} — periksa session token!")
+                    return
 
             # 1. First Pass: Coba ekstrak postingan dari data rehydration JSON
             logger.info(f"{TAG_CRAWL} Membaca rehydration JSON dari halaman profil @{username}...")

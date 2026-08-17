@@ -140,9 +140,9 @@ class BaseScraper(ABC):
                 return True
 
         # Cek 2: JSON cookie file
-        BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        cookie_file = os.path.join(BASE_DIR, "config", "cookies", f"{platform}.json")
-        if os.path.exists(cookie_file):
+        cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "config" / "cookies"))
+        cookie_file = cookie_dir / f"{platform}.json"
+        if cookie_file.exists():
             return True
 
         return False
@@ -161,8 +161,8 @@ class BaseScraper(ABC):
             if env_val and os.path.exists(env_val):
                 return env_val
 
-        import platform
-        system = platform.system()
+        import platform as _platform_module
+        system = _platform_module.system()
 
         if system == "Linux":
             # Debian/Ubuntu server: deteksi Chromium dan Chrome system-wide
@@ -259,11 +259,10 @@ class BaseScraper(ABC):
         source = ""  # Untuk logging: "json" atau "env"
 
         # ── Prioritas 1: File cookie dari config/cookies/<platform>.json atau <platform>.txt ──
-        BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        COOKIE_DIR = os.path.join(BASE_DIR, "config", "cookies")
+        cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "config" / "cookies"))
         cookie_candidates = [
-            Path(os.path.join(COOKIE_DIR, f"{platform}.json")),
-            Path(os.path.join(COOKIE_DIR, f"{platform}.txt")),
+            cookie_dir / f"{platform}.json",
+            cookie_dir / f"{platform}.txt",
         ]
 
         for cookie_file in cookie_candidates:

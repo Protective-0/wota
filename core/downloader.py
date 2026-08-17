@@ -294,8 +294,6 @@ class MediaDownloader:
             }
             logger.debug("Suntikkan headers & User-Agent anti-403 untuk TikTok")
 
-        loop = asyncio.get_running_loop()
-
         # Deteksi awal apakah ini post gambar Twitter /photo/ atau Instagram photo post (/p/)
         is_twitter_photo = ("twitter.com" in post_url or "x.com" in post_url) and ("/photo/" in post_url)
         is_instagram_photo = ("instagram.com" in post_url) and ("/p/" in post_url) and (is_video is not True)
@@ -1113,9 +1111,9 @@ class MediaDownloader:
 
         cmd.append(url)
 
-        before = set(self.temp_dir.rglob("*.*"))
         caption = ""
         timestamp = None
+        proc = None
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1141,15 +1139,27 @@ class MediaDownloader:
                             except Exception:
                                 pass
 
-            after = set(self.temp_dir.rglob("*.*"))
-            new_files = [f for f in (after - before) if f.is_file() and f.name.startswith(post_id)]
+            # Scoped glob hanya untuk post_id ini — hemat disk IOPS dibanding recursive rglob
+            new_files = [f for f in self.temp_dir.glob(f"{post_id}_*") if f.is_file()]
             return new_files, caption, timestamp
 
         except asyncio.TimeoutError:
-            logger.error(f"yt-dlp subprocess timeout setelah 180s untuk {url}")
+            logger.error(f"{TAG_ERROR} yt-dlp timeout setelah 180s untuk {url} — membunuh child process...")
+            if proc:
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except Exception:
+                    pass
             return [], "", None
         except Exception as e:
-            logger.error(f"yt-dlp subprocess error untuk {url}: {e}")
+            logger.error(f"{TAG_ERROR} yt-dlp subprocess error untuk {url}: {e}")
+            if proc:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
             return [], "", None
 
     def _run_ytdlp(self, url: str, opts: dict) -> tuple[list[Path], str, Optional[str]]:

@@ -32,6 +32,7 @@ import aiofiles  # Async file I/O agar baca cookies tidak blokir event loop
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from .base import BaseScraper, MediaType, PostMedia, USER_AGENT
+from core.utils import TAG_CRAWL, TAG_SYSTEM, TAG_WARN, TAG_ERROR, TAG_SUCCESS
 
 logger = logging.getLogger(__name__)
 
@@ -173,8 +174,18 @@ class InstagramScraper(BaseScraper):
                 # ──────────────────────────────────────────
                 # TAHAP 4: Ekstraksi Metadata secara Hybrid
                 # ──────────────────────────────────────────
-                logger.info(f"[⚙️ SYSTEM] Memulai ekstraksi metadata Hybrid untuk {len(combined_urls)} post/reels...")
+                logger.info(f"{TAG_CRAWL} Memulai ekstraksi metadata Hybrid untuk {len(combined_urls)} post/reels...")
+                import time as _t
+                crawl_start_time = _t.monotonic()
+                MAX_CRAWL_DURATION = 600.0  # 10 menit batas waktu safety per profil
+
                 for target_url in combined_urls:
+                    if _t.monotonic() - crawl_start_time > MAX_CRAWL_DURATION:
+                        logger.warning(
+                            f"{TAG_WARN} Batas waktu crawl Instagram (10m) tercapai untuk @{username} — menghentikan ekstraksi."
+                        )
+                        break
+
                     post_id = self._extract_post_id(target_url)
                     if not post_id:
                         continue

@@ -512,7 +512,6 @@ class MediaScraperBot(commands.Bot):
                 while not self._job_queue.empty():
                     try:
                         self._job_queue.get_nowait()
-                        self._job_queue.task_done()
                     except (asyncio.QueueEmpty, ValueError):
                         break
 
@@ -688,19 +687,6 @@ class MediaScraperBot(commands.Bot):
                 break
             except Exception as e:
                 logger.error(f"{TAG_ERROR} Kesalahan fatal di Job Worker: {e}", exc_info=True)
-
-    async def close(self) -> None:
-        """Cleanup resources sebelum bot disconnect."""
-        if self._worker_task:
-            self._worker_task.cancel()
-        self.patrol_loop.cancel()
-        await self.db.close()
-        try:
-            await self.downloader.close_browser()
-        except Exception as e:
-            logger.warning(f"Gagal menutup browser downloader: {e}")
-        logger.info("[⚙️ SYSTEM] Bot shutdown — DB closed & patrol loop stopped")
-        await super().close()
 
     async def on_ready(self) -> None:
         """Dipanggil saat bot berhasil connect ke Discord Gateway."""
@@ -900,7 +886,11 @@ class MediaScraperBot(commands.Bot):
             return
 
         if self.is_scanning or self.queue.is_busy or not self._job_queue.empty():
-            logger.info(f"{TAG_PATROL} Task aktif/antrean ada — tunda siklus patrol.")
+            q_size = self._job_queue.qsize()
+            logger.info(
+                f"{TAG_PATROL} Antrean/Task masih aktif (queue_busy={self.queue.is_busy}, "
+                f"job_queue={q_size}, is_scanning={self.is_scanning}) — siklus patroli ditunda."
+            )
             return
 
         # Hanya ambil akun yang siap dipatroli (historical dump selesai)
@@ -1606,9 +1596,12 @@ class MediaScraperBot(commands.Bot):
                 session_dir=SESSION_DIR,
                 headed=BROWSER_HEADED,
             )
+
     async def close(self) -> None:
-        """Graceful shutdown hook untuk membersihkan worker task, browser, dan DB."""
-        logger.info("[⚙️ SYSTEM] Menutup bot dan membersihkan seluruh background worker & subprocess...")
+        """Graceful shutdown hook terpadu untuk membersihkan worker task, loop patrol, browser, dan DB."""
+        logger.info(f"{TAG_SYSTEM} Menutup bot dan membersihkan seluruh background worker & subprocess...")
+        
+        # 1. Batalkan worker background queue dan tunggu selesai
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()
             try:
@@ -1616,17 +1609,23 @@ class MediaScraperBot(commands.Bot):
             except asyncio.CancelledError:
                 pass
 
-        if hasattr(self.downloader, "_browser") and self.downloader._browser:
-            try:
-                await self.downloader._browser.close()
-            except Exception:
-                pass
-        if hasattr(self.downloader, "_playwright") and self.downloader._playwright:
-            try:
-                await self.downloader._playwright.stop()
-            except Exception:
-                pass
+        # 2. Hentikan background patrol loop
+        if self.patrol_loop.is_running():
+            self.patrol_loop.cancel()
 
+        # 3. Tutup browser Playwright shared pool
+        try:
+            await self.downloader.close_browser()
+        except Exception as e:
+            logger.warning(f"{TAG_WARN} Gagal menutup browser downloader: {e}")
+
+        # 4. Flush WAL dan tutup koneksi database SQLite
+        try:
+            await self.db.close()
+        except Exception as e:
+            logger.warning(f"{TAG_WARN} Gagal menutup koneksi DB: {e}")
+
+        logger.info(f"{TAG_SYSTEM} Bot shutdown selesai — resource bersih.")
         await super().close()
 
 
@@ -1650,11 +1649,9 @@ def main() -> None:
         loop = asyncio.get_running_loop()
 
         # Graceful shutdown: SIGTERM (Docker stop / systemd stop) dan SIGINT (Ctrl+C)
-        # Tanpa handler ini, Docker kirim SIGTERM → Python tidak tangkap → tunggu 10s → SIGKILL
-        # Efek SIGKILL: DB commit terakhir hilang, browser Playwright zombie, temp file tidak bersih.
         def _signal_handler():
-            logger.info("[\u2699\ufe0f SYSTEM] SIGTERM/SIGINT diterima \u2014 memulai graceful shutdown...")
-            asyncio.create_task(bot.close())
+            logger.info(f"{TAG_SYSTEM} SIGTERM/SIGINT diterima — menjadwalkan graceful shutdown...")
+            loop.call_soon_threadsafe(loop.create_task, bot.close())
 
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -1665,7 +1662,7 @@ def main() -> None:
 
         try:
             await bot.start(DISCORD_BOT_TOKEN)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         finally:
             if not bot.is_closed():
