@@ -263,6 +263,14 @@ class TikTokScraper(BaseScraper):
             if not isinstance(rehydration_data, dict):
                 rehydration_data = {}
 
+            collected_urls = []
+            seen_urls = set()
+            rehydration_urls = rehydration_data.get("urls", [])
+            expected_video_count = int(rehydration_data.get("videoCount", 0))
+
+            if expected_video_count > 0:
+                logger.info(f"{TAG_CRAWL} Target @{username}: {expected_video_count} video publik terdeteksi.")
+
             # 1. First Pass: Gabungkan URL dari Network API Interceptor & Rehydration Data
             for i_url in intercepted_urls:
                 if i_url not in seen_urls:
