@@ -134,13 +134,17 @@ class TikTokScraper(BaseScraper):
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(2.5)
 
-            # Auto-reload halaman untuk bypass captcha interstitial dan inisialisasi sesi penuh
-            logger.info(f"{TAG_CRAWL} Auto-refresh untuk bypass captcha & inisialisasi sesi...")
-            try:
-                await page.reload(wait_until="domcontentloaded", timeout=60000)
-                await asyncio.sleep(2.0)
-            except Exception as e:
-                logger.warning(f"{TAG_WARN} Refresh timeout/gagal: {e} — lanjut proses...")
+            # Cek jika ada captcha verify overlay sebelum reload
+            has_captcha = await page.evaluate("""() => {
+                return !!(document.querySelector('.captcha_verify_container') || document.querySelector('#captcha-verify-image'));
+            }""")
+            if has_captcha:
+                logger.info(f"{TAG_CRAWL} Captcha overlay terdeteksi — melakukan auto-refresh...")
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=60000)
+                    await asyncio.sleep(2.5)
+                except Exception as e:
+                    logger.warning(f"{TAG_WARN} Refresh timeout/gagal: {e} — lanjut proses...")
 
             # Proteksi: Pastikan browser tidak dialihkan ke login wall, passport, atau akun lain
             current_url = page.url.lower()
@@ -164,42 +168,66 @@ class TikTokScraper(BaseScraper):
                         const u = targetUsername.toLowerCase().replace('@', '');
                         const foundUrls = new Set();
                         let videoCount = 0;
-                        
-                        const scriptEl = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__') || document.getElementById('SIGI_STATE');
+
+                        function searchJson(obj) {
+                            if (!obj || typeof obj !== 'object') return;
+
+                            if (Array.isArray(obj.itemList)) {
+                                for (const item of obj.itemList) {
+                                    if (typeof item === 'string' && /^\d{15,22}$/.test(item)) {
+                                        foundUrls.add(`https://www.tiktok.com/@${u}/video/${item}`);
+                                    } else if (item && typeof item === 'object') {
+                                        const id = item.id || item.itemId || item.vid;
+                                        if (id && /^\d{15,22}$/.test(String(id))) {
+                                            const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0) || item.images;
+                                            const type = isPhoto ? 'photo' : 'video';
+                                            foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (obj.ItemModule && typeof obj.ItemModule === 'object') {
+                                for (const [id, item] of Object.entries(obj.ItemModule)) {
+                                    if (typeof item === 'object' && item) {
+                                        const author = (item.author || item.authorName || item.nickname || '').toLowerCase().replace('@', '');
+                                        if (!author || author === u) {
+                                            const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0) || item.images;
+                                            const type = isPhoto ? 'photo' : 'video';
+                                            foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (obj.stats && (obj.stats.videoCount || obj.stats.video_count)) {
+                                videoCount = obj.stats.videoCount || obj.stats.video_count || videoCount;
+                            }
+                            if (obj.videoCount && typeof obj.videoCount === 'number') {
+                                videoCount = obj.videoCount;
+                            }
+
+                            for (const val of Object.values(obj)) {
+                                if (val && typeof val === 'object') {
+                                    searchJson(val);
+                                }
+                            }
+                        }
+
+                        const scriptEl = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__') || document.getElementById('SIGI_STATE') || document.getElementById('__NEXT_DATA__');
                         if (scriptEl && scriptEl.textContent) {
                             try {
                                 const data = JSON.parse(scriptEl.textContent);
-                                const defaultScope = data.__DEFAULT_SCOPE__ || {};
-                                const userDetail = defaultScope['webapp.user-detail'] || defaultScope['webapp.userDetail'] || {};
-                                const userInfo = userDetail.userInfo || {};
-                                const stats = userInfo.stats || {};
-                                videoCount = stats.videoCount || stats.video_count || 0;
-                                
-                                // Cara 1: userPost.itemList
-                                const userPost = userDetail.userPost || {};
-                                const postItems = userPost.itemList || userDetail.itemList || [];
-                                for (const item of postItems) {
-                                    if (!item) continue;
-                                    const id = typeof item === 'string' ? item : (item.id || item.itemId || '');
-                                    if (!id) continue;
-                                    const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
-                                    const type = isPhoto ? 'photo' : 'video';
-                                    foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                                }
-                                
-                                // Cara 2: ItemModule / ItemList
-                                const itemModule = data.ItemModule || {};
-                                for (const [id, item] of Object.entries(itemModule)) {
-                                    if (typeof item !== 'object') continue;
-                                    const author = (item.author || item.authorName || '').toLowerCase().replace('@', '');
-                                    if (author && author !== u) continue;
-                                    const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0);
-                                    const type = isPhoto ? 'photo' : 'video';
-                                    foundUrls.add(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                                }
+                                searchJson(data);
                             } catch (e) {}
                         }
-                        
+                        if (window.__UNIVERSAL_DATA_FOR_REHYDRATION__) {
+                            searchJson(window.__UNIVERSAL_DATA_FOR_REHYDRATION__);
+                        }
+                        if (window.SIGI_STATE) {
+                            searchJson(window.SIGI_STATE);
+                        }
+
                         return {
                             urls: Array.from(foundUrls),
                             videoCount: videoCount
@@ -254,46 +282,29 @@ class TikTokScraper(BaseScraper):
                 }""")
 
                 # Ambil snapshot URL dari card grid postingan profil (hanya post milik user target)
-                urls_snapshot = await page.evaluate("""
+                urls_snapshot = await page.evaluate(r"""
                     (targetUsername) => {
                         const u = targetUsername.toLowerCase().replace('@', '');
                         const results = [];
                         const seenIds = new Set();
                         
-                        // 1. Ekstrak HANYA dari card container user post di grid
-                        const cards = document.querySelectorAll('[data-e2e="user-post-item"], [data-e2e="user-post-item-desc"]');
-                        for (const card of cards) {
-                            const link = card.tagName === 'A' ? card : card.querySelector('a[href*="/video/"], a[href*="/photo/"], a[href*="/v/"]');
-                            if (link) {
-                                const href = link.getAttribute('href') || link.href || '';
-                                const match = href.match(/\\/(video|photo|v)\\/(\\d{15,22})/);
-                                if (match) {
-                                    const type = match[1] === 'photo' ? 'photo' : 'video';
-                                    const id = match[2];
-                                    if (!seenIds.has(id)) {
-                                        seenIds.add(id);
-                                        results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                                    }
+                        // Ekstrak dari seluruh anchor link postingan di DOM
+                        const allLinks = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"], a[href*="/v/"], [data-e2e="user-post-item"] a, [data-e2e="user-post-item-list"] a, div[class*="DivItemContainer"] a, div[class*="PostItem"] a, div[class*="ItemContainer"] a');
+                        for (const a of allLinks) {
+                            const fullUrl = a.href || a.getAttribute('href') || '';
+                            const match = fullUrl.match(/\/(video|photo|v)\/(\d{15,22})/);
+                            if (match) {
+                                const type = match[1] === 'photo' ? 'photo' : 'video';
+                                const id = match[2];
+                                
+                                const lower = fullUrl.toLowerCase();
+                                if (lower.includes('/@') && !lower.includes('/@' + u + '/')) {
+                                    continue;
                                 }
-                            }
-                        }
-                        
-                        // 2. Fallback: jika selector data-e2e tidak ada, cari link yang EKSPLISIT mengandung @username
-                        if (results.length === 0) {
-                            const allLinks = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
-                            for (const a of allLinks) {
-                                const href = a.getAttribute('href') || a.href || '';
-                                const lower = href.toLowerCase();
-                                if (lower.includes('/@' + u + '/video/') || lower.includes('/@' + u + '/photo/')) {
-                                    const match = href.match(/\\/(video|photo)\\/(\\d{15,22})/);
-                                    if (match) {
-                                        const type = match[1] === 'photo' ? 'photo' : 'video';
-                                        const id = match[2];
-                                        if (!seenIds.has(id)) {
-                                            seenIds.add(id);
-                                            results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                                        }
-                                    }
+                                
+                                if (!seenIds.has(id)) {
+                                    seenIds.add(id);
+                                    results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
                                 }
                             }
                         }
