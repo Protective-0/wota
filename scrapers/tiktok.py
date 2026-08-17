@@ -129,10 +129,32 @@ class TikTokScraper(BaseScraper):
             self.failed = True
             return
 
+        intercepted_urls: set[str] = set()
+
+        async def _on_response(response):
+            try:
+                # Intercept response JSON dari internal endpoint TikTok (post/item_list)
+                req_url = response.url.lower()
+                if "item_list" in req_url or "/api/post" in req_url or "/api/user/post" in req_url:
+                    if response.status == 200:
+                        data = await response.json()
+                        item_list = data.get("itemList", []) or data.get("items", []) or []
+                        for item in item_list:
+                            if isinstance(item, dict):
+                                item_id = item.get("id") or item.get("itemId") or item.get("vid")
+                                if item_id and re.match(r"^\d{15,22}$", str(item_id)):
+                                    is_photo = bool(item.get("imagePost") or item.get("images") or item.get("imageList"))
+                                    t = "photo" if is_photo else "video"
+                                    intercepted_urls.add(f"https://www.tiktok.com/@{username}/{t}/{item_id}")
+            except Exception:
+                pass
+
+        page.on("response", _on_response)
+
         try:
             logger.info(f"{TAG_CRAWL} Membuka halaman profil TikTok: {canonical_url}")
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=60000)
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(3.0)
 
             # Cek jika ada captcha verify overlay sebelum reload
             has_captcha = await page.evaluate("""() => {
@@ -241,13 +263,14 @@ class TikTokScraper(BaseScraper):
             if not isinstance(rehydration_data, dict):
                 rehydration_data = {}
 
-            collected_urls = []
-            seen_urls = set()
-            rehydration_urls = rehydration_data.get("urls", [])
-            expected_video_count = int(rehydration_data.get("videoCount", 0))
+            # 1. First Pass: Gabungkan URL dari Network API Interceptor & Rehydration Data
+            for i_url in intercepted_urls:
+                if i_url not in seen_urls:
+                    collected_urls.append(i_url)
+                    seen_urls.add(i_url)
 
-            if expected_video_count > 0:
-                logger.info(f"{TAG_CRAWL} Target @{username}: {expected_video_count} video publik terdeteksi.")
+            if intercepted_urls:
+                logger.info(f"{TAG_CRAWL} API Interceptor: {len(intercepted_urls)} postingan terdeteksi dari network traffic.")
 
             for r_url in rehydration_urls:
                 if r_url not in seen_urls:
@@ -260,14 +283,23 @@ class TikTokScraper(BaseScraper):
                     f"script tag @{username}."
                 )
 
-            # Tunggu elemen feed TikTok muncul (toleransi jika sudah ada dari rehydration)
+            # Jika pass pertama benar-benar kosong, lakukan 1x refresh terkendali untuk mengaktifkan sesi
+            if not collected_urls:
+                logger.info(f"{TAG_CRAWL} Pass awal kosong — melakukan reload untuk menginisialisasi feed TikTok...")
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=60000)
+                    await asyncio.sleep(3.0)
+                except Exception:
+                    pass
+
+            # Tunggu elemen feed TikTok muncul (toleransi jika sudah ada dari rehydration/interceptor)
             logger.info(f"{TAG_CRAWL} Menunggu feed DOM TikTok siap...")
             try:
-                await page.wait_for_selector('a[href*="/video/"], a[href*="/photo/"]', timeout=10000)
+                await page.wait_for_selector('a[href*="/video/"], a[href*="/photo/"]', timeout=8000)
             except Exception:
                 logger.debug(f"{TAG_CRAWL} Selector feed DOM timeout — lanjut scroll.")
 
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.5)
 
             # 2. Second Pass: Scrolling DOM & ekstraksi link postingan (bounded loop max 6 scroll)
             logger.info(f"{TAG_CRAWL} Mulai scroll+ekstraksi feed @{username} (max {6} pass)...")
@@ -313,7 +345,13 @@ class TikTokScraper(BaseScraper):
                     }
                 """, username)
 
-                new_added = 0
+                # Tambahkan URL baru yang tertangkap dari interceptor selama scrolling
+                for i_url in intercepted_urls:
+                    if i_url not in seen_urls:
+                        collected_urls.append(i_url)
+                        seen_urls.add(i_url)
+                        new_added += 1
+
                 for href in urls_snapshot:
                     clean_url = href.split("?")[0]
                     if clean_url.startswith('/'):
@@ -351,9 +389,9 @@ class TikTokScraper(BaseScraper):
                     logger.info(f"{TAG_CRAWL} 3x scroll kosong berturut — feed @{username} sudah habis.")
                     break
 
-                # Scroll ke bawah secara terukur
-                await page.evaluate("window.scrollBy(0, 1200)")
-                await asyncio.sleep(2.0)
+                # Scroll ke bawah untuk memicu IntersectionObserver TikTok memuat batch berikutnya
+                await page.evaluate("window.scrollBy(0, 1500)")
+                await asyncio.sleep(2.5)
 
             # Safety cap jika ada videoCount terdeteksi
             if expected_video_count > 0 and len(collected_urls) > expected_video_count:
