@@ -353,6 +353,8 @@ class TikTokScraper(BaseScraper):
                     }
                 """, username)
 
+                new_added = 0
+
                 # Tambahkan URL baru yang tertangkap dari interceptor selama scrolling
                 for i_url in intercepted_urls:
                     if i_url not in seen_urls:
