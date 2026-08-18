@@ -141,6 +141,20 @@ class TikTokScraper(BaseScraper):
                         item_list = data.get("itemList", []) or data.get("items", []) or []
                         for item in item_list:
                             if isinstance(item, dict):
+                                author = item.get("author")
+                                author_name = ""
+                                if isinstance(author, dict):
+                                    author_name = author.get("uniqueId") or author.get("id") or ""
+                                elif isinstance(author, str):
+                                    author_name = author
+                                
+                                author_clean = str(author_name).lower().replace("@", "").strip()
+                                target_clean = username.lower().replace("@", "").strip()
+
+                                # HANYA ambil jika author postingan sama persis dengan target_clean
+                                if author_clean and author_clean != target_clean:
+                                    continue
+
                                 item_id = item.get("id") or item.get("itemId") or item.get("vid")
                                 if item_id and re.match(r"^\d{15,22}$", str(item_id)):
                                     is_photo = bool(item.get("imagePost") or item.get("images") or item.get("imageList"))
@@ -329,6 +343,16 @@ class TikTokScraper(BaseScraper):
                                     if (!items || !items.length) break;
 
                                     for (const item of items) {
+                                        const author = item.author;
+                                        let itemAuthor = '';
+                                        if (author && typeof author === 'object') {
+                                            itemAuthor = author.uniqueId || author.id || '';
+                                        } else if (typeof author === 'string') {
+                                            itemAuthor = author;
+                                        }
+                                        const cleanAuthor = String(itemAuthor).toLowerCase().replace('@', '').trim();
+                                        if (cleanAuthor && cleanAuthor !== u) continue;
+
                                         const id = item.id || item.itemId || item.vid;
                                         if (id) {
                                             const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0) || item.images;
@@ -391,9 +415,17 @@ class TikTokScraper(BaseScraper):
                         const results = [];
                         const seenIds = new Set();
                         
-                        // Ekstrak dari seluruh anchor link postingan di DOM
-                        const allLinks = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"], a[href*="/v/"], [data-e2e="user-post-item"] a, [data-e2e="user-post-item-list"] a, div[class*="DivItemContainer"] a, div[class*="PostItem"] a, div[class*="ItemContainer"] a');
+                        // Ekstrak HANYA dari container grid postingan profil
+                        const gridContainer = document.querySelector('[data-e2e="user-post-item-list"]') || document.querySelector('main') || document.querySelector('#main-content-others_homepage');
+                        const root = gridContainer || document;
+                        const allLinks = root.querySelectorAll('a[href*="/video/"], a[href*="/photo/"], a[href*="/v/"]');
+                        
                         for (const a of allLinks) {
+                            // Abaikan link yang berada di sidebar rekomendasi / footer / suggestions
+                            if (a.closest('aside, [data-e2e="recommend-list"], [data-e2e="sidebar"], nav, footer, [class*="Suggest"]')) {
+                                continue;
+                            }
+
                             const fullUrl = a.href || a.getAttribute('href') || '';
                             const match = fullUrl.match(/\/(video|photo|v)\/(\d{15,22})/);
                             if (match) {
@@ -401,8 +433,15 @@ class TikTokScraper(BaseScraper):
                                 const id = match[2];
                                 
                                 const lower = fullUrl.toLowerCase();
-                                if (lower.includes('/@') && !lower.includes('/@' + u + '/')) {
-                                    continue;
+                                if (lower.includes('/@')) {
+                                    if (!lower.includes('/@' + u + '/')) {
+                                        continue; // Milik akun lain
+                                    }
+                                } else {
+                                    // Jika URL relative tanpa username, WAJIB berada di user-post card container
+                                    if (!a.closest('[data-e2e="user-post-item"], [data-e2e="user-post-item-list"], div[class*="DivItemContainer"], div[class*="PostItem"]')) {
+                                        continue;
+                                    }
                                 }
                                 
                                 if (!seenIds.has(id)) {

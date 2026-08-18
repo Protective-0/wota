@@ -1766,6 +1766,10 @@ class MediaDownloader:
             str(input_path),
             "-c:v",
             "libx264",
+            "-preset",
+            "veryfast",
+            "-threads",
+            "2",
             "-b:v",
             f"{target_kbps}k",
             "-maxrate",
@@ -1791,7 +1795,7 @@ class MediaDownloader:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=90,
             )
             if result.returncode != 0:
                 logger.error(
@@ -1800,7 +1804,7 @@ class MediaDownloader:
                 return False
             return True
         except subprocess.TimeoutExpired:
-            logger.error("ffmpeg timeout setelah 10 menit")
+            logger.error("ffmpeg timeout setelah 90 detik")
             return False
         except FileNotFoundError:
             logger.error(
