@@ -173,11 +173,17 @@ class BaseScraper(ABC):
                 "/usr/bin/google-chrome-stable",
                 "/snap/bin/chromium",
             ]
+            # Di container Playwright, cari binary full chrome di /ms-playwright
+            ms_playwright_dir = Path("/ms-playwright")
+            if ms_playwright_dir.exists():
+                for chrome_bin in sorted(ms_playwright_dir.glob("chromium-*/chrome-linux/chrome"), reverse=True):
+                    if chrome_bin.exists():
+                        linux_paths.append(str(chrome_bin))
+
             for path in linux_paths:
                 if os.path.exists(path):
-                    logger.info(f"Linux system browser ditemukan: {path}")
+                    logger.info(f"[⚙️ SYSTEM] Linux browser ditemukan: {path}")
                     return path
-            # Tidak ada system browser → Playwright unduh Chromium sendiri (normal untuk Docker)
             return None
 
         # 2. Windows: Brave Browser
@@ -240,6 +246,8 @@ class BaseScraper(ABC):
         }
         if brave_path:
             launch_kwargs["executable_path"] = brave_path
+        elif _platform_module.system() == "Linux":
+            launch_kwargs["channel"] = "chromium"
 
         if proxy:
             launch_kwargs["proxy"] = {"server": proxy}
