@@ -168,7 +168,11 @@ class TikTokScraper(BaseScraper):
         try:
             logger.info(f"{TAG_CRAWL} Membuka halaman profil TikTok: {canonical_url}")
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=60000)
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(2.5)
+
+            # Scroll awal untuk memicu event network loading feed internal TikTok
+            await page.evaluate("window.scrollBy(0, 1200)")
+            await asyncio.sleep(2.5)
 
             # Cek jika ada captcha verify overlay sebelum reload
             has_captcha = await page.evaluate("""() => {
@@ -294,102 +298,36 @@ class TikTokScraper(BaseScraper):
             if sec_uid:
                 logger.info(f"{TAG_CRAWL} secUid terdeteksi untuk @{username}: {sec_uid[:16]}...")
 
-            # 1. First Pass: Gabungkan URL dari Network API Interceptor & Rehydration Data
-            for i_url in intercepted_urls:
-                if i_url not in seen_urls:
-                    collected_urls.append(i_url)
-                    seen_urls.add(i_url)
+            # 1. First Pass: Kumpulkan URL dari Network API Interceptor dengan scroll pemicu
+            for _ in range(4):
+                for i_url in intercepted_urls:
+                    if i_url not in seen_urls:
+                        collected_urls.append(i_url)
+                        seen_urls.add(i_url)
 
-            if intercepted_urls:
-                logger.info(f"{TAG_CRAWL} API Interceptor: {len(intercepted_urls)} postingan terdeteksi dari network traffic.")
+                if expected_video_count > 0 and len(collected_urls) >= expected_video_count:
+                    break
+
+                await page.evaluate("window.scrollBy(0, 1500)")
+                await asyncio.sleep(2.0)
 
             for r_url in rehydration_urls:
                 if r_url not in seen_urls:
                     collected_urls.append(r_url)
                     seen_urls.add(r_url)
 
-            if rehydration_urls:
-                logger.info(
-                    f"{TAG_CRAWL} Rehydration JSON: {len(rehydration_urls)} postingan langsung dari "
-                    f"script tag @{username}."
-                )
+            if collected_urls:
+                logger.info(f"{TAG_CRAWL} Berhasil mengumpulkan {len(collected_urls)} postingan dari network stream @{username}.")
 
-            # 2. Second Pass (Super Fast & Resilient): Direct In-Browser API Fetch menggunakan secUid
-            if sec_uid and len(collected_urls) < (expected_video_count or 1):
-                logger.info(f"{TAG_CRAWL} Memanggil direct API endpoint TikTok dengan secUid @{username}...")
-                try:
-                    direct_urls = await page.evaluate(r"""
-                        async (params) => {
-                            const u = params.username.toLowerCase().replace('@', '');
-                            const secUid = params.secUid;
-                            const targetCount = params.targetCount || 35;
-                            const results = [];
-                            let cursor = 0;
-                            let hasMore = true;
-                            let attempts = 0;
-
-                            while (hasMore && results.length < targetCount && attempts < 6) {
-                                attempts++;
-                                try {
-                                    const url = `/api/post/item_list/?aid=1988&app_language=en&app_name=tiktok_web&count=35&cursor=${cursor}&secUid=${encodeURIComponent(secUid)}&device_platform=web_pc`;
-                                    const res = await fetch(url, {
-                                        headers: {
-                                            'Accept': 'application/json, text/plain, */*'
-                                        }
-                                    });
-                                    if (!res.ok) break;
-                                    const data = await res.json();
-                                    const items = data.itemList || data.items || [];
-                                    if (!items || !items.length) break;
-
-                                    for (const item of items) {
-                                        const author = item.author;
-                                        let itemAuthor = '';
-                                        if (author && typeof author === 'object') {
-                                            itemAuthor = author.uniqueId || author.unique_id || author.nickname || '';
-                                        } else if (typeof author === 'string') {
-                                            itemAuthor = author;
-                                        }
-                                        const cleanAuthor = String(itemAuthor).toLowerCase().replace('@', '').trim();
-                                        if (cleanAuthor && cleanAuthor !== u) continue;
-
-                                        const id = item.id || item.itemId || item.vid;
-                                        if (id) {
-                                            const isPhoto = item.imagePost || (item.imageList && item.imageList.length > 0) || item.images;
-                                            const type = isPhoto ? 'photo' : 'video';
-                                            results.push(`https://www.tiktok.com/@${u}/${type}/${id}`);
-                                        }
-                                    }
-
-                                    cursor = data.cursor || 0;
-                                    hasMore = !!data.hasMore && results.length < targetCount;
-                                    if (!hasMore) break;
-                                } catch (e) {
-                                    break;
-                                }
-                            }
-                            return results;
-                        }
-                    """, {"username": username, "secUid": sec_uid, "targetCount": expected_video_count or 35})
-
-                    if direct_urls:
-                        logger.info(f"{TAG_CRAWL} Direct API: +{len(direct_urls)} postingan berhasil diambil via secUid.")
-                        for d_url in direct_urls:
-                            if d_url not in seen_urls:
-                                collected_urls.append(d_url)
-                                seen_urls.add(d_url)
-                except Exception as e:
-                    logger.warning(f"{TAG_WARN} Direct API fetch error: {e}")
-
-            # Jika pass direct API dan rehydration sudah mencukupi target, langsung selesai tanpa scroll DOM
+            # Jika sudah mencukupi target, langsung lanjut tanpa scroll DOM
             if expected_video_count > 0 and len(collected_urls) >= expected_video_count:
                 collected_urls = collected_urls[:expected_video_count]
                 logger.info(
-                    f"{TAG_CRAWL} Target tercapai via API/Rehydration: {len(collected_urls)}/{expected_video_count} "
+                    f"{TAG_CRAWL} Target tercapai: {len(collected_urls)}/{expected_video_count} "
                     f"URL @{username} terkumpul."
                 )
             else:
-                # 3. Third Pass: Scrolling DOM & ekstraksi link postingan (bounded loop max 6 scroll)
+                # 2. Second Pass: Scrolling DOM fallback jika network stream belum lengkap
                 logger.info(f"{TAG_CRAWL} Menunggu feed DOM TikTok siap...")
                 try:
                     await page.wait_for_selector('a[href*="/video/"], a[href*="/photo/"]', timeout=6000)
