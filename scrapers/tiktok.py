@@ -144,7 +144,7 @@ class TikTokScraper(BaseScraper):
                                 author = item.get("author")
                                 author_name = ""
                                 if isinstance(author, dict):
-                                    author_name = author.get("uniqueId") or author.get("id") or ""
+                                    author_name = author.get("uniqueId") or author.get("unique_id") or author.get("nickname") or ""
                                 elif isinstance(author, str):
                                     author_name = author
                                 
@@ -346,7 +346,7 @@ class TikTokScraper(BaseScraper):
                                         const author = item.author;
                                         let itemAuthor = '';
                                         if (author && typeof author === 'object') {
-                                            itemAuthor = author.uniqueId || author.id || '';
+                                            itemAuthor = author.uniqueId || author.unique_id || author.nickname || '';
                                         } else if (typeof author === 'string') {
                                             itemAuthor = author;
                                         }
