@@ -391,19 +391,20 @@ class BaseScraper(ABC):
             )
             return None
 
-        # ── Injeksi ke Playwright browser context ──
-        try:
-            await context.add_cookies(cookies_to_inject)
-            logger.info(
-                f"[⚙️ SYSTEM] {len(cookies_to_inject)} cookie berhasil diinjeksi "
-                f"ke {platform} (sumber: {source})."
-            )
-        except Exception as e:
-            logger.error(
-                f"[❌ ERROR  ] Gagal menginjeksi cookie {platform}: {e}",
-                exc_info=True,
-            )
-            return None
+        # ── Injeksi ke Playwright browser context jika disediakan ──
+        if context is not None:
+            try:
+                await context.add_cookies(cookies_to_inject)
+                logger.info(
+                    f"[⚙️ SYSTEM] {len(cookies_to_inject)} cookie berhasil diinjeksi "
+                    f"ke {platform} (sumber: {source})."
+                )
+            except Exception as e:
+                logger.error(
+                    f"[❌ ERROR  ] Gagal menginjeksi cookie {platform}: {e}",
+                    exc_info=True,
+                )
+                return None
 
         # ── Export ke Netscape format untuk yt-dlp ──
         try:
