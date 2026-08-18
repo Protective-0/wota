@@ -1664,6 +1664,12 @@ def main() -> None:
             await bot.start(DISCORD_BOT_TOKEN)
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
+        except Exception as e:
+            # Jika bot sedang shutdown/close, abaikan exception penutupan connector aiohttp
+            if bot.is_closed() or "Connector is closed" in str(e):
+                pass
+            else:
+                logger.error(f"{TAG_ERROR} Bot runtime error: {e}")
         finally:
             if not bot.is_closed():
                 await bot.close()
