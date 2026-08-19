@@ -29,6 +29,11 @@ import time as _time
 
 logger = logging.getLogger(__name__)
 
+from scrapers.base import (
+    BaseScraper,
+    DOCKER_CHROMIUM_FLAGS,
+    HAS_SCRAPLING,
+)
 from .utils import (
     TAG_DOWN, TAG_COMPR, TAG_SYSTEM, TAG_WARN, TAG_ERROR, TAG_SUCCESS, TAG_CRAWL,
     fmt_size, fmt_duration,
@@ -555,42 +560,29 @@ class MediaDownloader:
                 if not ct0 and "ct0" in parsed_c:
                     ct0 = parsed_c["ct0"]
 
-            # Optimization: reuse existing browser instance from self.get_browser() instead of spawning new async_playwright() instances
-            browser = await self.get_browser()
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 900},
-                locale="id-ID"
-            )
+            twitter_cookies = []
+            for name, value, domains in [
+                ("auth_token", auth_token, [".x.com", ".twitter.com"]),
+                ("ct0",        ct0,        [".x.com", ".twitter.com"]),
+            ]:
+                if value:
+                    for domain in domains:
+                        twitter_cookies.append({
+                            "name": name,
+                            "value": value.strip(),
+                            "domain": domain,
+                            "path": "/",
+                        })
 
-            if auth_token or ct0:
-                # FIX: guard each cookie with its own None check before .strip().
-                # If auth_token is None (env not set, cookies_file missing auth_token),
-                # calling auth_token.strip() raises AttributeError and crashes the fallback.
-                twitter_cookies = []
-                for name, value, domains in [
-                    ("auth_token", auth_token, [".x.com", ".twitter.com"]),
-                    ("ct0",        ct0,        [".x.com", ".twitter.com"]),
-                ]:
-                    if value:  # Skip entirely if token is None or empty string
-                        for domain in domains:
-                            twitter_cookies.append({
-                                "name": name,
-                                "value": value.strip(),
-                                "domain": domain,
-                                "path": "/",
-                            })
-                if twitter_cookies:
-                    await context.add_cookies(twitter_cookies)
+            unique_images = []
 
-            page = await context.new_page()
-            try:
-                await page.goto(post_url, wait_until="domcontentloaded", timeout=25000)
+            async def _twitter_page_action(page):
+                nonlocal real_caption, ytdl_timestamp, unique_images
                 try:
                     await page.wait_for_selector('article, [data-testid="tweet"], img[src*="pbs.twimg.com/media/"]', timeout=12000)
                 except Exception:
                     pass
-                await asyncio.sleep(2.5) # Beri jeda render gambar
+                await asyncio.sleep(2.0)
 
                 # Ambil caption/teks tweet
                 try:
@@ -605,8 +597,8 @@ class MediaDownloader:
                     time_el = await page.query_selector('article time, time')
                     if time_el:
                         ytdl_timestamp = await time_el.get_attribute("datetime")
-                except Exception as e:
-                    logger.warning(f"Gagal mengambil timestamp di Twitter fallback: {e}")
+                except Exception:
+                    pass
 
                 # Kumpulkan semua URL gambar pbs.twimg.com dari tweet
                 img_srcs = await page.evaluate("""() => {
@@ -615,15 +607,13 @@ class MediaDownloader:
                         .map(img => img.src)
                         .filter(src => src && src.includes('pbs.twimg.com/media/') && !src.includes('profile_images') && !src.includes('emoji'));
                 }""")
-                unique_images = []
                 seen_urls = set()
 
-                for src in img_srcs:
+                for src in (img_srcs or []):
                     if src:
                         clean_src = src.split("?")[0]
                         if clean_src not in seen_urls:
                             seen_urls.add(clean_src)
-                            # Gunakan format kualitas original
                             if "format=" in src:
                                 high_res = re.sub(r"name=\w+", "name=orig", src)
                                 if "name=" not in high_res:
@@ -632,8 +622,32 @@ class MediaDownloader:
                                 high_res = f"{clean_src}?format=jpg&name=orig"
                             unique_images.append(high_res)
 
-            finally:
-                await context.close()
+            try:
+                if HAS_SCRAPLING:
+                    await BaseScraper.fetch_stealth_page(
+                        post_url,
+                        cookies=twitter_cookies if twitter_cookies else None,
+                        page_action=_twitter_page_action,
+                        timeout=25000,
+                        headless=True,
+                    )
+                else:
+                    browser = await self.get_browser()
+                    context = await browser.new_context(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        viewport={"width": 1280, "height": 900},
+                        locale="id-ID"
+                    )
+                    if twitter_cookies:
+                        await context.add_cookies(twitter_cookies)
+                    page = await context.new_page()
+                    try:
+                        await page.goto(post_url, wait_until="domcontentloaded", timeout=25000)
+                        await _twitter_page_action(page)
+                    finally:
+                        await context.close()
+            except Exception as tw_err:
+                logger.warning(f"Twitter fallback fetch error: {tw_err}")
 
             # Mulai unduh asinkron menggunakan httpx dengan session cookies
             if unique_images:
@@ -679,51 +693,61 @@ class MediaDownloader:
         return downloaded_files, real_caption, ytdl_timestamp
 
     async def _extract_tiktok_carousel_urls(self, url: str, cookies_file: Optional[str] = None) -> tuple[list[str], str]:
-        """Ekstrak list URL gambar carousel dan caption dari webpage TikTok secara async."""
+        """Ekstrak list URL gambar carousel dan caption dari webpage TikTok secara async menggunakan Scrapling TLS Fetcher."""
         import httpx
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.tiktok.com/",
         }
 
-        # Load cookies dari Netscape format (jika dikirim oleh scraper) untuk HTTPX
         cookies_dict = {}
         if cookies_file and Path(cookies_file).exists():
             try:
-                # Netscape cookie format parser sederhana asinkron
-                async with aiofiles.open(cookies_file, "r", encoding="utf-8") as f:
-                    async for line in f:
-                        if line.startswith("#") or not line.strip():
-                            continue
-                        parts = line.strip().split("\t")
-                        if len(parts) >= 7:
-                            domain, _, path, _, _, name, value = parts[:7]
-                            cookies_dict[name] = value
-                logger.debug(f"Parser memuat {len(cookies_dict)} cookies untuk HTTPX dari {cookies_file}")
+                cookies_dict = self._parse_netscape_cookies(cookies_file)
             except Exception as e:
-                logger.warning(f"Gagal parse Netscape cookie file untuk HTTPX: {e}")
+                logger.warning(f"Gagal parse Netscape cookie file: {e}")
+
+        html_content = ""
+        # 1. Coba Scrapling HTTP Fetcher (TLS spoofing chrome124)
+        if HAS_SCRAPLING:
+            try:
+                resp = await BaseScraper.fetch_http_page(
+                    url,
+                    cookies=cookies_dict if cookies_dict else None,
+                    headers=headers,
+                    impersonate="chrome124",
+                    timeout=15,
+                )
+                html_content = getattr(resp, "text", "") or ""
+            except Exception as e:
+                logger.debug(f"Scrapling fetch_http_page info: {e}")
+
+        # 2. Fallback ke httpx jika Scrapling belum ada/gagal
+        if not html_content:
+            try:
+                async with httpx.AsyncClient(
+                    headers={"User-Agent": SHARED_USER_AGENT, **headers},
+                    cookies=cookies_dict if cookies_dict else None,
+                    follow_redirects=True,
+                    timeout=15,
+                ) as client:
+                    resp = await client.get(url)
+                    if resp.status_code == 200:
+                        html_content = resp.text
+            except Exception as e:
+                logger.debug(f"HTTPX fetch info: {e}")
+
+        if not html_content:
+            return [], ""
 
         try:
-            async with httpx.AsyncClient(
-                headers=headers,
-                cookies=cookies_dict if cookies_dict else None,
-                follow_redirects=True,
-                timeout=15
-            ) as client:
-                resp = await client.get(url)
-                if resp.status_code != 200:
-                    return [], ""
-                html_content = resp.text
-
-            # Cari script __UNIVERSAL_DATA_FOR_REHYDRATION__ (state rehydration data modern TikTok)
             match = re.search(
                 r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)</script>',
                 html_content,
             )
             if not match:
-                # Fallback: Cari SIGI_STATE (state rehydration data lama TikTok)
                 match = re.search(
                     r'<script id="SIGI_STATE"[^>]*>([\s\S]*?)</script>', html_content
                 )
@@ -737,14 +761,11 @@ class MediaDownloader:
             data = json.loads(match.group(1))
             image_urls = _extract_tiktok_image_urls_from_rehydration(data)
 
-            # Ekstrak deskripsi/caption postingan secara aman dari rehydration data
             caption = ""
             try:
                 default_scope = data.get("__DEFAULT_SCOPE__", {})
-                # Cek flat key first
                 video_detail = default_scope.get("webapp.video-detail", {}) or default_scope.get("webapp.videoDetail", {})
                 if not video_detail:
-                    # Fallback ke nested key
                     webapp = default_scope.get("webapp", {})
                     video_detail = webapp.get("video-detail", {}) or webapp.get("videoDetail", {})
                 item_struct = video_detail.get("itemInfo", {}).get("itemStruct", {})
@@ -761,64 +782,46 @@ class MediaDownloader:
         self, post_url: str, cookies_file: Optional[str] = None
     ) -> tuple[list[str], str, list[dict]]:
         """
-        Playwright Fallback Extractor khusus TikTok Carousel.
+        Scrapling Stealth Fallback Extractor khusus TikTok Carousel.
         Membuka halaman postingan TikTok, menanti pemuatan, dan mengekstrak data rehydration JSON secara dinamis.
         """
         import os
         import json
 
-        image_urls = []
+        image_urls: list[str] = []
         caption = ""
-        browser_cookies = []
+        browser_cookies: list[dict] = []
 
         tiktok_session_id = os.getenv("TIKTOK_SESSION_ID")
+        cookies_to_add: list[dict] = []
 
-        try:
-            browser = await self.get_browser()
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 900},
-                locale="en-US"
-            )
-            await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        if cookies_file and Path(cookies_file).exists():
+            try:
+                parsed_c = self._parse_netscape_cookies(cookies_file)
+                for k, v in parsed_c.items():
+                    cookies_to_add.append({
+                        "name": k,
+                        "value": v,
+                        "domain": ".tiktok.com",
+                        "path": "/",
+                        "secure": True,
+                    })
+            except Exception as e:
+                logger.warning(f"Gagal parse Netscape cookie: {e}")
 
-            # Inject cookies lengkap jika ada (dari cookies_file Netscape atau .env)
-            cookies_to_add = []
-            if cookies_file and Path(cookies_file).exists():
-                try:
-                    async with aiofiles.open(cookies_file, "r", encoding="utf-8") as f:
-                        async for line in f:
-                            if line.startswith("#") or not line.strip():
-                                continue
-                            parts = line.strip().split("\t")
-                            if len(parts) >= 7:
-                                domain, _, path, secure, _, name, value = parts[:7]
-                                cookies_to_add.append({
-                                    "name": name.strip(),
-                                    "value": value.strip(),
-                                    "domain": domain.strip(),
-                                    "path": path.strip() or "/",
-                                    "secure": secure.upper() == "TRUE",
-                                })
-                except Exception as e:
-                    logger.warning(f"Gagal parse Netscape cookie untuk Playwright fallback: {e}")
+        if not cookies_to_add and tiktok_session_id:
+            cookies_to_add.append({
+                "name": "sessionid",
+                "value": tiktok_session_id.strip(),
+                "domain": ".tiktok.com",
+                "path": "/",
+            })
 
-            if not cookies_to_add and tiktok_session_id:
-                cookies_to_add.append({
-                    "name": "sessionid",
-                    "value": tiktok_session_id.strip(),
-                    "domain": ".tiktok.com",
-                    "path": "/",
-                })
+        async def _carousel_page_action(page):
+            nonlocal image_urls, caption, browser_cookies
+            await asyncio.sleep(2.0)
 
-            if cookies_to_add:
-                await context.add_cookies(cookies_to_add)
-
-            page = await context.new_page()
-            await page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(2.5)  # Jeda aman agar React/Swiper component selesai render
-
-            # Path A: Try rehydration JSON first from window or script tag
+            # Path A: Rehydration JSON
             json_content = await page.evaluate("""() => {
                 if (window.__UNIVERSAL_DATA_FOR_REHYDRATION__) {
                     return JSON.stringify(window.__UNIVERSAL_DATA_FOR_REHYDRATION__);
@@ -837,7 +840,6 @@ class MediaDownloader:
                 try:
                     raw_data = json.loads(json_content)
                     image_urls = _extract_tiktok_image_urls_from_rehydration(raw_data)
-
                     try:
                         default_scope = raw_data.get("__DEFAULT_SCOPE__", {})
                         video_detail = default_scope.get("webapp.video-detail", {}) or default_scope.get("webapp.videoDetail", {})
@@ -851,18 +853,15 @@ class MediaDownloader:
                 except Exception as json_err:
                     logger.warning(f"Gagal memparsing rehydration JSON TikTok: {json_err}")
 
-            # Path B: Direct DOM img-tag scraper if rehydration failed
+            # Path B: DOM img fallback
             if not image_urls:
-                logger.debug("Rehydration kosong — scraping img tag photomode dari DOM...")
                 image_urls = await page.evaluate("""() => {
                     const results = new Set();
-                    // Selector 1: photomode swiper images
                     document.querySelectorAll('img[src*="photomode"], img[src*="tos-"]').forEach(el => {
                         if (el.src && !el.src.includes('avatar') && !el.src.includes('cover') && !el.src.includes('icon')) {
                             results.add(el.src);
                         }
                     });
-                    // Selector 2: tplv-photomode srcset images (highest res)
                     document.querySelectorAll('img[srcset*="photomode"], img[srcset*="tos-"]').forEach(el => {
                         const srcset = el.srcset || '';
                         const parts = srcset.split(',');
@@ -871,16 +870,13 @@ class MediaDownloader:
                             if (last && !last.includes('avatar') && !last.includes('icon')) results.add(last);
                         }
                     });
-                    // Selector 3: tiktokcdn img tags inside swiper slides
                     document.querySelectorAll('.swiper-slide img, [class*="PhotoSwiper"] img, [class*="ImageWrapper"] img, [data-e2e*="image"] img').forEach(el => {
                         if (el.src && el.src.startsWith('http') && !el.src.includes('avatar') && !el.src.includes('icon')) {
                             results.add(el.src);
                         }
                     });
                     return Array.from(results);
-                }""")
-                if image_urls:
-                    logger.info(f"DOM img fallback: {len(image_urls)} foto ditemukan dari img tag")
+                }""") or []
 
             if not caption:
                 try:
@@ -890,15 +886,42 @@ class MediaDownloader:
                         const h1 = document.querySelector('h1');
                         if (h1 && h1.innerText) return h1.innerText.trim();
                         return '';
-                    }""")
+                    }""") or ""
                 except Exception:
                     pass
 
-            browser_cookies = await context.cookies()
-            await context.close()
+            if hasattr(page, "context"):
+                try:
+                    browser_cookies = await page.context.cookies()
+                except Exception:
+                    pass
+
+        try:
+            if HAS_SCRAPLING:
+                await BaseScraper.fetch_stealth_page(
+                    post_url,
+                    cookies=cookies_to_add if cookies_to_add else None,
+                    page_action=_carousel_page_action,
+                    timeout=30000,
+                    headless=True,
+                )
+            else:
+                browser = await self.get_browser()
+                context = await browser.new_context(
+                    user_agent=SHARED_USER_AGENT,
+                    viewport={"width": 1280, "height": 900},
+                    locale="en-US"
+                )
+                if cookies_to_add:
+                    await context.add_cookies(cookies_to_add)
+                page = await context.new_page()
+                try:
+                    await page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
+                    await _carousel_page_action(page)
+                finally:
+                    await context.close()
         except Exception as e:
             logger.warning(f"Browser fallback extractor failed: {e}")
-            browser_cookies = []
 
         return image_urls, caption, cast(list[dict], browser_cookies)
 
@@ -906,68 +929,48 @@ class MediaDownloader:
         self, post_url: str, cookies_file: Optional[str] = None
     ) -> tuple[Optional[str], str, list[dict]]:
         """
-        Playwright Fallback Extractor khusus TikTok Video.
+        Scrapling Stealth Fallback Extractor khusus TikTok Video.
         Membuka halaman postingan TikTok, menanti pemuatan tag video, dan mengekstrak direct CDN URL serta caption.
         """
         video_url = None
         caption = ""
-        browser_cookies = []
+        browser_cookies: list[dict] = []
 
         tiktok_session_id = os.getenv("TIKTOK_SESSION_ID")
+        cookies_to_add: list[dict] = []
 
-        try:
-            browser = await self.get_browser()
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 900},
-                locale="en-US"
-            )
-            await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-            # Inject cookies lengkap jika ada (dari cookies_file Netscape atau .env)
-            cookies_to_add = []
-            if cookies_file and Path(cookies_file).exists():
-                try:
-                    async with aiofiles.open(cookies_file, "r", encoding="utf-8") as f:
-                        async for line in f:
-                            if line.startswith("#") or not line.strip():
-                                continue
-                            parts = line.strip().split("\t")
-                            if len(parts) >= 7:
-                                domain, _, path, secure, _, name, value = parts[:7]
-                                cookies_to_add.append({
-                                    "name": name.strip(),
-                                    "value": value.strip(),
-                                    "domain": domain.strip(),
-                                    "path": path.strip() or "/",
-                                    "secure": secure.upper() == "TRUE",
-                                })
-                except Exception as e:
-                    logger.warning(f"Gagal parse Netscape cookie untuk Playwright fallback: {e}")
-
-            if not cookies_to_add and tiktok_session_id:
-                cookies_to_add.append({
-                    "name": "sessionid",
-                    "value": tiktok_session_id.strip(),
-                    "domain": ".tiktok.com",
-                    "path": "/",
-                })
-
-            if cookies_to_add:
-                await context.add_cookies(cookies_to_add)
-
-            page = await context.new_page()
-            
-            # Masuk ke halaman video
-            await page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
-            
-            # Tunggu elemen video atau rehydration data muncul
+        if cookies_file and Path(cookies_file).exists():
             try:
-                await page.wait_for_selector("video, #__UNIVERSAL_DATA_FOR_REHYDRATION__, #SIGI_STATE", timeout=15000)
-            except Exception:
-                logger.warning("Tag video atau rehydration tidak terdeteksi oleh selector Playwright.")
+                parsed_c = self._parse_netscape_cookies(cookies_file)
+                for k, v in parsed_c.items():
+                    cookies_to_add.append({
+                        "name": k,
+                        "value": v,
+                        "domain": ".tiktok.com",
+                        "path": "/",
+                        "secure": True,
+                    })
+            except Exception as e:
+                logger.warning(f"Gagal parse Netscape cookie: {e}")
 
-            # Ambil data rehydration JSON secara dinamis
+        if not cookies_to_add and tiktok_session_id:
+            cookies_to_add.append({
+                "name": "sessionid",
+                "value": tiktok_session_id.strip(),
+                "domain": ".tiktok.com",
+                "path": "/",
+            })
+
+        async def _video_page_action(page):
+            nonlocal video_url, caption, browser_cookies
+            await asyncio.sleep(2.0)
+
+            try:
+                await page.wait_for_selector("video, #__UNIVERSAL_DATA_FOR_REHYDRATION__, #SIGI_STATE", timeout=12000)
+            except Exception:
+                pass
+
+            # Ambil rehydration JSON
             json_content = await page.evaluate("""() => {
                 const el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
                 if (el) return el.textContent;
@@ -979,7 +982,6 @@ class MediaDownloader:
             if json_content:
                 try:
                     raw_data = json.loads(json_content)
-                    # Ekstrak video_url & caption secara aman
                     try:
                         default_scope = raw_data.get("__DEFAULT_SCOPE__", {})
                         video_detail = default_scope.get("webapp.video-detail", {}) or default_scope.get("webapp.videoDetail", {})
@@ -987,8 +989,6 @@ class MediaDownloader:
                             webapp = default_scope.get("webapp", {})
                             video_detail = webapp.get("video-detail", {}) or webapp.get("videoDetail", {})
                         item_struct = video_detail.get("itemInfo", {}).get("itemStruct", {})
-                        
-                        # Cari playAddr
                         video_info = item_struct.get("video", {})
                         video_url = video_info.get("playAddr") or video_info.get("downloadAddr")
                         caption = item_struct.get("desc") or ""
@@ -999,7 +999,6 @@ class MediaDownloader:
                 except Exception as json_err:
                     logger.warning(f"Gagal memparsing rehydration JSON untuk video TikTok: {json_err}")
 
-            # Fallback: Ambil src dari video tag (pastikan bukan blob URL)
             if not video_url:
                 video_url = await page.evaluate("""() => {
                     const video = document.querySelector('video');
@@ -1011,11 +1010,38 @@ class MediaDownloader:
                 if video_url:
                     logger.info("Berhasil mengekstrak video URL dari tag video (non-blob)")
 
-            browser_cookies = await context.cookies()
-            await context.close()
+            if hasattr(page, "context"):
+                try:
+                    browser_cookies = await page.context.cookies()
+                except Exception:
+                    pass
+
+        try:
+            if HAS_SCRAPLING:
+                await BaseScraper.fetch_stealth_page(
+                    post_url,
+                    cookies=cookies_to_add if cookies_to_add else None,
+                    page_action=_video_page_action,
+                    timeout=30000,
+                    headless=True,
+                )
+            else:
+                browser = await self.get_browser()
+                context = await browser.new_context(
+                    user_agent=SHARED_USER_AGENT,
+                    viewport={"width": 1280, "height": 900},
+                    locale="en-US"
+                )
+                if cookies_to_add:
+                    await context.add_cookies(cookies_to_add)
+                page = await context.new_page()
+                try:
+                    await page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
+                    await _video_page_action(page)
+                finally:
+                    await context.close()
         except Exception as e:
             logger.warning(f"Browser video fallback extractor failed: {e}")
-            browser_cookies = []
 
         return video_url, caption, cast(list[dict], browser_cookies)
 

@@ -1,11 +1,14 @@
 """
 scrapers/base.py
-Abstract base class untuk semua platform scraper.
+Abstract base class untuk semua platform scraper dengan integrasi Scrapling Stealth Engine.
 
 Mendefinisikan:
 - Kontrak interface yang harus diimplementasikan setiap scraper
 - Dataclass PostMedia sebagai format data standar antar scraper
 - Enum MediaType untuk klasifikasi tipe media
+- Centralized Scrapling Fetcher Factory (AsyncFetcher, StealthyFetcher, DynamicFetcher)
+- Docker & Linux Headless stealth flags injection (--no-sandbox, --disable-dev-shm-usage)
+- Manajemen cookie universal (JSON, Netscape, .env)
 """
 
 from abc import ABC, abstractmethod
@@ -16,8 +19,17 @@ import logging
 import os
 from pathlib import Path
 import platform as _platform_module
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Callable, Optional, Union
 import aiofiles
+
+try:
+    from scrapling.fetchers import AsyncFetcher, DynamicFetcher, StealthyFetcher
+    HAS_SCRAPLING = True
+except ImportError:
+    AsyncFetcher = None  # type: ignore
+    DynamicFetcher = None  # type: ignore
+    StealthyFetcher = None  # type: ignore
+    HAS_SCRAPLING = False
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +38,23 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0.0.0 Safari/537.36"
 )
+
+# Standard Chromium / Scrapling stealth flags untuk Linux headless & Docker container
+DOCKER_CHROMIUM_FLAGS = [
+    "--no-sandbox",                  # Wajib di Docker (mencegah error user namespace non-root)
+    "--disable-setuid-sandbox",      # Sandbox fallback untuk Debian/Ubuntu container
+    "--disable-dev-shm-usage",       # KRITIS: cegah SIGBUS crash di Docker saat scraping media berat
+    "--disable-gpu",                 # Nonaktifkan GPU init pada server headless
+    "--disable-software-rasterizer", # Hemat memori CPU
+    "--disable-blink-features=AutomationControlled", # Anti-detection layer
+    "--disable-web-security",        # Mencegah CORS blocking saat scraping resource CDN
+    "--ignore-certificate-errors",
+    "--disable-infobars",
+    "--window-position=0,0",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--no-first-run",
+    "--no-default-browser-check",
+]
 
 
 class MediaType(Enum):
@@ -63,11 +92,11 @@ class PostMedia:
 
 class BaseScraper(ABC):
     """
-    Abstract base class yang mendefinisikan kontrak scraper.
+    Abstract base class yang mendefinisikan kontrak scraper dengan dukungan Scrapling.
 
     Setiap scraper platform harus mengimplementasikan method:
     - `scrape_profile`: Generator yang menghasilkan PostMedia dari profil
-    - `close`: Cleanup resources (tutup browser, dll)
+    - `close`: Cleanup resources (tutup browser/fetcher, dll)
     """
 
     def __init__(self, db_manager, session_dir: str):
@@ -98,13 +127,13 @@ class BaseScraper(ABC):
 
     @abstractmethod
     async def close(self) -> None:
-        """Tutup semua resource (browser, koneksi, dll) dengan aman."""
+        """Tutup semua resource (browser, fetcher, koneksi) dengan aman."""
         ...
 
     # ──────────────────────────────────────────────
     # Peta token .env per platform
     # ──────────────────────────────────────────────
-    # Prioritas: .env session token → JSON cookie file → gagal (skip)
+    # Prioritas: .env session token → JSON cookie file → guest mode
     ENV_TOKEN_MAP = {
         "instagram": [
             {
@@ -130,17 +159,14 @@ class BaseScraper(ABC):
     def has_auth_configured(platform: str) -> bool:
         """
         Pre-flight check: apakah platform ini punya auth yang valid?
-        Cek .env token ATAU JSON cookie file. Dipakai bot.py sebelum spawn scraper.
+        Cek .env token ATAU JSON cookie file.
         """
-        # Cek 1: .env session token
         token_specs = BaseScraper.ENV_TOKEN_MAP.get(platform, [])
         if token_specs:
-            # Semua token harus ada (Twitter butuh 2: auth_token + ct0)
             all_present = all(os.getenv(spec["env_key"]) for spec in token_specs)
             if all_present:
                 return True
 
-        # Cek 2: JSON cookie file
         cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "config" / "cookies"))
         cookie_file = cookie_dir / f"{platform}.json"
         if cookie_file.exists():
@@ -153,10 +179,7 @@ class BaseScraper(ABC):
         """
         Deteksi otomatis path browser di Windows dan Linux/Debian.
         Mendukung override via BROWSER_EXECUTABLE_PATH atau BRAVE_EXECUTABLE_PATH.
-        Di Linux/Docker: deteksi system Chromium terlebih dahulu sebelum fallback ke
-        Playwright built-in (agar tidak re-download browser tiap deploy).
         """
-        # 1. Cek explicit override dari env
         for env_key in ["BROWSER_EXECUTABLE_PATH", "BRAVE_EXECUTABLE_PATH"]:
             env_val = os.getenv(env_key)
             if env_val and os.path.exists(env_val):
@@ -165,7 +188,6 @@ class BaseScraper(ABC):
         system = _platform_module.system()
 
         if system == "Linux":
-            # Debian/Ubuntu server: deteksi Chromium dan Chrome system-wide
             linux_paths = [
                 "/usr/bin/chromium",
                 "/usr/bin/chromium-browser",
@@ -173,7 +195,6 @@ class BaseScraper(ABC):
                 "/usr/bin/google-chrome-stable",
                 "/snap/bin/chromium",
             ]
-            # Di container Playwright, cari binary full chrome di /ms-playwright
             ms_playwright_dir = Path("/ms-playwright")
             if ms_playwright_dir.exists():
                 for chrome_bin in sorted(ms_playwright_dir.glob("chromium-*/chrome-linux/chrome"), reverse=True):
@@ -186,7 +207,7 @@ class BaseScraper(ABC):
                     return path
             return None
 
-        # 2. Windows: Brave Browser
+        # Windows: Brave Browser
         brave_paths = [
             r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
             r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
@@ -198,7 +219,7 @@ class BaseScraper(ABC):
             if os.path.exists(path):
                 return path
 
-        # 3. Windows: Fallback ke Google Chrome
+        # Windows: Google Chrome fallback
         chrome_paths = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -208,7 +229,6 @@ class BaseScraper(ABC):
         ]
         for path in chrome_paths:
             if os.path.exists(path):
-                logger.info(f"Brave tidak ditemukan, menggunakan Google Chrome dari: {path}")
                 return path
 
         return None
@@ -216,41 +236,15 @@ class BaseScraper(ABC):
     @staticmethod
     def get_browser_launch_kwargs(proxy: Optional[str] = None) -> dict:
         """
-        Bangun kwarg launch browser Playwright terpusat dengan dukungan proxy opsional.
-        Format proxy: 'http://username:password@ip:port' atau 'http://ip:port'
-
-        PENTING — Flag Linux/Docker wajib:
-        --disable-dev-shm-usage: Cegah crash SIGBUS di Docker. Default /dev/shm Docker
-            hanya 64MB. Chromium pakai shared memory untuk rendering. Tanpa flag ini,
-            scraping halaman media-heavy (Instagram grid, TikTok profile) = SIGBUS crash.
-            Dengan flag ini Chromium pakai /tmp sebagai fallback shared memory.
-        --disable-gpu: Tidak ada GPU di headless server — skip GPU init yang bisa hang.
+        Bangun kwarg launch browser Playwright terpusat dengan flag Docker/Linux wajib.
         """
         brave_path = BaseScraper.get_brave_path()
         launch_kwargs: dict = {
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",               # Wajib di Docker (no root namespace)
-                "--disable-setuid-sandbox",   # Wajib di Docker
-                "--disable-dev-shm-usage",    # KRITIS: cegah SIGBUS crash di Docker/Debian
-                "--disable-gpu",              # Tidak ada GPU di headless server
-                "--disable-software-rasterizer",
-                "--disable-infobars",
-                "--window-position=0,0",
-                "--ignore-certificate-errors",
-                "--disable-web-security",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
+            "args": list(DOCKER_CHROMIUM_FLAGS),
         }
         if brave_path:
             launch_kwargs["executable_path"] = brave_path
         elif _platform_module.system() == "Linux":
-            # FIX: if no system browser found AND we're falling back to Playwright's bundled
-            # chromium via channel="chromium", check that it's actually installed first.
-            # If not installed, launch silently fails with a cryptic error. Log an explicit
-            # actionable message so operators know to run `playwright install chromium`.
             ms_playwright_cache = Path.home() / ".cache" / "ms-playwright"
             has_playwright_chromium = any(
                 p.name == "chrome" and p.exists()
@@ -260,8 +254,7 @@ class BaseScraper(ABC):
             if not has_playwright_chromium:
                 logger.error(
                     "[❌ ERROR  ] Tidak ada browser yang ditemukan di Linux! "
-                    "Jalankan: `playwright install chromium` atau set env BROWSER_EXECUTABLE_PATH. "
-                    "Bot akan crash saat mencoba membuka browser."
+                    "Jalankan: `scrapling install` atau set env BROWSER_EXECUTABLE_PATH."
                 )
             else:
                 logger.debug("[⚙️ SYSTEM] Menggunakan Playwright bundled chromium via channel='chromium'.")
@@ -272,19 +265,130 @@ class BaseScraper(ABC):
 
         return launch_kwargs
 
-    async def load_and_inject_cookies(self, context, platform: str) -> Optional[Path]:
-        """
-        Injeksi cookie ke Playwright context + export Netscape untuk yt-dlp.
+    # ──────────────────────────────────────────────
+    # Scrapling Fetcher Helpers
+    # ──────────────────────────────────────────────
 
-        Prioritas sumber:
-          1. Full JSON cookie jar dari config/cookies/<platform>.json (hasil export browser)
-          2. Fallback ke .env session token (INSTAGRAM_SESSION_ID, TIKTOK_SESSION_ID, TWITTER_AUTH_TOKEN+CT0)
-          3. Tidak ada keduanya → log error, return None (akun di-skip)
+    @staticmethod
+    async def fetch_stealth_page(
+        url: str,
+        cookies: Optional[Union[list[dict], dict]] = None,
+        page_action: Optional[Callable] = None,
+        timeout: int = 30000,
+        wait_selector: Optional[str] = None,
+        headless: bool = True,
+        proxy: Optional[str] = None,
+        network_idle: bool = False,
+    ) -> Any:
         """
-        cookies_to_inject: list[dict] = []
-        source = ""  # Untuk logging: "json" atau "env"
+        Ambil halaman menggunakan Scrapling StealthyFetcher (anti-bot fingerprinting).
+        """
+        if not HAS_SCRAPLING or StealthyFetcher is None:
+            raise RuntimeError("Scrapling library tidak terpasang. Jalankan `pip install scrapling[fetchers]`")
 
-        # ── Prioritas 1: File cookie dari config/cookies/<platform>.json atau <platform>.txt ──
+        fetcher_kwargs: dict[str, Any] = {
+            "headless": headless,
+            "timeout": timeout,
+            "additional_args": list(DOCKER_CHROMIUM_FLAGS),
+        }
+        if cookies:
+            fetcher_kwargs["cookies"] = cookies
+        if page_action:
+            fetcher_kwargs["page_action"] = page_action
+        if wait_selector:
+            fetcher_kwargs["wait_selector"] = wait_selector
+        if proxy:
+            fetcher_kwargs["proxy"] = proxy
+        if network_idle:
+            fetcher_kwargs["network_idle"] = network_idle
+
+        brave_path = BaseScraper.get_brave_path()
+        if brave_path and os.path.exists(brave_path):
+            fetcher_kwargs["executable_path"] = brave_path
+
+        return await StealthyFetcher.async_fetch(url, **fetcher_kwargs)
+
+    @staticmethod
+    async def fetch_dynamic_page(
+        url: str,
+        cookies: Optional[Union[list[dict], dict]] = None,
+        page_action: Optional[Callable] = None,
+        timeout: int = 30000,
+        wait_selector: Optional[str] = None,
+        headless: bool = True,
+        proxy: Optional[str] = None,
+        network_idle: bool = False,
+    ) -> Any:
+        """
+        Ambil halaman menggunakan Scrapling DynamicFetcher untuk JS-heavy pages.
+        """
+        if not HAS_SCRAPLING or DynamicFetcher is None:
+            raise RuntimeError("Scrapling library tidak terpasang. Jalankan `pip install scrapling[fetchers]`")
+
+        fetcher_kwargs: dict[str, Any] = {
+            "headless": headless,
+            "timeout": timeout,
+            "additional_args": list(DOCKER_CHROMIUM_FLAGS),
+        }
+        if cookies:
+            fetcher_kwargs["cookies"] = cookies
+        if page_action:
+            fetcher_kwargs["page_action"] = page_action
+        if wait_selector:
+            fetcher_kwargs["wait_selector"] = wait_selector
+        if proxy:
+            fetcher_kwargs["proxy"] = proxy
+        if network_idle:
+            fetcher_kwargs["network_idle"] = network_idle
+
+        brave_path = BaseScraper.get_brave_path()
+        if brave_path and os.path.exists(brave_path):
+            fetcher_kwargs["executable_path"] = brave_path
+
+        return await DynamicFetcher.async_fetch(url, **fetcher_kwargs)
+
+    @staticmethod
+    async def fetch_http_page(
+        url: str,
+        cookies: Optional[dict] = None,
+        headers: Optional[dict] = None,
+        impersonate: str = "chrome124",
+        timeout: int = 20,
+        proxy: Optional[str] = None,
+    ) -> Any:
+        """
+        Ambil halaman HTTP cepat menggunakan Scrapling AsyncFetcher (curl_cffi TLS impersonation).
+        """
+        if not HAS_SCRAPLING or AsyncFetcher is None:
+            raise RuntimeError("Scrapling library tidak terpasang. Jalankan `pip install scrapling`")
+
+        req_headers = {"User-Agent": USER_AGENT}
+        if headers:
+            req_headers.update(headers)
+
+        fetch_kwargs: dict[str, Any] = {
+            "headers": req_headers,
+            "timeout": timeout,
+            "impersonate": impersonate,
+        }
+        if cookies:
+            fetch_kwargs["cookies"] = cookies
+        if proxy:
+            fetch_kwargs["proxy"] = proxy
+
+        return await AsyncFetcher.get(url, **fetch_kwargs)
+
+    # ──────────────────────────────────────────────
+    # Cookie Management
+    # ──────────────────────────────────────────────
+
+    async def load_cookies_as_list(self, platform: str) -> list[dict]:
+        """
+        Muat cookie dari file JSON, Netscape, atau .env dalam format list of dicts:
+        [{"name": "...", "value": "...", "domain": "...", "path": "/", "secure": True, ...}]
+        """
+        cookies: list[dict] = []
+
         cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "config" / "cookies"))
         cookie_candidates = [
             cookie_dir / f"{platform}.json",
@@ -302,9 +406,6 @@ class BaseScraper(ABC):
                 if not content:
                     continue
 
-                valid_cookies = []
-
-                # Format A: JSON Array (Cookie-Editor format)
                 if content.startswith("[") or content.startswith("{"):
                     json_data = json.loads(content)
                     if isinstance(json_data, dict):
@@ -322,26 +423,21 @@ class BaseScraper(ABC):
                                     norm_c["secure"] = bool(c["secure"])
                                 if "httpOnly" in c:
                                     norm_c["httpOnly"] = bool(c["httpOnly"])
-                                if "sameSite" in c and c["sameSite"]:
-                                    ss = str(c["sameSite"]).capitalize()
-                                    if ss in ("Strict", "Lax", "None"):
-                                        norm_c["sameSite"] = ss
                                 exp = c.get("expirationDate") or c.get("expires")
                                 if exp:
                                     try:
                                         norm_c["expires"] = int(float(exp))
                                     except (ValueError, TypeError):
                                         pass
-                                valid_cookies.append(norm_c)
+                                cookies.append(norm_c)
                 else:
-                    # Format B: Netscape HTTP Cookie format (Get cookies.txt format)
                     for line in content.splitlines():
                         line = line.strip()
                         if not line or line.startswith("#"):
                             continue
                         parts = line.split("\t")
                         if len(parts) >= 7:
-                            domain, include_sub, path, secure, expires, name, value = parts[:7]
+                            domain, _, path, secure, expires, name, value = parts[:7]
                             norm_c = {
                                 "name": name.strip(),
                                 "value": value.strip(),
@@ -350,119 +446,94 @@ class BaseScraper(ABC):
                                 "secure": secure.upper() == "TRUE",
                                 "httpOnly": True,
                             }
-                            if expires and expires.isdigit():
-                                exp_int = int(expires)
-                                if exp_int > 0:
-                                    norm_c["expires"] = exp_int
-                            valid_cookies.append(norm_c)
+                            if expires and expires.isdigit() and int(expires) > 0:
+                                norm_c["expires"] = int(expires)
+                            cookies.append(norm_c)
 
-                if valid_cookies:
-                    cookies_to_inject = valid_cookies
-                    source = "file"
-                    logger.info(
-                        f"[⚙️ SYSTEM] Cookie {platform} berhasil dimuat dari file: {cookie_file.name} "
-                        f"({len(valid_cookies)} cookies)."
-                    )
-                    break
+                if cookies:
+                    logger.info(f"[⚙️ SYSTEM] Cookie {platform} berhasil dimuat dari {cookie_file.name} ({len(cookies)} cookies).")
+                    return cookies
             except Exception as e:
                 logger.warning(f"Gagal membaca file cookie {platform} ({cookie_file.name}): {e}")
 
-        # ── Prioritas 2: Fallback ke .env session token ──
-        if not cookies_to_inject:
-            token_specs = self.ENV_TOKEN_MAP.get(platform, [])
-            if token_specs:
-                env_cookies = []
-                all_present = True
+        # Fallback ke .env
+        token_specs = self.ENV_TOKEN_MAP.get(platform, [])
+        if token_specs:
+            env_cookies = []
+            all_present = True
+            for spec in token_specs:
+                token_val = os.getenv(spec["env_key"])
+                if token_val:
+                    env_cookies.append({
+                        "name": spec["name"],
+                        "value": token_val.strip(),
+                        "domain": spec["domain"],
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": True,
+                    })
+                else:
+                    all_present = False
+            if all_present and env_cookies:
+                logger.info(f"[⚙️ SYSTEM] Cookie {platform} dibangun dari .env token ({len(env_cookies)} cookies).")
+                return env_cookies
 
-                for spec in token_specs:
-                    token_value = os.getenv(spec["env_key"])
-                    if token_value:
-                        # Bersihkan whitespace tak sengaja agar Playwright tidak error
-                        env_cookies.append(
-                            {
-                                "name": spec["name"],
-                                "value": token_value.strip(),
-                                "domain": spec["domain"],
-                                "path": "/",
-                                "secure": True,
-                                "httpOnly": True,
-                            }
-                        )
-                    else:
-                        all_present = False
+        return cookies
 
-                # Hanya pakai .env jika SEMUA token untuk platform ini ada
-                if all_present and env_cookies:
-                    cookies_to_inject = env_cookies
-                    source = "env"
-                    logger.info(
-                        f"[⚙️ SYSTEM] Cookie {platform} dibangun dari .env session token "
-                        f"({len(env_cookies)} cookie)."
-                    )
+    async def load_cookies_as_dict(self, platform: str) -> dict[str, str]:
+        """
+        Muat cookie dari file atau .env dalam format dictionary {name: value}.
+        """
+        cookie_list = await self.load_cookies_as_list(platform)
+        return {c["name"]: c["value"] for c in cookie_list if "name" in c and "value" in c}
 
-        # ── Tidak ada sumber auth sama sekali ──
-        if not cookies_to_inject:
-            logger.error(
-                f"[❌ ERROR  ] Tidak ada autentikasi untuk {platform}! "
-                f"Isi .env ({', '.join(s['env_key'] for s in token_specs)}) "
-                f"atau taruh config/cookies/{platform}.json. Melewati akun..."
-            )
-            return None
+    async def load_and_inject_cookies(self, context, platform: str) -> Optional[Path]:
+        """
+        Injeksi cookie ke browser context + export file Netscape untuk yt-dlp.
+        """
+        cookies_to_inject = await self.load_cookies_as_list(platform)
 
-        # ── Injeksi ke Playwright browser context jika disediakan ──
-        if context is not None:
+        # Injeksi ke browser context jika diberikan
+        if context is not None and cookies_to_inject:
             try:
                 await context.add_cookies(cookies_to_inject)
-                logger.info(
-                    f"[⚙️ SYSTEM] {len(cookies_to_inject)} cookie berhasil diinjeksi "
-                    f"ke {platform} (sumber: {source})."
-                )
+                logger.info(f"[⚙️ SYSTEM] {len(cookies_to_inject)} cookie berhasil diinjeksi ke {platform}.")
             except Exception as e:
-                logger.error(
-                    f"[❌ ERROR  ] Gagal menginjeksi cookie {platform}: {e}",
-                    exc_info=True,
-                )
-                return None
+                logger.error(f"[❌ ERROR  ] Gagal menginjeksi cookie {platform}: {e}", exc_info=True)
 
-        # ── Export ke Netscape format untuk yt-dlp ──
-        try:
-            netscape_path = Path(self.session_dir) / f"{platform}_cookies.txt"
-            netscape_path.parent.mkdir(parents=True, exist_ok=True)
+        # Export ke format Netscape untuk yt-dlp
+        if cookies_to_inject:
+            try:
+                netscape_path = Path(self.session_dir) / f"{platform}_cookies.txt"
+                netscape_path.parent.mkdir(parents=True, exist_ok=True)
 
-            lines = [
-                "# Netscape HTTP Cookie File\n",
-                "# Generated by bot session export for yt-dlp\n\n",
-            ]
-            for cookie in cookies_to_inject:
-                domain = cookie.get("domain", "")
-                include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
-                path = cookie.get("path", "/")
-                secure = "TRUE" if cookie.get("secure", False) else "FALSE"
-                expires = cookie.get("expires")
-                # FIX: expires=None or 0 writes epoch-0 (Jan 1 1970) → cookie rejected as expired
-                # Use 2147483647 (Year 2038, max 32-bit epoch) as far-future sentinel
-                expires = int(expires) if expires and int(expires) > 0 else 2147483647
-                name = cookie.get("name", "")
-                value = cookie.get("value", "")
-                lines.append(
-                    f"{domain}\t{include_subdomains}\t{path}\t"
-                    f"{secure}\t{expires}\t{name}\t{value}\n"
-                )
+                lines = [
+                    "# Netscape HTTP Cookie File\n",
+                    "# Generated by bot session export for yt-dlp\n\n",
+                ]
+                for cookie in cookies_to_inject:
+                    domain = cookie.get("domain", "")
+                    include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
+                    path = cookie.get("path", "/")
+                    secure = "TRUE" if cookie.get("secure", False) else "FALSE"
+                    expires = cookie.get("expires")
+                    expires = int(expires) if expires and int(expires) > 0 else 2147483647
+                    name = cookie.get("name", "")
+                    value = cookie.get("value", "")
+                    lines.append(
+                        f"{domain}\t{include_subdomains}\t{path}\t"
+                        f"{secure}\t{expires}\t{name}\t{value}\n"
+                    )
 
-            async with aiofiles.open(netscape_path, "w", encoding="utf-8") as f:
-                await f.writelines(lines)
+                async with aiofiles.open(netscape_path, "w", encoding="utf-8") as f:
+                    await f.writelines(lines)
 
-            logger.info(
-                f"[⚙️ SYSTEM] Netscape cookies {platform} diekspor ke: {netscape_path}"
-            )
-            return netscape_path
+                logger.info(f"[⚙️ SYSTEM] Netscape cookies {platform} diekspor ke: {netscape_path}")
+                return netscape_path
+            except Exception as e:
+                logger.error(f"[❌ ERROR  ] Gagal menulis Netscape cookie {platform}: {e}", exc_info=True)
 
-        except Exception as e:
-            logger.error(
-                f"[❌ ERROR  ] Gagal menulis Netscape cookie {platform}: {e}",
-                exc_info=True,
-            )
-            return None
+        return None
 
     async def __aenter__(self):
         return self
