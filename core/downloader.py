@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 from scrapers.base import (
     BaseScraper,
     DOCKER_CHROMIUM_FLAGS,
-    HAS_SCRAPLING,
 )
 from .utils import (
     TAG_DOWN, TAG_COMPR, TAG_SYSTEM, TAG_WARN, TAG_ERROR, TAG_SUCCESS, TAG_CRAWL,
@@ -623,29 +622,20 @@ class MediaDownloader:
                             unique_images.append(high_res)
 
             try:
-                if HAS_SCRAPLING:
-                    await BaseScraper.fetch_stealth_page(
-                        post_url,
-                        cookies=twitter_cookies if twitter_cookies else None,
-                        page_action=_twitter_page_action,
-                        timeout=25000,
-                        headless=True,
-                    )
-                else:
-                    browser = await self.get_browser()
-                    context = await browser.new_context(
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        viewport={"width": 1280, "height": 900},
-                        locale="id-ID"
-                    )
-                    if twitter_cookies:
-                        await context.add_cookies(twitter_cookies)
-                    page = await context.new_page()
-                    try:
-                        await page.goto(post_url, wait_until="domcontentloaded", timeout=25000)
-                        await _twitter_page_action(page)
-                    finally:
-                        await context.close()
+                browser = await self.get_browser()
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 900},
+                    locale="id-ID"
+                )
+                if twitter_cookies:
+                    await context.add_cookies(twitter_cookies)
+                page = await context.new_page()
+                try:
+                    await page.goto(post_url, wait_until="domcontentloaded", timeout=25000)
+                    await _twitter_page_action(page)
+                finally:
+                    await context.close()
             except Exception as tw_err:
                 logger.warning(f"Twitter fallback fetch error: {tw_err}")
 
@@ -693,10 +683,11 @@ class MediaDownloader:
         return downloaded_files, real_caption, ytdl_timestamp
 
     async def _extract_tiktok_carousel_urls(self, url: str, cookies_file: Optional[str] = None) -> tuple[list[str], str]:
-        """Ekstrak list URL gambar carousel dan caption dari webpage TikTok secara async menggunakan Scrapling TLS Fetcher."""
+        """Ekstrak list URL gambar carousel dan caption dari webpage TikTok secara async menggunakan Fast HTTP."""
         import httpx
 
         headers = {
+            "User-Agent": SHARED_USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.tiktok.com/",
@@ -710,34 +701,18 @@ class MediaDownloader:
                 logger.warning(f"Gagal parse Netscape cookie file: {e}")
 
         html_content = ""
-        # 1. Coba Scrapling HTTP Fetcher (TLS spoofing chrome124)
-        if HAS_SCRAPLING:
-            try:
-                resp = await BaseScraper.fetch_http_page(
-                    url,
-                    cookies=cookies_dict if cookies_dict else None,
-                    headers=headers,
-                    impersonate="chrome124",
-                    timeout=15,
-                )
-                html_content = getattr(resp, "text", "") or ""
-            except Exception as e:
-                logger.debug(f"Scrapling fetch_http_page info: {e}")
-
-        # 2. Fallback ke httpx jika Scrapling belum ada/gagal
-        if not html_content:
-            try:
-                async with httpx.AsyncClient(
-                    headers={"User-Agent": SHARED_USER_AGENT, **headers},
-                    cookies=cookies_dict if cookies_dict else None,
-                    follow_redirects=True,
-                    timeout=15,
-                ) as client:
-                    resp = await client.get(url)
-                    if resp.status_code == 200:
-                        html_content = resp.text
-            except Exception as e:
-                logger.debug(f"HTTPX fetch info: {e}")
+        try:
+            async with httpx.AsyncClient(
+                headers=headers,
+                cookies=cookies_dict if cookies_dict else None,
+                follow_redirects=True,
+                timeout=15.0,
+            ) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    html_content = resp.text
+        except Exception as e:
+            logger.debug(f"HTTPX fetch info: {e}")
 
         if not html_content:
             return [], ""
@@ -897,29 +872,20 @@ class MediaDownloader:
                     pass
 
         try:
-            if HAS_SCRAPLING:
-                await BaseScraper.fetch_stealth_page(
-                    post_url,
-                    cookies=cookies_to_add if cookies_to_add else None,
-                    page_action=_carousel_page_action,
-                    timeout=30000,
-                    headless=True,
-                )
-            else:
-                browser = await self.get_browser()
-                context = await browser.new_context(
-                    user_agent=SHARED_USER_AGENT,
-                    viewport={"width": 1280, "height": 900},
-                    locale="en-US"
-                )
-                if cookies_to_add:
-                    await context.add_cookies(cookies_to_add)
-                page = await context.new_page()
-                try:
-                    await page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
-                    await _carousel_page_action(page)
-                finally:
-                    await context.close()
+            browser = await self.get_browser()
+            context = await browser.new_context(
+                user_agent=SHARED_USER_AGENT,
+                viewport={"width": 1280, "height": 900},
+                locale="en-US"
+            )
+            if cookies_to_add:
+                await context.add_cookies(cookies_to_add)
+            page = await context.new_page()
+            try:
+                await page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
+                await _carousel_page_action(page)
+            finally:
+                await context.close()
         except Exception as e:
             logger.warning(f"Browser fallback extractor failed: {e}")
 
@@ -1017,29 +983,20 @@ class MediaDownloader:
                     pass
 
         try:
-            if HAS_SCRAPLING:
-                await BaseScraper.fetch_stealth_page(
-                    post_url,
-                    cookies=cookies_to_add if cookies_to_add else None,
-                    page_action=_video_page_action,
-                    timeout=30000,
-                    headless=True,
-                )
-            else:
-                browser = await self.get_browser()
-                context = await browser.new_context(
-                    user_agent=SHARED_USER_AGENT,
-                    viewport={"width": 1280, "height": 900},
-                    locale="en-US"
-                )
-                if cookies_to_add:
-                    await context.add_cookies(cookies_to_add)
-                page = await context.new_page()
-                try:
-                    await page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
-                    await _video_page_action(page)
-                finally:
-                    await context.close()
+            browser = await self.get_browser()
+            context = await browser.new_context(
+                user_agent=SHARED_USER_AGENT,
+                viewport={"width": 1280, "height": 900},
+                locale="en-US"
+            )
+            if cookies_to_add:
+                await context.add_cookies(cookies_to_add)
+            page = await context.new_page()
+            try:
+                await page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
+                await _video_page_action(page)
+            finally:
+                await context.close()
         except Exception as e:
             logger.warning(f"Browser video fallback extractor failed: {e}")
 

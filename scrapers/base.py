@@ -1,13 +1,13 @@
 """
 scrapers/base.py
-Abstract base class untuk semua platform scraper dengan integrasi Scrapling Stealth Engine.
+Abstract base class untuk semua platform scraper dengan Built-in Stealth Engine.
 
 Mendefinisikan:
 - Kontrak interface yang harus diimplementasikan setiap scraper
 - Dataclass PostMedia sebagai format data standar antar scraper
 - Enum MediaType untuk klasifikasi tipe media
-- Centralized Scrapling Fetcher Factory (AsyncFetcher, StealthyFetcher, DynamicFetcher)
 - Docker & Linux Headless stealth flags injection (--no-sandbox, --disable-dev-shm-usage)
+- Deep Stealth Context Initializer (navigator.webdriver spoofing, chrome runtime mock)
 - Manajemen cookie universal (JSON, Netscape, .env)
 """
 
@@ -19,17 +19,9 @@ import logging
 import os
 from pathlib import Path
 import platform as _platform_module
-from typing import Any, AsyncGenerator, Callable, Optional, Union
+from typing import AsyncGenerator, Optional, Tuple
 import aiofiles
-
-try:
-    from scrapling.fetchers import AsyncFetcher, DynamicFetcher, StealthyFetcher
-    HAS_SCRAPLING = True
-except ImportError:
-    AsyncFetcher = None  # type: ignore
-    DynamicFetcher = None  # type: ignore
-    StealthyFetcher = None  # type: ignore
-    HAS_SCRAPLING = False
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +31,7 @@ USER_AGENT = (
     "Chrome/125.0.0.0 Safari/537.36"
 )
 
-# Standard Chromium / Scrapling stealth flags untuk Linux headless & Docker container
+# Standard Chromium stealth flags untuk Linux headless & Docker container
 DOCKER_CHROMIUM_FLAGS = [
     "--no-sandbox",                  # Wajib di Docker (mencegah error user namespace non-root)
     "--disable-setuid-sandbox",      # Sandbox fallback untuk Debian/Ubuntu container
@@ -92,11 +84,11 @@ class PostMedia:
 
 class BaseScraper(ABC):
     """
-    Abstract base class yang mendefinisikan kontrak scraper dengan dukungan Scrapling.
+    Abstract base class yang mendefinisikan kontrak scraper dengan dukungan Stealth Browser.
 
     Setiap scraper platform harus mengimplementasikan method:
     - `scrape_profile`: Generator yang menghasilkan PostMedia dari profil
-    - `close`: Cleanup resources (tutup browser/fetcher, dll)
+    - `close`: Cleanup resources (tutup browser, dll)
     """
 
     def __init__(self, db_manager, session_dir: str):
@@ -127,13 +119,12 @@ class BaseScraper(ABC):
 
     @abstractmethod
     async def close(self) -> None:
-        """Tutup semua resource (browser, fetcher, koneksi) dengan aman."""
+        """Tutup semua resource (browser, koneksi) dengan aman."""
         ...
 
     # ──────────────────────────────────────────────
     # Peta token .env per platform
     # ──────────────────────────────────────────────
-    # Prioritas: .env session token → JSON cookie file → guest mode
     ENV_TOKEN_MAP = {
         "instagram": [
             {
@@ -254,7 +245,7 @@ class BaseScraper(ABC):
             if not has_playwright_chromium:
                 logger.error(
                     "[❌ ERROR  ] Tidak ada browser yang ditemukan di Linux! "
-                    "Jalankan: `scrapling install` atau set env BROWSER_EXECUTABLE_PATH."
+                    "Jalankan: `playwright install chromium` atau set env BROWSER_EXECUTABLE_PATH."
                 )
             else:
                 logger.debug("[⚙️ SYSTEM] Menggunakan Playwright bundled chromium via channel='chromium'.")
@@ -265,118 +256,48 @@ class BaseScraper(ABC):
 
         return launch_kwargs
 
-    # ──────────────────────────────────────────────
-    # Scrapling Fetcher Helpers
-    # ──────────────────────────────────────────────
-
     @staticmethod
-    async def fetch_stealth_page(
-        url: str,
-        cookies: Optional[Union[list[dict], dict]] = None,
-        page_action: Optional[Callable] = None,
-        timeout: int = 30000,
-        wait_selector: Optional[str] = None,
-        headless: bool = True,
+    async def create_stealth_browser(
+        playwright: Playwright,
+        headed: bool = False,
         proxy: Optional[str] = None,
-        network_idle: bool = False,
-    ) -> Any:
+        viewport: dict = {"width": 1280, "height": 800},
+        locale: str = "en-US,en;q=0.9",
+        timezone_id: str = "Asia/Jakarta",
+    ) -> Tuple[Browser, BrowserContext]:
         """
-        Ambil halaman menggunakan Scrapling StealthyFetcher (anti-bot fingerprinting).
+        Inisialisasi Browser + BrowserContext Playwright dengan stealth injection penuh.
         """
-        if not HAS_SCRAPLING or StealthyFetcher is None:
-            raise RuntimeError("Scrapling library tidak terpasang. Jalankan `pip install scrapling[fetchers]`")
+        launch_kwargs = BaseScraper.get_browser_launch_kwargs(proxy=proxy)
+        launch_kwargs["headless"] = not headed
 
-        fetcher_kwargs: dict[str, Any] = {
-            "headless": headless,
-            "timeout": timeout,
-            "additional_args": list(DOCKER_CHROMIUM_FLAGS),
-        }
-        if cookies:
-            fetcher_kwargs["cookies"] = cookies
-        if page_action:
-            fetcher_kwargs["page_action"] = page_action
-        if wait_selector:
-            fetcher_kwargs["wait_selector"] = wait_selector
-        if proxy:
-            fetcher_kwargs["proxy"] = proxy
-        if network_idle:
-            fetcher_kwargs["network_idle"] = network_idle
+        browser = await playwright.chromium.launch(**launch_kwargs)
+        if browser is None:
+            raise RuntimeError("Gagal meluncurkan browser Playwright")
 
-        brave_path = BaseScraper.get_brave_path()
-        if brave_path and os.path.exists(brave_path):
-            fetcher_kwargs["executable_path"] = brave_path
+        context = await browser.new_context(
+            user_agent=USER_AGENT,
+            viewport=viewport,
+            locale=locale,
+            timezone_id=timezone_id,
+        )
 
-        return await StealthyFetcher.async_fetch(url, **fetcher_kwargs)
+        # Deep Stealth Script Injection
+        await context.add_init_script("""
+            () => {
+                // 1. Clear Webdriver flag
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
-    @staticmethod
-    async def fetch_dynamic_page(
-        url: str,
-        cookies: Optional[Union[list[dict], dict]] = None,
-        page_action: Optional[Callable] = None,
-        timeout: int = 30000,
-        wait_selector: Optional[str] = None,
-        headless: bool = True,
-        proxy: Optional[str] = None,
-        network_idle: bool = False,
-    ) -> Any:
-        """
-        Ambil halaman menggunakan Scrapling DynamicFetcher untuk JS-heavy pages.
-        """
-        if not HAS_SCRAPLING or DynamicFetcher is None:
-            raise RuntimeError("Scrapling library tidak terpasang. Jalankan `pip install scrapling[fetchers]`")
+                // 2. Mock Chrome runtime structure
+                window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {} };
 
-        fetcher_kwargs: dict[str, Any] = {
-            "headless": headless,
-            "timeout": timeout,
-            "additional_args": list(DOCKER_CHROMIUM_FLAGS),
-        }
-        if cookies:
-            fetcher_kwargs["cookies"] = cookies
-        if page_action:
-            fetcher_kwargs["page_action"] = page_action
-        if wait_selector:
-            fetcher_kwargs["wait_selector"] = wait_selector
-        if proxy:
-            fetcher_kwargs["proxy"] = proxy
-        if network_idle:
-            fetcher_kwargs["network_idle"] = network_idle
+                // 3. Fake Languages & Plugins
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'id'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            }
+        """)
 
-        brave_path = BaseScraper.get_brave_path()
-        if brave_path and os.path.exists(brave_path):
-            fetcher_kwargs["executable_path"] = brave_path
-
-        return await DynamicFetcher.async_fetch(url, **fetcher_kwargs)
-
-    @staticmethod
-    async def fetch_http_page(
-        url: str,
-        cookies: Optional[dict] = None,
-        headers: Optional[dict] = None,
-        impersonate: str = "chrome124",
-        timeout: int = 20,
-        proxy: Optional[str] = None,
-    ) -> Any:
-        """
-        Ambil halaman HTTP cepat menggunakan Scrapling AsyncFetcher (curl_cffi TLS impersonation).
-        """
-        if not HAS_SCRAPLING or AsyncFetcher is None:
-            raise RuntimeError("Scrapling library tidak terpasang. Jalankan `pip install scrapling`")
-
-        req_headers = {"User-Agent": USER_AGENT}
-        if headers:
-            req_headers.update(headers)
-
-        fetch_kwargs: dict[str, Any] = {
-            "headers": req_headers,
-            "timeout": timeout,
-            "impersonate": impersonate,
-        }
-        if cookies:
-            fetch_kwargs["cookies"] = cookies
-        if proxy:
-            fetch_kwargs["proxy"] = proxy
-
-        return await AsyncFetcher.get(url, **fetch_kwargs)
+        return browser, context
 
     # ──────────────────────────────────────────────
     # Cookie Management
@@ -384,8 +305,7 @@ class BaseScraper(ABC):
 
     async def load_cookies_as_list(self, platform: str) -> list[dict]:
         """
-        Muat cookie dari file JSON, Netscape, atau .env dalam format list of dicts:
-        [{"name": "...", "value": "...", "domain": "...", "path": "/", "secure": True, ...}]
+        Muat cookie dari file JSON, Netscape, atau .env dalam format list of dicts.
         """
         cookies: list[dict] = []
 
@@ -493,7 +413,6 @@ class BaseScraper(ABC):
         """
         cookies_to_inject = await self.load_cookies_as_list(platform)
 
-        # Injeksi ke browser context jika diberikan
         if context is not None and cookies_to_inject:
             try:
                 await context.add_cookies(cookies_to_inject)
@@ -501,7 +420,6 @@ class BaseScraper(ABC):
             except Exception as e:
                 logger.error(f"[❌ ERROR  ] Gagal menginjeksi cookie {platform}: {e}", exc_info=True)
 
-        # Export ke format Netscape untuk yt-dlp
         if cookies_to_inject:
             try:
                 netscape_path = Path(self.session_dir) / f"{platform}_cookies.txt"

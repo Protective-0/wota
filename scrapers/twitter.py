@@ -1,9 +1,9 @@
 """
 scrapers/twitter.py
-Scraper profil Twitter/X menggunakan Scrapling Stealth Engine + yt-dlp.
+Scraper profil Twitter/X menggunakan Built-in Stealth Browser + yt-dlp.
 
 Strategi:
-- Scrapling Stealth Fetcher untuk bypass Cloudflare/Twitter bot barriers
+- Playwright Stealth Browser untuk bypass Cloudflare/Twitter bot barriers
 - Ekstraksi timeline profil (https://x.com/username) dengan browser fingerprint spoofing
 - Smart stop-condition: berhenti saat menemukan tweet yang sudah ada di database SQLite
 - Ekstraksi gambar resolusi tinggi (pbs.twimg.com/media/...?format=jpg&name=orig)
@@ -18,6 +18,7 @@ import random
 import re
 from pathlib import Path
 from typing import AsyncGenerator, Optional
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from .base import (
     BaseScraper,
@@ -25,7 +26,6 @@ from .base import (
     PostMedia,
     USER_AGENT,
     DOCKER_CHROMIUM_FLAGS,
-    HAS_SCRAPLING,
 )
 from core.utils import (
     TAG_CRAWL,
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 class TwitterScraper(BaseScraper):
     """
-    Scraper profil Twitter/X berbasis Scrapling Stealth Engine.
+    Scraper profil Twitter/X berbasis Built-in Stealth Browser.
     """
 
     PLATFORM = "twitter"
@@ -51,6 +51,9 @@ class TwitterScraper(BaseScraper):
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.netscape_cookie_path = self.session_dir / "twitter_cookies.txt"
+        self._playwright = None
+        self._browser: Optional[Browser] = None
+        self._context: Optional[BrowserContext] = None
 
     def _extract_username(self, url: str) -> str:
         """Ekstrak username Twitter/X dari URL profil."""
@@ -66,13 +69,25 @@ class TwitterScraper(BaseScraper):
         match = re.search(r"/status/(\d+)", url)
         return match.group(1) if match else ""
 
+    async def _init_browser(self) -> Page:
+        """Inisialisasi browser stealth Playwright."""
+        self._playwright = await async_playwright().start()
+        self._browser, self._context = await BaseScraper.create_stealth_browser(
+            self._playwright,
+            headed=self.headed,
+            viewport={"width": 1280, "height": 900},
+            locale="id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        )
+        await self.load_and_inject_cookies(self._context, "twitter")
+        return await self._context.new_page()
+
     async def scrape_profile(
         self,
         profile_url: str,
         forced: bool = False,
     ) -> AsyncGenerator[PostMedia, None]:
         """
-        Crawl semua tweet media dari profil Twitter/X via Scrapling.
+        Crawl semua tweet media dari profil Twitter/X via Stealth Browser.
         """
         username = self._extract_username(profile_url)
         if not username:
@@ -87,11 +102,13 @@ class TwitterScraper(BaseScraper):
         if netscape_path:
             self.netscape_cookie_path = netscape_path
 
-        cookie_list = await self.load_cookies_as_list("twitter")
         collected_posts: list[PostMedia] = []
 
-        async def _collect_tweets_action(page):
-            logger.info(f"{TAG_CRAWL} Membuka Timeline Twitter target via Scrapling: {timeline_url}")
+        try:
+            page = await self._init_browser()
+            logger.info(f"{TAG_CRAWL} Membuka Timeline Twitter target: {timeline_url}")
+
+            await page.goto(timeline_url, wait_until="domcontentloaded", timeout=45000)
             await asyncio.sleep(2.5)
 
             try:
@@ -238,16 +255,11 @@ class TwitterScraper(BaseScraper):
                     logger.info(f"{TAG_CRAWL} Batas 35 scroll tercapai untuk @{username} — stop.")
                     break
 
-        try:
-            await self.fetch_stealth_page(
-                timeline_url,
-                cookies=cookie_list,
-                page_action=_collect_tweets_action,
-                timeout=50000,
-                headless=not self.headed,
-            )
+            await page.close()
         except Exception as e:
             logger.error(f"{TAG_ERROR} Gagal scrape timeline Twitter @{username}: {e}")
+        finally:
+            await self.close()
 
         logger.info(f"{TAG_CRAWL} Selesai: {len(collected_posts)} tweet media terkumpul dari @{username}.")
 
@@ -255,5 +267,17 @@ class TwitterScraper(BaseScraper):
             yield post
 
     async def close(self) -> None:
-        """Cleanup resources."""
-        pass
+        """Cleanup browser resources."""
+        try:
+            if self._context:
+                await self._context.close()
+            if self._browser:
+                await self._browser.close()
+            if self._playwright:
+                await self._playwright.stop()
+        except Exception as e:
+            logger.debug(f"TwitterScraper close error: {e}")
+        finally:
+            self._context = None
+            self._browser = None
+            self._playwright = None

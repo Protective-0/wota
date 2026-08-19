@@ -1,11 +1,11 @@
 """
 scrapers/tiktok.py
-Scraper profil TikTok menggunakan Scrapling Stealth Engine + yt-dlp fallback.
+Scraper profil TikTok menggunakan Built-in Stealth Browser + Fast HTTP Rehydration & yt-dlp.
 
 Strategi:
 1. Ekstraksi cepat via yt-dlp flat-playlist (Primary).
-2. Fast Pass: Ekstraksi Rehydration JSON via Scrapling AsyncFetcher (Super ringan tanpa browser).
-3. Dynamic Pass: Scrapling DynamicFetcher / StealthyFetcher dengan response interceptor dan natural scroll.
+2. Fast Pass: Ekstraksi Rehydration JSON via HTTPX (Ringan, aman tanpa AVX2 requirement).
+3. Dynamic Pass: Playwright Stealth Browser dengan response interceptor dan natural scroll.
 4. Auto-detection & logging jika terhadang WAF/Captcha ([🚨 BLOCKED]).
 5. DSU (Decorate-Sort-Undecorate) sorting untuk kronologi postingan yang akurat.
 """
@@ -17,6 +17,8 @@ import os
 import re
 from pathlib import Path
 from typing import AsyncGenerator, Optional
+import httpx
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from .base import (
     BaseScraper,
@@ -24,7 +26,6 @@ from .base import (
     PostMedia,
     USER_AGENT,
     DOCKER_CHROMIUM_FLAGS,
-    HAS_SCRAPLING,
 )
 from core.utils import (
     TAG_CRAWL,
@@ -40,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 class TikTokScraper(BaseScraper):
     """
-    Scraper profil TikTok berbasis Scrapling Stealth & yt-dlp.
+    Scraper profil TikTok berbasis Stealth Browser & Fast Rehydration.
     """
 
     PLATFORM = "tiktok"
@@ -51,6 +52,9 @@ class TikTokScraper(BaseScraper):
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.netscape_cookie_path = self.session_dir / "tiktok_cookies.txt"
+        self._playwright = None
+        self._browser: Optional[Browser] = None
+        self._context: Optional[BrowserContext] = None
 
     def _extract_username(self, url: str) -> Optional[str]:
         """Ekstrak clean username dari berbagai format URL TikTok."""
@@ -73,7 +77,7 @@ class TikTokScraper(BaseScraper):
         forced: bool = False,
     ) -> AsyncGenerator[PostMedia, None]:
         """
-        Crawl profil TikTok menggunakan Scrapling Stealth Engine.
+        Crawl profil TikTok menggunakan Fast Rehydration & Stealth Browser.
         """
         logger.info(f"Mulai crawl TikTok profil: {profile_url}")
 
@@ -86,12 +90,11 @@ class TikTokScraper(BaseScraper):
         collected_urls: list[str] = []
         seen_urls: set[str] = set()
 
-        # ── Step 0: Siapkan file cookie Netscape untuk yt-dlp / fetcher ──
+        # ── Step 0: Siapkan file cookie Netscape untuk yt-dlp / browser ──
         netscape_cookie_path = await self.load_and_inject_cookies(None, "tiktok")
         if netscape_cookie_path:
             self.netscape_cookie_path = netscape_cookie_path
 
-        cookie_list = await self.load_cookies_as_list("tiktok")
         cookie_dict = await self.load_cookies_as_dict("tiktok")
 
         # ── Method 1 (Primary): Ekstraksi cepat via yt-dlp flat-playlist ──
@@ -132,46 +135,61 @@ class TikTokScraper(BaseScraper):
                     except Exception:
                         pass
         except Exception as e:
-            logger.warning(f"{TAG_WARN} yt-dlp flat-playlist extraction gagal: {e} — lanjut ke Scrapling...")
+            logger.warning(f"{TAG_WARN} yt-dlp flat-playlist extraction gagal: {e} — lanjut ke Fast Rehydration...")
 
         expected_video_count = 0
 
-        # ── Method 2 (Scrapling Fast Pass): Rehydration Parser tanpa Browser ──
-        if not collected_urls and HAS_SCRAPLING:
-            logger.info(f"{TAG_CRAWL} Menjalankan Scrapling Fast Pass (TLS Stealth Request)...")
+        # ── Method 2: Fast HTTP Rehydration Parser (Ringan & Cepat) ──
+        if not collected_urls:
+            logger.info(f"{TAG_CRAWL} Menjalankan Fast HTTP Rehydration Parser...")
             try:
-                resp = await self.fetch_http_page(
-                    canonical_url,
-                    cookies=cookie_dict,
-                    headers={"Referer": "https://www.tiktok.com/"},
-                    impersonate="chrome124",
-                )
-                html_text = getattr(resp, "text", "") or ""
-                rehydration_data = self._parse_rehydration_from_html(html_text, username)
+                headers = {
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://www.tiktok.com/",
+                }
+                async with httpx.AsyncClient(
+                    headers=headers,
+                    cookies=cookie_dict if cookie_dict else None,
+                    follow_redirects=True,
+                    timeout=15.0,
+                ) as client:
+                    resp = await client.get(canonical_url)
+                    if resp.status_code == 200:
+                        rehydration_data = self._parse_rehydration_from_html(resp.text, username)
+                        rehydration_urls = rehydration_data.get("urls", [])
+                        expected_video_count = rehydration_data.get("videoCount", 0)
 
-                rehydration_urls = rehydration_data.get("urls", [])
-                expected_video_count = rehydration_data.get("videoCount", 0)
+                        if expected_video_count > 0:
+                            logger.info(f"{TAG_CRAWL} Target @{username}: {expected_video_count} video publik terdeteksi.")
 
-                if expected_video_count > 0:
-                    logger.info(f"{TAG_CRAWL} Target @{username}: {expected_video_count} video publik terdeteksi.")
+                        for r_url in rehydration_urls:
+                            if r_url not in seen_urls:
+                                collected_urls.append(r_url)
+                                seen_urls.add(r_url)
 
-                for r_url in rehydration_urls:
-                    if r_url not in seen_urls:
-                        collected_urls.append(r_url)
-                        seen_urls.add(r_url)
-
-                if collected_urls:
-                    logger.info(f"{TAG_CRAWL} Fast pass berhasil menemukan {len(collected_urls)} post.")
+                        if collected_urls:
+                            logger.info(f"{TAG_CRAWL} Fast pass berhasil menemukan {len(collected_urls)} post.")
             except Exception as e:
-                logger.debug(f"Scrapling Fast Pass info: {e}")
+                logger.debug(f"Fast HTTP Rehydration info: {e}")
 
-        # ── Method 3 (Scrapling Dynamic Pass): Browser Automation dengan Stealth ──
-        if (not collected_urls or (expected_video_count > 0 and len(collected_urls) < expected_video_count)) and HAS_SCRAPLING:
-            logger.info(f"{TAG_CRAWL} Mengaktifkan Scrapling Dynamic Stealth Fetcher untuk @{username}...")
+        # ── Method 3: Browser Automation dengan Deep Stealth & Response Interceptor ──
+        if not collected_urls or (expected_video_count > 0 and len(collected_urls) < expected_video_count):
+            logger.info(f"{TAG_CRAWL} Mengaktifkan Stealth Browser Automation untuk @{username}...")
             intercepted_urls: set[str] = set()
 
-            async def _interceptor_and_scroller(page):
-                # 1. Response Interceptor untuk stream internal TikTok API
+            try:
+                self._playwright = await async_playwright().start()
+                self._browser, self._context = await BaseScraper.create_stealth_browser(
+                    self._playwright,
+                    headed=self.headed,
+                )
+                await self.load_and_inject_cookies(self._context, "tiktok")
+
+                page = await self._context.new_page()
+
+                # Response Interceptor untuk stream internal TikTok API
                 async def _on_response(response):
                     try:
                         req_url = response.url.lower()
@@ -204,37 +222,45 @@ class TikTokScraper(BaseScraper):
 
                 page.on("response", _on_response)
 
-                # 2. Periksa apakah terblokir Captcha / Slider / Login Wall
+                logger.info(f"{TAG_CRAWL} Membuka profil TikTok di browser stealth: {canonical_url}")
+                await page.goto(canonical_url, wait_until="domcontentloaded", timeout=60000)
                 await asyncio.sleep(2.5)
+
+                # Periksa apakah terblokir Captcha / Slider / Verification
                 current_url = page.url.lower()
                 if "captcha" in current_url or "verify" in current_url:
                     logger.error(f"[🚨 BLOCKED] TikTok menyajikan Captcha/Verification challenge untuk @{username}!")
-                    return
+                else:
+                    # Dismiss modal login jika ada
+                    try:
+                        close_btn = await page.query_selector('[data-e2e="modal-close-inner-button"], [aria-label="Close"], button[class*="close"]')
+                        if close_btn:
+                            await close_btn.click()
+                            await asyncio.sleep(1.0)
+                    except Exception:
+                        pass
 
-                # 3. Dismiss modal login / cookie banner jika ada
-                try:
-                    close_btn = await page.query_selector('[data-e2e="modal-close-inner-button"], [aria-label="Close"], button[class*="close"]')
-                    if close_btn:
-                        await close_btn.click()
-                        await asyncio.sleep(1.0)
-                except Exception:
-                    pass
+                    # Multi-step scroll untuk memicu pagination feed
+                    for _ in range(5):
+                        await page.evaluate("window.scrollBy(0, 1500)")
+                        await asyncio.sleep(2.0)
+                        if expected_video_count > 0 and len(intercepted_urls) >= expected_video_count:
+                            break
 
-                # 4. Multi-step scroll untuk memicu pagination API
-                for _ in range(5):
-                    await page.evaluate("window.scrollBy(0, 1500)")
-                    await asyncio.sleep(2.0)
-                    if expected_video_count > 0 and len(intercepted_urls) >= expected_video_count:
-                        break
-
-            try:
-                fetch_res = await self.fetch_dynamic_page(
-                    canonical_url,
-                    cookies=cookie_list,
-                    page_action=_interceptor_and_scroller,
-                    timeout=45000,
-                    headless=not self.headed,
-                )
+                    # Ambil link video dari DOM snapshot
+                    dom_links = await page.locator('a[href*="/video/"], a[href*="/photo/"]').all()
+                    for a_link in dom_links:
+                        try:
+                            href = await a_link.get_attribute("href")
+                            if href:
+                                match = re.search(r"/(?:video|photo|v)/(\d{15,22})", href)
+                                if match:
+                                    clean_href = f"https://www.tiktok.com/@{username}/video/{match.group(1)}"
+                                    if clean_href not in seen_urls:
+                                        collected_urls.append(clean_href)
+                                        seen_urls.add(clean_href)
+                        except Exception:
+                            pass
 
                 # Gabungkan intercepted URLs
                 for i_url in intercepted_urls:
@@ -242,19 +268,11 @@ class TikTokScraper(BaseScraper):
                         collected_urls.append(i_url)
                         seen_urls.add(i_url)
 
-                # Ekstrak link DOM dari hasil fetch jika masih ada yang belum masuk
-                if hasattr(fetch_res, "css"):
-                    for a_el in fetch_res.css('a[href*="/video/"], a[href*="/photo/"]'):
-                        href = a_el.attrib.get("href", "") if hasattr(a_el, "attrib") else ""
-                        match = re.search(r"/(?:video|photo|v)/(\d{15,22})", href)
-                        if match:
-                            clean_href = f"https://www.tiktok.com/@{username}/video/{match.group(1)}"
-                            if clean_href not in seen_urls:
-                                collected_urls.append(clean_href)
-                                seen_urls.add(clean_href)
-
+                await page.close()
             except Exception as e:
-                logger.error(f"{TAG_ERROR} Scrapling Dynamic Fetcher error: {e}")
+                logger.error(f"{TAG_ERROR} Browser automation error untuk @{username}: {e}")
+            finally:
+                await self.close()
 
         logger.info(
             f"{TAG_CRAWL} Total {len(collected_urls)} URL postingan @{username} berhasil dikumpulkan."
@@ -362,5 +380,17 @@ class TikTokScraper(BaseScraper):
         }
 
     async def close(self) -> None:
-        """Cleanup resources."""
-        pass
+        """Cleanup browser resources."""
+        try:
+            if self._context:
+                await self._context.close()
+            if self._browser:
+                await self._browser.close()
+            if self._playwright:
+                await self._playwright.stop()
+        except Exception as e:
+            logger.debug(f"TikTokScraper close error: {e}")
+        finally:
+            self._context = None
+            self._browser = None
+            self._playwright = None

@@ -21,10 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 4. Set direktori kerja aplikasi
 WORKDIR /app
 
-# 5. Layer caching dependensi Python & Scrapling browser install
+# 5. Layer caching dependensi Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN scrapling install || true
 
 # 6. Copy seluruh source code project
 COPY . .
