@@ -4,6 +4,7 @@
 
 # Environment variables & Secrets (JANGAN DI-COMMIT)
 .env
+.env*
 .env.local
 .env.*.local
 
