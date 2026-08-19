@@ -19,19 +19,26 @@ ENV/
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
 
-# Database files
+# Database files (Mounted via volume in container)
 *.db
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm
 bot_data.db
-data/
+data/*
+!data/.gitkeep
 
 # Log files
 *.log
 logs/
 
-# Sessions & Temporary files
+# Sessions & Temporary files (Docker volumes will mount these at runtime)
 sessions/*
 !sessions/.gitkeep
 temp_media/*
@@ -39,7 +46,13 @@ temp_media/*
 config/cookies/*
 !config/cookies/.gitkeep
 
-# IDE settings & documentation
+# IDE settings, documentation & local tools
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 README.md
+.agents/
+skills-lock.json
+.skills/
