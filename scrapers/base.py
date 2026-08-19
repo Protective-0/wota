@@ -158,10 +158,20 @@ class BaseScraper(ABC):
             if all_present:
                 return True
 
-        cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "config" / "cookies"))
-        cookie_file = cookie_dir / f"{platform}.json"
-        if cookie_file.exists():
-            return True
+        # Cek 2: Cookie files di sessions/ atau COOKIE_DIR
+        cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "sessions"))
+        cookie_candidates = [
+            cookie_dir / f"{platform}.json",
+            cookie_dir / f"{platform}.txt",
+            cookie_dir / f"cookies_{platform}.json",
+            Path.cwd() / "sessions" / f"{platform}.json",
+            Path.cwd() / "sessions" / f"{platform}.txt",
+            Path.cwd() / "sessions" / f"cookies_{platform}.json",
+            Path.cwd() / "config" / "cookies" / f"{platform}.json",
+        ]
+        for candidate in cookie_candidates:
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return True
 
         return False
 
@@ -309,10 +319,16 @@ class BaseScraper(ABC):
         """
         cookies: list[dict] = []
 
-        cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "config" / "cookies"))
+        cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "sessions"))
         cookie_candidates = [
             cookie_dir / f"{platform}.json",
             cookie_dir / f"{platform}.txt",
+            cookie_dir / f"cookies_{platform}.json",
+            Path(self.session_dir) / f"{platform}.json",
+            Path(self.session_dir) / f"{platform}.txt",
+            Path(self.session_dir) / f"cookies_{platform}.json",
+            Path.cwd() / "config" / "cookies" / f"{platform}.json",
+            Path.cwd() / "config" / "cookies" / f"{platform}.txt",
         ]
 
         for cookie_file in cookie_candidates:

@@ -4,12 +4,12 @@ services:
     image: discord-bot:latest
     container_name: discord_media_bot
     restart: always
+    shm_size: '2gb'
     env_file:
       - .env
     environment:
       - BROWSER_HEADED=false
     volumes:
       - ./data:/app/data
-      - ./config:/app/config
       - ./sessions:/app/sessions
       - ./temp_media:/app/temp_media

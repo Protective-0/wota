@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # 7. Siapkan direktori penyimpanan data/temporer
-RUN mkdir -p data temp_media sessions config
+RUN mkdir -p data temp_media sessions
 
 # 8. Jalankan bot Discord
 CMD ["python", "bot.py"]

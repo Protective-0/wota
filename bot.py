@@ -695,7 +695,6 @@ class MediaScraperBot(commands.Bot):
         await self.db.initialize()
         Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
         Path(SESSION_DIR).mkdir(parents=True, exist_ok=True)
-        Path("config/cookies").mkdir(parents=True, exist_ok=True)
 
         # Resolve channel ID ke object channel
         self._target_channel = self.get_channel(DISCORD_CHANNEL_ID)
@@ -1329,7 +1328,7 @@ class MediaScraperBot(commands.Bot):
             )
             await sender.send_text(
                 f"❌ **Error:** Tidak ada autentikasi untuk **{platform}**. "
-                f"Isi session token di `.env` atau taruh file `config/cookies/{platform}.json`."
+                f"Isi session token di `.env` atau taruh file `{platform}.json` di folder `sessions/`."
             )
             self.queue.release()
             return
