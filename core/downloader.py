@@ -71,8 +71,8 @@ def _extract_tiktok_image_urls_from_rehydration(data: dict) -> list[str]:
 
     def search_images(d) -> None:
         if isinstance(d, dict):
-            # Check known TikTok image fields directly
-            for key in ("imagePost", "imagePostInfo", "images", "photo", "photos"):
+            # 1. Direct photo structure checks
+            for key in ("imagePost", "imagePostInfo", "images", "photo", "photos", "displayImage", "display_image"):
                 if key in d:
                     val = d[key]
                     if isinstance(val, dict):
@@ -119,6 +119,9 @@ def _extract_tiktok_image_urls_from_rehydration(data: dict) -> list[str]:
         elif isinstance(d, list):
             for item in d:
                 search_images(item)
+        elif isinstance(d, str):
+            if ("photomode" in d or "tos-alisg-i" in d or "tiktokcdn" in d) and d.startswith("http"):
+                add_url(d)
 
     search_images(data)
     return image_urls
@@ -683,9 +686,32 @@ class MediaDownloader:
         return downloaded_files, real_caption, ytdl_timestamp
 
     async def _extract_tiktok_carousel_urls(self, url: str, cookies_file: Optional[str] = None) -> tuple[list[str], str]:
-        """Ekstrak list URL gambar carousel dan caption dari webpage TikTok secara async menggunakan Fast HTTP."""
+        """
+        Ekstrak list URL gambar carousel dan caption dari webpage TikTok secara async.
+        Multi-tier fallback:
+          Tier 1: TikWM Clean API (cepat, direct CDN URL)
+          Tier 2: SSR HTML Rehydration Parser (__UNIVERSAL_DATA_FOR_REHYDRATION__)
+          Tier 3: TikTok Official Web Detail API
+        """
         import httpx
 
+        # ── Tier 1: TikWM Clean API (Fastest & most reliable for unauthenticated photo posts) ──
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                tw_resp = await client.get(f"https://www.tikwm.com/api/?url={url}")
+                if tw_resp.status_code == 200:
+                    tw_data = tw_resp.json()
+                    if tw_data.get("code") == 0 and tw_data.get("data"):
+                        d = tw_data["data"]
+                        tw_images = d.get("images", [])
+                        tw_title = d.get("title", "") or ""
+                        if tw_images and isinstance(tw_images, list):
+                            logger.info(f"{TAG_DOWN} TikWM API: Berhasil menemukan {len(tw_images)} foto TikTok.")
+                            return tw_images, tw_title
+        except Exception as e:
+            logger.debug(f"TikWM API extraction error: {e}")
+
+        # ── Tier 2: SSR HTML Rehydration Parser ──
         headers = {
             "User-Agent": SHARED_USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -714,51 +740,72 @@ class MediaDownloader:
         except Exception as e:
             logger.debug(f"HTTPX fetch info: {e}")
 
-        if not html_content:
-            return [], ""
-
-        try:
-            match = re.search(
-                r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)</script>',
-                html_content,
-            )
-            if not match:
+        if html_content:
+            try:
                 match = re.search(
-                    r'<script id="SIGI_STATE"[^>]*>([\s\S]*?)</script>', html_content
+                    r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)</script>',
+                    html_content,
                 )
                 if not match:
-                    match = re.search(
-                        r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', html_content
-                    )
-                    if not match:
-                        return [], ""
+                    match = re.search(r'<script id="SIGI_STATE"[^>]*>([\s\S]*?)</script>', html_content)
+                if not match:
+                    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', html_content)
 
-            data = json.loads(match.group(1))
-            image_urls = _extract_tiktok_image_urls_from_rehydration(data)
+                if match:
+                    data = json.loads(match.group(1))
+                    image_urls = _extract_tiktok_image_urls_from_rehydration(data)
+                    caption = ""
+                    try:
+                        default_scope = data.get("__DEFAULT_SCOPE__", {})
+                        video_detail = default_scope.get("webapp.video-detail", {}) or default_scope.get("webapp.videoDetail", {})
+                        if not video_detail:
+                            webapp = default_scope.get("webapp", {})
+                            video_detail = webapp.get("video-detail", {}) or webapp.get("videoDetail", {})
+                        item_struct = video_detail.get("itemInfo", {}).get("itemStruct", {})
+                        caption = item_struct.get("desc") or ""
+                    except Exception:
+                        pass
 
-            caption = ""
-            try:
-                default_scope = data.get("__DEFAULT_SCOPE__", {})
-                video_detail = default_scope.get("webapp.video-detail", {}) or default_scope.get("webapp.videoDetail", {})
-                if not video_detail:
-                    webapp = default_scope.get("webapp", {})
-                    video_detail = webapp.get("video-detail", {}) or webapp.get("videoDetail", {})
-                item_struct = video_detail.get("itemInfo", {}).get("itemStruct", {})
-                caption = item_struct.get("desc") or ""
+                    if image_urls:
+                        return image_urls, caption
             except Exception as e:
-                logger.debug(f"Gagal ekstrak deskripsi dari rehydration data: {e}")
+                logger.debug(f"Gagal ekstrak rehydration JSON: {e}")
 
-            return image_urls, caption
-        except Exception as e:
-            logger.error(f"Gagal mengekstrak carousel TikTok secara manual: {e}")
-            return [], ""
+        # ── Tier 3: TikTok Official Item Detail Web API ──
+        post_id_match = re.search(r"/(?:video|photo|v)/(\d+)", url)
+        if post_id_match:
+            item_id = post_id_match.group(1)
+            try:
+                api_url = f"https://www.tiktok.com/api/item/detail/?itemId={item_id}"
+                async with httpx.AsyncClient(
+                    headers={
+                        "User-Agent": SHARED_USER_AGENT,
+                        "Referer": url,
+                        "Accept": "application/json, text/plain, */*",
+                    },
+                    cookies=cookies_dict if cookies_dict else None,
+                    timeout=15.0,
+                ) as client:
+                    api_resp = await client.get(api_url)
+                    if api_resp.status_code == 200:
+                        api_data = api_resp.json()
+                        image_urls = _extract_tiktok_image_urls_from_rehydration(api_data)
+                        caption = api_data.get("itemInfo", {}).get("itemStruct", {}).get("desc") or ""
+                        if image_urls:
+                            logger.info(f"{TAG_DOWN} TikTok Item API: Berhasil menemukan {len(image_urls)} foto.")
+                            return image_urls, caption
+            except Exception as e:
+                logger.debug(f"TikTok Item Detail API extraction error: {e}")
+
+        return [], ""
 
     async def _extract_tiktok_carousel_via_browser(
         self, post_url: str, cookies_file: Optional[str] = None
     ) -> tuple[list[str], str, list[dict]]:
         """
-        Scrapling Stealth Fallback Extractor khusus TikTok Carousel.
-        Membuka halaman postingan TikTok, menanti pemuatan, dan mengekstrak data rehydration JSON secara dinamis.
+        Stealth Browser Fallback Extractor khusus TikTok Carousel.
+        Membuka halaman postingan TikTok di browser stealth, menangkap response API internal,
+        dan mengekstrak data rehydration JSON serta DOM image elements.
         """
         import os
         import json
@@ -794,9 +841,24 @@ class MediaDownloader:
 
         async def _carousel_page_action(page):
             nonlocal image_urls, caption, browser_cookies
-            await asyncio.sleep(2.0)
 
-            # Path A: Rehydration JSON
+            # Network Interceptor: Tangkap payload API item/detail internal TikTok
+            async def _on_resp(response):
+                nonlocal image_urls, caption
+                try:
+                    r_url = response.url.lower()
+                    if ("item/detail" in r_url or "/api/post" in r_url or "aweme/v1" in r_url) and response.status == 200:
+                        data = await response.json()
+                        extracted = _extract_tiktok_image_urls_from_rehydration(data)
+                        if extracted and not image_urls:
+                            image_urls = extracted
+                except Exception:
+                    pass
+
+            page.on("response", _on_resp)
+            await asyncio.sleep(2.5)
+
+            # Path A: Rehydration JSON dari state window / DOM
             json_content = await page.evaluate("""() => {
                 if (window.__UNIVERSAL_DATA_FOR_REHYDRATION__) {
                     return JSON.stringify(window.__UNIVERSAL_DATA_FOR_REHYDRATION__);
@@ -811,7 +873,7 @@ class MediaDownloader:
                 return null;
             }""")
 
-            if json_content:
+            if json_content and not image_urls:
                 try:
                     raw_data = json.loads(json_content)
                     image_urls = _extract_tiktok_image_urls_from_rehydration(raw_data)
@@ -828,7 +890,7 @@ class MediaDownloader:
                 except Exception as json_err:
                     logger.warning(f"Gagal memparsing rehydration JSON TikTok: {json_err}")
 
-            # Path B: DOM img fallback
+            # Path B: DOM img element selectors
             if not image_urls:
                 image_urls = await page.evaluate("""() => {
                     const results = new Set();
@@ -890,6 +952,7 @@ class MediaDownloader:
             logger.warning(f"Browser fallback extractor failed: {e}")
 
         return image_urls, caption, cast(list[dict], browser_cookies)
+
 
     async def _extract_tiktok_video_via_browser(
         self, post_url: str, cookies_file: Optional[str] = None
@@ -1079,9 +1142,16 @@ class MediaDownloader:
                 if resp.status_code in (200, 206):
                     # FIX: stream chunk-write instead of resp.content (loads full video to RAM).
                     # Large TikTok videos (100+ MB) would cause OOM with in-memory load.
+                    # Supports both curl_cffi (aiter_content) and httpx (aiter_bytes).
                     async with aiofiles.open(output_path, "wb") as f:
-                        async for chunk in resp.aiter_bytes(8192):
-                            await f.write(chunk)
+                        if hasattr(resp, "aiter_content"):
+                            async for chunk in resp.aiter_content(8192):
+                                await f.write(chunk)
+                        elif hasattr(resp, "aiter_bytes"):
+                            async for chunk in resp.aiter_bytes(8192):
+                                await f.write(chunk)
+                        else:
+                            await f.write(resp.content)
                     logger.info(f"TikTok CDN: Download sukses via curl_cffi ({output_path.stat().st_size // 1024} KB)")
                     return output_path
                 else:
@@ -1584,9 +1654,16 @@ class MediaDownloader:
                         return None
 
                     # FIX: streaming chunk write — cegah RAM spike untuk file besar
+                    # Supports both curl_cffi (aiter_content) and httpx (aiter_bytes)
                     async with aiofiles.open(output_path, "wb") as f:
-                        async for chunk in response.aiter_bytes(8192):
-                            await f.write(chunk)
+                        if hasattr(response, "aiter_content"):
+                            async for chunk in response.aiter_content(8192):
+                                await f.write(chunk)
+                        elif hasattr(response, "aiter_bytes"):
+                            async for chunk in response.aiter_bytes(8192):
+                                await f.write(chunk)
+                        else:
+                            await f.write(response.content)
                 return output_path
             except (ImportError, ModuleNotFoundError):
                 import httpx  # pyright: ignore[reportMissingImports]
