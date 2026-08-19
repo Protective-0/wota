@@ -15,10 +15,17 @@ from typing import Optional
 # ──────────────────────────────────────────────
 
 # Detect if terminal supports color (Linux/Docker: yes; Windows without ANSI: no)
+# FORCE_COLOR=0  — explicit opt-out for log collectors that set TERM=xterm even when
+#                   output is piped to journald/file, which would print raw ANSI escape codes.
+# FORCE_COLOR=1  — explicit opt-in (useful in CI/CD pipelines).
+_force_color_env = os.getenv("FORCE_COLOR", "").lower()
 _USE_COLOR = (
-    sys.stdout.isatty()
-    or os.getenv("FORCE_COLOR", "").lower() in ("1", "true", "yes")
-    or os.getenv("TERM", "") not in ("", "dumb")
+    _force_color_env not in ("0", "false", "no")  # explicit opt-out wins
+    and (
+        _force_color_env in ("1", "true", "yes")  # explicit opt-in
+        or sys.stdout.isatty()                    # real terminal
+        or os.getenv("TERM", "") not in ("", "dumb")  # terminal type hint
+    )
 )
 
 # Reset
@@ -125,12 +132,15 @@ class ColoredFormatter(logging.Formatter):
         colored_lvl = f"{level_color}{lvl_part}{RESET}"
 
         # Colorize tag badge inside message (e.g., [🤖 PATROL])
+        # FIX: `import re as _re` was inside this loop, triggering a module lookup
+        # on every log line (Python caches it in sys.modules, but the dict lookup
+        # + local variable assignment per call is wasteful). Hoisted to module-level
+        # `import re` at the top of the file — use module-level `re` directly.
         colored_msg = msg_part
         for tag_key, tag_color in _TAG_COLORS.items():
             if tag_key in msg_part:
                 # Highlight just the bracket badge, leave rest in msg_color
-                import re as _re
-                colored_msg = _re.sub(
+                colored_msg = re.sub(
                     r"(\[[\W\w]{1,3}" + tag_key + r"[\W\s]*\])",
                     lambda m: f"{tag_color}{BOLD}{m.group(0)}{RESET}{msg_color}",
                     msg_part,

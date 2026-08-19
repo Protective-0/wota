@@ -235,7 +235,7 @@ class TwitterScraper(BaseScraper):
             )
 
             new_found = 0
-            should_stop = False
+            stop_after_batch = False  # FIX: collect all new tweets in this batch before stopping
 
             for item in tweets_snapshot:
                 href = item["href"]
@@ -246,16 +246,27 @@ class TwitterScraper(BaseScraper):
                 seen_ids.add(tweet_id)
                 tweet_url = f"https://x.com/{username}/status/{tweet_id}"
 
-                # STOP-CONDITION: Cek SQLite jika tweet ini sudah pernah di-scrape
+                # STOP-CONDITION: Cek SQLite jika tweet ini sudah pernah di-scrape.
+                # FIX: don't break immediately — continue processing the rest of this batch.
+                # Twitter timeline interleaves RTs of old content: if tweet X (already in DB)
+                # appears at position 5, tweets at positions 1-4 (new) are collected BUT
+                # tweets at positions 6+ would be silently missed if we broke here.
+                # Fix: set a flag to stop after finishing the current DOM snapshot batch,
+                # but still collect all new IDs found in this batch.
                 if not forced and await self.db.check_post_exists(tweet_id, self.PLATFORM):
                     logger.info(
                         f"{TAG_CRAWL} Stop-condition: tweet {tweet_id} sudah di DB — "
-                        f"resume point ditemukan."
+                        f"selesaikan batch ini lalu berhenti scroll."
                     )
-                    should_stop = True
-                    break
+                    stop_after_batch = True
+                    continue  # Jangan break — proses sisa batch dulu
 
                 # Bersihkan URL media Twitter ke kualitas original tertinggi (name=orig)
+                # Capture path to local var to prevent TOCTOU: if close() runs concurrently,
+                # netscape_cookie_path file may be deleted between exists() and yt-dlp use.
+                _cookie_path = self.netscape_cookie_path
+                cookies_file_str = str(_cookie_path) if _cookie_path and _cookie_path.exists() else None
+
                 cleaned_media_urls = []
                 for m_url in item.get("media_urls", []):
                     if "pbs.twimg.com/media/" in m_url:
@@ -283,14 +294,12 @@ class TwitterScraper(BaseScraper):
                         caption=item.get("caption", ""),
                         timestamp=item.get("timestamp"),
                         media_urls=cleaned_media_urls if cleaned_media_urls else [],
-                        cookies_file=str(self.netscape_cookie_path)
-                        if self.netscape_cookie_path.exists()
-                        else None,
+                        cookies_file=cookies_file_str,
                     )
                 )
                 new_found += 1
 
-            if should_stop:
+            if stop_after_batch:
                 break
 
             if new_found > 0:

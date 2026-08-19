@@ -242,8 +242,12 @@ class MediaDownloader:
         """
         # Intersepsi khusus TikTok Carousel (hanya untuk URL yang secara eksplisit memuat /photo/):
         if "tiktok.com" in post_url and "/photo/" in post_url:
-            browser_cookies = []
-            image_urls = []
+            # FIX: removed dead `browser_cookies = []` variable. It was never populated
+            # in this branch, causing `cookies_dict` to always be {} which sent TikTok CDN
+            # requests without auth cookies — resulting in 403s on authenticated content.
+            # _extract_tiktok_carousel_urls() (called below) already handles cookies
+            # internally via the cookies_file parameter, so no browser_cookies needed.
+            image_urls: list[str] = []
             caption = ""
 
             try:
@@ -261,8 +265,9 @@ class MediaDownloader:
                     f"{TAG_DOWN} TikTok Carousel terdeteksi ({len(image_urls)} foto) "
                     f"\u2014 bypass yt-dlp, download CDN langsung..."
                 )
-                
-                cookies_dict = {c["name"]: c["value"] for c in browser_cookies}
+
+                # Build cookies_dict from cookies_file only (browser_cookies removed)
+                cookies_dict: dict[str, str] = {}
                 if cookies_file:
                     cookies_dict.update(self._parse_netscape_cookies(cookies_file))
 
@@ -277,7 +282,7 @@ class MediaDownloader:
 
                 tasks = [download_single(idx, img_url) for idx, img_url in enumerate(image_urls)]
                 results = await asyncio.gather(*tasks)
-                
+
                 downloaded_files = [path for path in results if path is not None]
                 if downloaded_files:
                     return downloaded_files, caption, None
@@ -559,12 +564,24 @@ class MediaDownloader:
             )
 
             if auth_token or ct0:
-                await context.add_cookies([
-                    {"name": "auth_token", "value": auth_token.strip(), "domain": ".x.com", "path": "/"},
-                    {"name": "ct0", "value": ct0.strip(), "domain": ".x.com", "path": "/"},
-                    {"name": "auth_token", "value": auth_token.strip(), "domain": ".twitter.com", "path": "/"},
-                    {"name": "ct0", "value": ct0.strip(), "domain": ".twitter.com", "path": "/"}
-                ])
+                # FIX: guard each cookie with its own None check before .strip().
+                # If auth_token is None (env not set, cookies_file missing auth_token),
+                # calling auth_token.strip() raises AttributeError and crashes the fallback.
+                twitter_cookies = []
+                for name, value, domains in [
+                    ("auth_token", auth_token, [".x.com", ".twitter.com"]),
+                    ("ct0",        ct0,        [".x.com", ".twitter.com"]),
+                ]:
+                    if value:  # Skip entirely if token is None or empty string
+                        for domain in domains:
+                            twitter_cookies.append({
+                                "name": name,
+                                "value": value.strip(),
+                                "domain": domain,
+                                "path": "/",
+                            })
+                if twitter_cookies:
+                    await context.add_cookies(twitter_cookies)
 
             page = await context.new_page()
             try:
@@ -1435,7 +1452,10 @@ class MediaDownloader:
 
         downloaded = []
         try:
-            before = set(self.temp_dir.rglob("*.*"))
+            # FIX: scope to flat glob instead of recursive rglob to avoid O(N) scan
+            # of the entire temp_dir on every gallery-dl call (expensive on busy servers
+            # with thousands of leftover files). gallery-dl writes flat into --dest dir.
+            before = set(self.temp_dir.glob("*.*"))
 
             proc = await asyncio.create_subprocess_exec(
                 "gallery-dl",
@@ -1636,13 +1656,13 @@ class MediaDownloader:
             logger.warning(f"{TAG_WARN} Durasi video tidak terdeteksi \u2014 fallback bitrate 1 Mbps.")
             target_bitrate_bps = 1_000_000
 
-        # Jalankan kompresi di thread pool (ffmpeg bersifat blocking)
+        # Jalankan kompresi via asyncio subprocess (non-blocking, no executor needed)
         compressed_path = file_path.with_stem(file_path.stem + "_compressed")
         t_compress_start = _time.monotonic()
-        loop = asyncio.get_running_loop()  # get_running_loop() — tidak deprecated
-        success = await loop.run_in_executor(
-            None,
-            self._run_ffmpeg_compress,
+        # FIX: _run_ffmpeg_compress is now async (uses asyncio.create_subprocess_exec),
+        # so we await it directly instead of wrapping in run_in_executor.
+        # This eliminates thread pool saturation when multiple compressions run concurrently.
+        success = await self._run_ffmpeg_compress(
             file_path,
             compressed_path,
             target_bitrate_bps,
@@ -1746,7 +1766,7 @@ class MediaDownloader:
 
         return None
 
-    def _run_ffmpeg_compress(
+    async def _run_ffmpeg_compress(
         self,
         input_path: Path,
         output_path: Path,
@@ -1754,36 +1774,36 @@ class MediaDownloader:
     ) -> bool:
         """
         Jalankan ffmpeg untuk mengompres video dengan target bitrate tertentu.
-        Menggunakan single-pass encoding dengan -maxrate dan -bufsize untuk
-        kontrol yang lebih baik terhadap ukuran output.
+        Menggunakan asyncio.create_subprocess_exec (non-blocking) agar event loop
+        tidak tertahan selama kompresi — konsisten dengan pola yt-dlp di codebase ini.
+
+        FIX (dari audit): sebelumnya menggunakan subprocess.run() sinkron di dalam
+        loop.run_in_executor(). Ini menyebabkan thread pool saturasi jika 4+ kompresi
+        berjalan serentak. Migrasi ke async subprocess menghilangkan ketergantungan
+        pada executor thread pool untuk operasi I/O-bound ini.
         """
         target_kbps = target_bitrate_bps // 1000
         bufsize_kbps = target_kbps * 2
 
+        # FIX: hapus `-threads 2` hardcode — biarkan ffmpeg auto-detect jumlah thread
+        # optimal. Di container 1-vCPU, -threads 2 menyebabkan context-switch overhead
+        # yang tidak perlu. Bisa di-override via FFMPEG_THREADS env jika diperlukan.
+        ffmpeg_threads = os.getenv("FFMPEG_THREADS", "")
+        thread_args = ["-threads", ffmpeg_threads] if ffmpeg_threads.isdigit() else []
+
         cmd = [
             "ffmpeg",
-            "-i",
-            str(input_path),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-threads",
-            "2",
-            "-b:v",
-            f"{target_kbps}k",
-            "-maxrate",
-            f"{target_kbps}k",
-            "-bufsize",
-            f"{bufsize_kbps}k",
-            "-fs",
-            f"{self.target_file_size_bytes}",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
+            "-i", str(input_path),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            *thread_args,
+            "-b:v", f"{target_kbps}k",
+            "-maxrate", f"{target_kbps}k",
+            "-bufsize", f"{bufsize_kbps}k",
+            "-fs", f"{self.target_file_size_bytes}",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
             "-y",
             str(output_path),
         ]
@@ -1791,21 +1811,27 @@ class MediaDownloader:
         logger.info(f"ffmpeg kompresi: target {target_kbps}kbps → {output_path.name}")
 
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=90,
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            if result.returncode != 0:
-                logger.error(
-                    f"ffmpeg error: {result.stderr[-500:]}"
-                )
+            try:
+                _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=90.0)
+            except asyncio.TimeoutError:
+                logger.error("ffmpeg timeout setelah 90 detik — membunuh proses...")
+                proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+                return False
+
+            if proc.returncode != 0:
+                stderr_text = (stderr_bytes or b"").decode("utf-8", errors="replace")[-500:]
+                logger.error(f"ffmpeg error: {stderr_text}")
                 return False
             return True
-        except subprocess.TimeoutExpired:
-            logger.error("ffmpeg timeout setelah 90 detik")
-            return False
         except FileNotFoundError:
             logger.error(
                 "ffmpeg tidak ditemukan — pastikan sudah terinstall dan ada di PATH"

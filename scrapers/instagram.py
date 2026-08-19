@@ -142,7 +142,12 @@ class InstagramScraper(BaseScraper):
             canonical_url = f"https://www.instagram.com/{username}/"
             reels_url = f"https://www.instagram.com/{username}/reels/"
 
-            assert self._context is not None
+            assert self._context is not None  # guaranteed by _init_browser raising on None
+            # FIX: add explicit guard that survives python -O (which strips assert).
+            # _init_browser() already raises RuntimeError if context is None, so this
+            # is belt-and-suspenders for any future refactor that bypasses _init_browser.
+            if self._context is None:
+                raise RuntimeError("Browser context is not initialized — call _init_browser() first")
             page = await self._context.new_page()
 
             try:
@@ -177,7 +182,10 @@ class InstagramScraper(BaseScraper):
                 logger.info(f"{TAG_CRAWL} Memulai ekstraksi metadata Hybrid untuk {len(combined_urls)} post/reels...")
                 import time as _t
                 crawl_start_time = _t.monotonic()
-                MAX_CRAWL_DURATION = 600.0  # 10 menit batas waktu safety per profil
+                # FIX: make crawl duration configurable via env so operators can tune
+                # for accounts with 500+ posts (default 10 min = 600s).
+                _max_crawl_minutes = int(os.getenv("MAX_INSTAGRAM_CRAWL_MINUTES", "10"))
+                MAX_CRAWL_DURATION = _max_crawl_minutes * 60.0
 
                 for target_url in combined_urls:
                     if _t.monotonic() - crawl_start_time > MAX_CRAWL_DURATION:
@@ -212,9 +220,12 @@ class InstagramScraper(BaseScraper):
                         all_post_objects.append(post_data)
 
                 # ──────────────────────────────────────────
-                # TAHAP 5: Urutkan Kronologis (Lama ke Baru)
-                # ──────────────────────────────────────────
-                # Type-consistent sort: handle None gracefully in key function without mutating domain object timestamp
+                # TAHAP 5: Urutkan Kronologis (Terbaru ke Terlama)
+                # ──────────────────────────────────────────────────────────────────
+                # FIX: sort is reverse=True = newest-first (descending by timestamp).
+                # Previous comment said "Lama ke Baru" which was wrong — fixed.
+                # Downstream pipeline (bot.py _run_scraping_pipeline) processes
+                # items oldest-first by reversing the yielded list before downloading.
                 all_post_objects.sort(key=lambda x: str(x.timestamp) if x.timestamp else "1970-01-01T00:00:00.000Z", reverse=True)
 
                 # ──────────────────────────────────────────

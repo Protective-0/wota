@@ -12,9 +12,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 import json
-import os
 import logging
+import os
 from pathlib import Path
+import platform as _platform_module
 from typing import AsyncGenerator, Optional
 import aiofiles
 
@@ -161,7 +162,6 @@ class BaseScraper(ABC):
             if env_val and os.path.exists(env_val):
                 return env_val
 
-        import platform as _platform_module
         system = _platform_module.system()
 
         if system == "Linux":
@@ -247,6 +247,24 @@ class BaseScraper(ABC):
         if brave_path:
             launch_kwargs["executable_path"] = brave_path
         elif _platform_module.system() == "Linux":
+            # FIX: if no system browser found AND we're falling back to Playwright's bundled
+            # chromium via channel="chromium", check that it's actually installed first.
+            # If not installed, launch silently fails with a cryptic error. Log an explicit
+            # actionable message so operators know to run `playwright install chromium`.
+            ms_playwright_cache = Path.home() / ".cache" / "ms-playwright"
+            has_playwright_chromium = any(
+                p.name == "chrome" and p.exists()
+                for p in ms_playwright_cache.glob("chromium-*/chrome-linux/chrome")
+            ) if ms_playwright_cache.exists() else False
+
+            if not has_playwright_chromium:
+                logger.error(
+                    "[❌ ERROR  ] Tidak ada browser yang ditemukan di Linux! "
+                    "Jalankan: `playwright install chromium` atau set env BROWSER_EXECUTABLE_PATH. "
+                    "Bot akan crash saat mencoba membuka browser."
+                )
+            else:
+                logger.debug("[⚙️ SYSTEM] Menggunakan Playwright bundled chromium via channel='chromium'.")
             launch_kwargs["channel"] = "chromium"
 
         if proxy:

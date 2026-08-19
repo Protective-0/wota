@@ -509,6 +509,8 @@ class MediaScraperBot(commands.Bot):
                 await asyncio.to_thread(clear_directory_contents, SESSION_DIR)
 
                 # Kosongkan antrean job yang tertunda
+                # FIX: task_done() removed — tidak ada Queue.join() di codebase ini,
+                # task_done() hanya relevan jika join() dipakai. get_nowait() sudah cukup.
                 while not self._job_queue.empty():
                     try:
                         self._job_queue.get_nowait()
@@ -887,9 +889,16 @@ class MediaScraperBot(commands.Bot):
 
         if self.is_scanning or self.queue.is_busy or not self._job_queue.empty():
             q_size = self._job_queue.qsize()
-            logger.info(
-                f"{TAG_PATROL} Antrean/Task masih aktif (queue_busy={self.queue.is_busy}, "
-                f"job_queue={q_size}, is_scanning={self.is_scanning}) — siklus patroli ditunda."
+            # FIX: downgraded to WARNING so operators see skipped cycles in production logs.
+            # Structured log includes current lock holder URL so it's actionable.
+            lock_info = (
+                f" — lock held by: {self.queue.current_task.profile_url}"
+                if self.queue.current_task else ""
+            )
+            logger.warning(
+                f"{TAG_PATROL} Siklus patroli DILEWATI — antrean/task masih aktif "
+                f"(queue_busy={self.queue.is_busy}, job_queue={q_size}, "
+                f"is_scanning={self.is_scanning}){lock_info}."
             )
             return
 
@@ -1609,9 +1618,18 @@ class MediaScraperBot(commands.Bot):
             except asyncio.CancelledError:
                 pass
 
-        # 2. Hentikan background patrol loop
+        # 2. Hentikan background patrol loop dan tunggu task-nya selesai
         if self.patrol_loop.is_running():
             self.patrol_loop.cancel()
+            # FIX: await the underlying task so the loop cannot fire once more
+            # after close() returns. tasks.Loop.cancel() is async-fire-and-forget;
+            # without this the loop may still execute one more cycle.
+            patrol_task = self.patrol_loop.get_task()
+            if patrol_task is not None and not patrol_task.done():
+                try:
+                    await asyncio.wait_for(patrol_task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
 
         # 3. Tutup browser Playwright shared pool
         try:
@@ -1649,7 +1667,20 @@ def main() -> None:
         loop = asyncio.get_running_loop()
 
         # Graceful shutdown: SIGTERM (Docker stop / systemd stop) dan SIGINT (Ctrl+C)
+        # FIX: _shutdown_flag prevents double-close race.
+        # Scenario: SIGTERM fires _signal_handler → schedules bot.close().
+        # Then finally block at L1675 also calls bot.close() if not bot.is_closed().
+        # Two concurrent close() calls race on _worker_task cancellation and db.close().
+        # Guard: check bot.is_closed() AND a local flag (is_closed() may not be True yet
+        # during the brief window between close() being scheduled and it setting the flag).
+        _shutdown_scheduled = False
+
         def _signal_handler():
+            nonlocal _shutdown_scheduled
+            if _shutdown_scheduled or bot.is_closed():
+                logger.debug(f"{TAG_SYSTEM} Shutdown sudah dijadwalkan — sinyal duplikat diabaikan.")
+                return
+            _shutdown_scheduled = True
             logger.info(f"{TAG_SYSTEM} SIGTERM/SIGINT diterima — menjadwalkan graceful shutdown...")
             loop.call_soon_threadsafe(loop.create_task, bot.close())
 

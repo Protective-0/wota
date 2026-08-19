@@ -110,9 +110,11 @@ class QueueManager:
     def release(self) -> None:
         """Lepas lock dan bersihkan state task (termasuk dereference object untuk cegah memory leak)."""
         self._current_task = None
-        if self._lock.locked():
-            self._lock.release()
-            logger.info("Lock released — bot siap menerima task baru")
+        # FIX: removed `if self._lock.locked()` guard — silently no-oping hides double-release
+        # programmer bugs. Let asyncio.Lock.release() raise RuntimeError so the error
+        # surfaces immediately in logs instead of accumulating as a silent state corruption.
+        self._lock.release()
+        logger.info("Lock released — bot siap menerima task baru")
 
     def update_progress(self, posts_done: int, posts_total: int = 0, current_post_id: Optional[str] = None) -> None:
         """Update progress counter untuk task yang sedang berjalan."""

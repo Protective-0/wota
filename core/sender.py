@@ -108,7 +108,9 @@ class MediaSender:
             return False
 
         discord_file = discord.File(file_path)
-        file_size = file_path.stat().st_size
+        # FIX: removed duplicate file_size = file_path.stat().st_size call here.
+        # file_size was already captured at L96 before the early-return guards above.
+        # Re-reading stat() here was redundant (and a syscall per send).
         try:
             await self.channel.send(
                 file=discord_file,
@@ -160,7 +162,8 @@ class MediaSender:
             return False
 
         discord_file = discord.File(file_path)
-        file_size = file_path.stat().st_size
+        # FIX: removed duplicate file_size = file_path.stat().st_size call here.
+        # file_size was already captured at L144 before the early-return guards above.
         try:
             await self.channel.send(
                 file=discord_file,
@@ -285,6 +288,11 @@ class MediaSender:
                 except discord.HTTPException as e:
                     logger.error(f"{TAG_ERROR} Gagal rollback carousel message: {e}")
             logger.warning(f"{TAG_WARN} Carousel partial delivery — file dipertahankan untuk recovery.")
+            # FIX: cleanup temp files even on failure to prevent disk leak accumulation.
+            # Rollback deletes the Discord messages, so retaining local files serves no purpose
+            # (caller has no retry mechanism that would use them). Cleanup immediately.
+            await asyncio.sleep(1.5)
+            await self.downloader.cleanup_files_async(file_paths)
         return all_success
 
     # ──────────────────────────────────────────────

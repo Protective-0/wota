@@ -56,54 +56,69 @@ class TikTokScraper(BaseScraper):
     async def _init_browser(self) -> Page:
         """Inisialisasi browser Playwright standard dengan konfigurasi Headless Stealth tingkat tinggi."""
         self._playwright = await async_playwright().start()
-        brave_path = BaseScraper.get_brave_path()
-        if brave_path:
-            logger.info(f"Menggunakan browser Brave dari: {brave_path}")
+        # FIX: wrap browser launch in try/except so Playwright node process is never orphaned.
+        # If chromium.launch() raises, stop() is called before re-raising — prevents ~50MB
+        # leaked `node` processes per failure on Debian headless server.
+        try:
+            brave_path = BaseScraper.get_brave_path()
+            if brave_path:
+                logger.info(f"Menggunakan browser Brave dari: {brave_path}")
 
-        # FIX: replaced manual launch_kwargs dict with base class helper
-        # to ensure all stealth args (--disable-web-security, --disable-features etc.)
-        # are consistent across all scrapers
-        launch_kwargs = BaseScraper.get_browser_launch_kwargs()
-        launch_kwargs["headless"] = not self.headed
+            # FIX: replaced manual launch_kwargs dict with base class helper
+            # to ensure all stealth args (--disable-web-security, --disable-features etc.)
+            # are consistent across all scrapers
+            launch_kwargs = BaseScraper.get_browser_launch_kwargs()
+            launch_kwargs["headless"] = not self.headed
 
-        self._browser = await self._playwright.chromium.launch(**launch_kwargs)
-        # FIX: replace `assert self._browser is not None` with explicit RuntimeError.
-        # assert is stripped when Python runs with -O (optimized flag), making the
-        # guard invisible in production. RuntimeError always fires regardless of flags.
-        if self._browser is None:
-            raise RuntimeError("Playwright failed to launch browser — chromium.launch() returned None")
-        
-        self._context = await self._browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1280, "height": 720},
-            locale="en-US,en;q=0.9",
-            timezone_id="Asia/Jakarta"
-        )
+            self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+            # FIX: replace `assert self._browser is not None` with explicit RuntimeError.
+            # assert is stripped when Python runs with -O (optimized flag), making the
+            # guard invisible in production. RuntimeError always fires regardless of flags.
+            if self._browser is None:
+                raise RuntimeError("Playwright failed to launch browser — chromium.launch() returned None")
 
-        # DEEP STEALTH INJECTION: Menyamarkan seluruh properti headless object agar dikira browser manusia asli
-        if self._context is None:
-            raise RuntimeError("Browser context gagal diinisialisasi oleh Playwright — new_context() return None")
-        await self._context.add_init_script("""
-            () => {
-                // 1. Clear Webdriver flag
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                
-                // 2. Mock Chrome runtime structure
-                window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {} };
-                
-                // 3. Fake Languages & Plugins
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            }
-        """)
+            self._context = await self._browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 720},
+                locale="en-US,en;q=0.9",
+                timezone_id="Asia/Jakarta"
+            )
 
-        netscape_path = await self.load_and_inject_cookies(self._context, "tiktok")
-        if not netscape_path:
-            raise ValueError("File cookie TikTok tidak ditemukan atau kosong.")
-        self.netscape_cookie_path = netscape_path
+            # DEEP STEALTH INJECTION: Menyamarkan seluruh properti headless object agar dikira browser manusia asli
+            if self._context is None:
+                raise RuntimeError("Browser context gagal diinisialisasi oleh Playwright — new_context() return None")
+            await self._context.add_init_script("""
+                () => {
+                    // 1. Clear Webdriver flag
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
-        page = await self._context.new_page()
-        return page
+                    // 2. Mock Chrome runtime structure
+                    window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {} };
+
+                    // 3. Fake Languages & Plugins
+                    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                }
+            """)
+
+            netscape_path = await self.load_and_inject_cookies(self._context, "tiktok")
+            if not netscape_path:
+                raise ValueError("File cookie TikTok tidak ditemukan atau kosong.")
+            self.netscape_cookie_path = netscape_path
+
+            page = await self._context.new_page()
+            return page
+        except Exception:
+            # Ensure playwright process is always cleaned up on any failure
+            if self._playwright:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+            self._browser = None
+            self._context = None
+            raise
 
     async def scrape_profile(
         self,
@@ -176,6 +191,16 @@ class TikTokScraper(BaseScraper):
             logger.info(f"{TAG_CRAWL} yt-dlp kosong — fallback ke Playwright browser automation...")
             try:
                 page = await self._init_browser()
+            except Exception as e:
+                # FIX: catch _init_browser errors (cookie missing, browser crash) and fail
+                # gracefully — identical to instagram.py:L129-133 pattern.
+                # Without this guard, ValueError from missing cookies propagates uncaught
+                # to bot.py's _run_initial_historical_scrape, causing the job to error WITHOUT
+                # marking initial_scan_completed=False, so the account retries forever.
+                logger.error(f"{TAG_ERROR} Menghentikan scraping TikTok @{username} — error browser/cookie: {e}")
+                self.failed = True
+                return
+            try:
                 intercepted_urls: set[str] = set()
 
                 async def _on_response(response):

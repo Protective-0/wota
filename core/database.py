@@ -105,6 +105,9 @@ class DatabaseManager:
         self._db.row_factory = aiosqlite.Row  # Hasil query bisa diakses seperti dict
 
         # Set timeout DULU sebelum mengaktifkan WAL untuk mencegah instant lock pada Linux disk
+        # FIX: busy_timeout harus diset SEBELUM journal_mode=WAL karena aktivasi WAL
+        # sendiri membutuhkan brief exclusive lock. Jika reader lain menahannya,
+        # tanpa busy_timeout yang aktif → langsung OperationalError: database is locked.
         await self._db.execute("PRAGMA busy_timeout = 5000")
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
@@ -140,12 +143,15 @@ class DatabaseManager:
                 logger.info("[⚙️ SYSTEM] Tabel monitored_accounts baru dibuat, tidak memerlukan migrasi.")
                 return
 
-            # Cek kolom yang dibutuhkan
+            # Cek kolom yang dibutuhkan (presence check saja, bukan DDL generation)
+            # FIX: hapus col_def yang stale — schema asli pakai composite PK (username, platform)
+            # bukan TEXT PRIMARY KEY per kolom. Dict ini hanya dipakai untuk cek keberadaan kolom.
             required_cols = {
-                "username": "TEXT PRIMARY KEY",
-                "platform": "TEXT",
-                "channel_id": "INTEGER",
-                "last_scraped_id": "TEXT",
+                "username",
+                "platform",
+                "channel_id",
+                "last_scraped_id",
+                "initial_scan_completed",
             }
 
             needs_rebuild = (
@@ -161,10 +167,16 @@ class DatabaseManager:
                 return
 
             # Jika tidak butuh rebuild total, tambahkan kolom yang kurang via ALTER TABLE
-            for col_name, col_def in required_cols.items():
+            for col_name in required_cols:
                 if col_name not in current_columns:
-                    logger.info(f"[⚙️ SYSTEM] Migrasi monitored_accounts: Menambahkan kolom {col_name} ({col_def})")
-                    await self.db.execute(f"ALTER TABLE monitored_accounts ADD COLUMN {col_name} {col_def}")
+                    # Tentukan tipe default berdasarkan nama kolom
+                    col_type = (
+                        "INTEGER NOT NULL DEFAULT 0" if col_name == "initial_scan_completed"
+                        else "INTEGER NOT NULL" if col_name == "channel_id"
+                        else "TEXT"
+                    )
+                    logger.info(f"[⚙️ SYSTEM] Migrasi monitored_accounts: Menambahkan kolom {col_name} ({col_type})")
+                    await self.db.execute(f"ALTER TABLE monitored_accounts ADD COLUMN {col_name} {col_type}")
             
             await self.db.commit()
 
@@ -178,7 +190,12 @@ class DatabaseManager:
         # aiosqlite in WAL mode raises "cannot start a transaction within a transaction"
         # when BEGIN is issued manually while autocommit is active. The context manager
         # handles commit on success and rollback on any exception atomically.
+        #
+        # Additional FIX: call commit() BEFORE entering the context manager to ensure
+        # any implicit transaction from prior executescript() is closed. This prevents
+        # OperationalError: cannot start a transaction within a transaction.
         try:
+            await self.db.commit()  # Flush any pending implicit transaction first
             async with self.db:
                 await self.db.execute("""
                     CREATE TABLE monitored_accounts_new (
