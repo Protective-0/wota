@@ -1,14 +1,21 @@
 """
 scrapers/instagram.py
-Scraper profil Instagram menggunakan Built-in Stealth Browser + Subprocess Fallback (gallery-dl / yt-dlp).
+Engine Scraper Profil Instagram 100% Guest Mode (Zero-Login).
 
-Fitur & Keamanan Linux/Debian Headless:
-1. Proactive Authentication Check: Validasi keberadaan cookie `sessionid` sebelum navigasi.
-2. Early Abort Login Wall: Jika terdeteksi redirect ke /accounts/login/ atau /challenge/, bot langsung berhenti scrolling halaman kosong dan beralih ke fallback extractor.
-3. Fallback Subprocess Extractor (gallery-dl / yt-dlp): Mengambil postingan akun publik tanpa bergantung pada browser yang terblokir (dengan proteksi timeout & anti-zombie subprocess).
-4. Dual-Tab Crawling: Feed utama (/username/) lalu tab Reels (/username/reels/).
-5. DSU (Decorate-Sort-Undecorate) sorting untuk kronologi postingan yang presisi (oldest-first ke downstream).
-6. Smart stop-condition: berhenti saat menemukan postingan yang sudah ada di SQLite.
+Fitur & Keamanan:
+1. Zero-Login Architecture:
+   - Tidak memerlukan cookie akun login pengguna sama sekali, bebas dari resiko ban atau checkpoint akun.
+2. Multi-Tier Public Extraction:
+   - Tier 1: Instagram Public Web API (api/v1/users/web_profile_info/?username={username}) menggunakan X-IG-App-ID header resmi (936619743392459).
+   - Tier 2: gallery-dl Subprocess Extractor (ekstraksi feed publik langsung tanpa browser).
+   - Tier 3: yt-dlp Flat-Playlist (fallback metadata ekstraksi cepat).
+   - Tier 4: Playwright Stealth Browser (fallback DOM parser dengan deteksi login wall instan).
+3. Anti-Zombie Subprocess Guards:
+   - Seluruh subprocess dilengkapi asyncio.TimeoutError handler dengan proc.kill() dan proc.wait().
+4. DSU Chronological Sorting:
+   - Stop-condition evaluation pada post terbaru, lalu dispatch ke downstream secara kronologis (oldest-first).
+5. Clean Error Handling:
+   - Melewati profil private atau terblokir secara bersih tanpa looping tak berujung.
 """
 
 import asyncio
@@ -18,8 +25,10 @@ import os
 import random
 import re
 from pathlib import Path
-from typing import AsyncGenerator, Optional
-from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from typing import AsyncGenerator, Optional, Any
+from datetime import datetime, timezone
+
+import httpx
 
 from .base import (
     BaseScraper,
@@ -39,10 +48,13 @@ from core.utils import (
 
 logger = logging.getLogger(__name__)
 
+# Instagram Web App ID resmi untuk public web API client
+IG_WEB_APP_ID = "936619743392459"
+
 
 class InstagramScraper(BaseScraper):
     """
-    Scraper profil Instagram berbasis Built-in Stealth Browser dengan deteksi login wall dan fallback extractor.
+    Scraper profil Instagram 100% Guest Mode (Zero-Login) berbasis Multi-Tier API & Subprocess Fallback.
     """
 
     PLATFORM = "instagram"
@@ -52,52 +64,24 @@ class InstagramScraper(BaseScraper):
         self.headed = headed
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        self.netscape_cookie_path = self.session_dir / "instagram_cookies.txt"
         self._playwright = None
-        self._browser: Optional[Browser] = None
-        self._context: Optional[BrowserContext] = None
+        self._browser = None
+        self._context = None
 
     def _extract_username(self, url: str) -> str:
-        """Ekstrak username Instagram dari URL profil."""
+        """Ekstrak username Instagram dari berbagai format URL profil."""
         match = re.search(r"instagram\.com/([^/?&#/]+)/?", url)
         if match:
             username = match.group(1)
             if username not in {"p", "reel", "explore", "stories", "accounts"}:
                 return username.lower().strip()
-        return ""
+        cleaned = url.split("?")[0].rstrip("/").split("/")[-1]
+        return cleaned.lower().strip() if cleaned else ""
 
     def _extract_post_id(self, url: str) -> str:
         """Ekstrak shortcode postingan dari URL Instagram."""
-        match = re.search(r"/p/([A-Za-z0-9_-]+)", url)
-        if match:
-            return match.group(1)
-        match = re.search(r"/reel/([A-Za-z0-9_-]+)", url)
+        match = re.search(r"/(?:p|reel)/([A-Za-z0-9_-]+)", url)
         return match.group(1) if match else ""
-
-    def _has_session_cookie(self) -> bool:
-        """Cek apakah cookie sessionid Instagram tersedia di .env atau Netscape file."""
-        if os.getenv("INSTAGRAM_SESSION_ID", "").strip():
-            return True
-        if self.netscape_cookie_path.exists():
-            try:
-                cookies = self._parse_netscape_cookies(str(self.netscape_cookie_path))
-                if "sessionid" in cookies and cookies["sessionid"]:
-                    return True
-            except Exception:
-                pass
-        return False
-
-    async def _init_browser(self) -> Page:
-        """Inisialisasi browser stealth Playwright."""
-        self._playwright = await async_playwright().start()
-        self._browser, self._context = await BaseScraper.create_stealth_browser(
-            self._playwright,
-            headed=self.headed,
-            viewport={"width": 1280, "height": 800},
-            locale="id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-        )
-        await self.load_and_inject_cookies(self._context, "instagram")
-        return await self._context.new_page()
 
     async def scrape_profile(
         self,
@@ -105,232 +89,178 @@ class InstagramScraper(BaseScraper):
         forced: bool = False,
     ) -> AsyncGenerator[PostMedia, None]:
         """
-        Crawl konten profil Instagram secara dual-tab (Feed & Reels) dengan early abort login wall.
+        Crawl profil Instagram secara 100% Guest Mode tanpa memerlukan akun login.
         """
         username = self._extract_username(profile_url)
         if not username:
-            logger.error(f"{TAG_ERROR} Username tidak valid: {profile_url}")
+            logger.error(f"{TAG_ERROR} Username tidak valid dari URL: {profile_url}")
             return
         self._profile_url_username = username
 
         canonical_url = f"https://www.instagram.com/{username}/"
-        reels_url = f"https://www.instagram.com/{username}/reels/"
+        logger.info(f"{TAG_CRAWL} Memulai scraping profil @{username} (instagram, Zero-Login Mode): {canonical_url}")
 
-        # Siapkan cookies
-        netscape_path = await self.load_and_inject_cookies(None, "instagram")
-        if netscape_path:
-            self.netscape_cookie_path = netscape_path
+        collected_posts: list[PostMedia] = []
+        seen_shortcodes: set[str] = set()
 
-        has_auth = self._has_session_cookie()
-        if not has_auth:
-            logger.warning(
-                f"{TAG_WARN} Cookie INSTAGRAM_SESSION_ID tidak ditemukan di .env/sessions. Menggunakan mode anonim..."
-            )
-
-        feed_urls: list[str] = []
-        reels_urls: list[str] = []
-        login_wall_encountered = False
-
+        # ─────────────────────────────────────────────────────────────────────
+        # TIER 1: Instagram Public Web API (X-IG-App-ID)
+        # Super cepat, tanpa browser overhead, mengekstrak timeline publik
+        # ─────────────────────────────────────────────────────────────────────
+        logger.info(f"{TAG_CRAWL} [TIER 1] Menjalankan Instagram Public Web API untuk @{username}...")
         try:
-            page = await self._init_browser()
+            api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+            headers = {
+                "User-Agent": USER_AGENT,
+                "X-IG-App-ID": IG_WEB_APP_ID,
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": canonical_url,
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            }
 
-            # ──────────────────────────────────────────
-            # TAHAP 1: Kumpulkan URL Feed / Grid Utama
-            # ──────────────────────────────────────────
-            logger.info(f"[TAB 1/2] Mengumpulkan URL feed Instagram: {canonical_url}")
-            try:
-                await page.goto(canonical_url, wait_until="domcontentloaded", timeout=45000)
-                await asyncio.sleep(random.uniform(2.0, 3.5))
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15.0) as client:
+                resp = await client.get(api_url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    user_data = data.get("data", {}).get("user")
+                    if user_data:
+                        is_private = user_data.get("is_private", False)
+                        if is_private:
+                            logger.warning(f"{TAG_WARN} Profil @{username} bersifat Private — tidak dapat diakses dalam Guest Mode.")
+                            return
 
-                # Dismiss dialog modal login banner jika ada
-                try:
-                    close_btn = await page.query_selector(
-                        'button:has-text("Not Now"), button:has-text("Lain Kali"), [aria-label="Close"], [aria-label="Tutup"]'
-                    )
-                    if close_btn:
-                        await close_btn.click()
-                        await asyncio.sleep(1.0)
-                except Exception:
-                    pass
+                        media_timeline = user_data.get("edge_owner_to_timeline_media", {})
+                        edges = media_timeline.get("edges", [])
+                        logger.info(f"{TAG_CRAWL} [TIER 1] Public Web API menemukan {len(edges)} post pada timeline @{username}.")
 
-                # Early Abort Login Wall Check
-                current_url = page.url.lower()
-                if "accounts/login" in current_url or "challenge" in current_url:
-                    login_wall_encountered = True
-                    logger.warning(
-                        f"[🚨 LOGIN WALL] Instagram mengalihkan @{username} ke login page: {page.url} — menghentikan scroll browser."
-                    )
+                        for edge in edges:
+                            node = edge.get("node", {})
+                            shortcode = node.get("shortcode")
+                            if not shortcode or shortcode in seen_shortcodes:
+                                continue
+
+                            seen_shortcodes.add(shortcode)
+                            p_url = f"https://www.instagram.com/p/{shortcode}/"
+                            is_video = node.get("is_video", False)
+                            media_type = MediaType.VIDEO if is_video else MediaType.PHOTO
+
+                            # Caption & Timestamp
+                            caption = ""
+                            edges_caption = node.get("edge_media_to_caption", {}).get("edges", [])
+                            if edges_caption:
+                                caption = edges_caption[0].get("node", {}).get("text", "") or ""
+
+                            ts_val = node.get("taken_at_timestamp")
+                            ts_str = None
+                            if ts_val:
+                                ts_str = datetime.fromtimestamp(ts_val, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                            # Media direct URLs
+                            media_urls = []
+                            if not is_video:
+                                display_url = node.get("display_url")
+                                if display_url:
+                                    media_urls.append(display_url)
+                                # Cek carousel items jika ada
+                                sidecar = node.get("edge_sidecar_to_children", {}).get("edges", [])
+                                if len(sidecar) > 1:
+                                    media_type = MediaType.CAROUSEL
+                                    media_urls = []
+                                    for c_edge in sidecar:
+                                        c_node = c_edge.get("node", {})
+                                        c_url = c_node.get("display_url") or c_node.get("video_url")
+                                        if c_url:
+                                            media_urls.append(c_url)
+
+                            collected_posts.append(
+                                PostMedia(
+                                    post_id=shortcode,
+                                    post_url=p_url,
+                                    profile_url=canonical_url,
+                                    platform=self.PLATFORM,
+                                    media_type=media_type,
+                                    media_urls=media_urls,
+                                    caption=caption,
+                                    timestamp=ts_str,
+                                    cookies_file=None,
+                                )
+                            )
                 else:
-                    seen_in_page = set()
-                    should_stop = False
-
-                    for _ in range(6):
-                        if should_stop:
-                            break
-
-                        links = await page.locator('a[href*="/p/"], a[href*="/reel/"]').all()
-                        for link in links:
-                            try:
-                                href = await link.get_attribute("href")
-                                if not href or href in seen_in_page:
-                                    continue
-                                seen_in_page.add(href)
-                                full_post_url = f"https://www.instagram.com{href}" if href.startswith("/") else href
-                                p_id = self._extract_post_id(full_post_url)
-                                if not p_id:
-                                    continue
-
-                                if not forced and await self.db.check_post_exists(p_id, self.PLATFORM):
-                                    logger.info(f"{TAG_CRAWL} Stop-condition feed: post {p_id} sudah ada di DB.")
-                                    should_stop = True
-                                    break
-
-                                feed_urls.append(full_post_url)
-                            except Exception:
-                                pass
-
-                        await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-                        await asyncio.sleep(random.uniform(2.0, 3.5))
-
-            except Exception as e:
-                logger.error(f"{TAG_ERROR} Gagal fetch feed Instagram @{username}: {e}")
-
-            logger.info(f"[TAB 1/2] {len(feed_urls)} post ditemukan di feed @{username}")
-
-            # ──────────────────────────────────────────
-            # TAHAP 2: Kumpulkan URL Tab Reels Eksklusif
-            # ──────────────────────────────────────────
-            if not login_wall_encountered:
-                await asyncio.sleep(random.uniform(2.5, 4.0))
-                logger.info(f"[TAB 2/2] Mengumpulkan URL Reels Instagram: {reels_url}")
-                try:
-                    await page.goto(reels_url, wait_until="domcontentloaded", timeout=45000)
-                    await asyncio.sleep(random.uniform(2.0, 3.5))
-
-                    if "accounts/login" in page.url.lower():
-                        logger.warning(f"[🚨 LOGIN WALL] Reels @{username} dialihkan ke login wall.")
-                    else:
-                        seen_reels_in_page = set()
-                        should_stop = False
-
-                        for _ in range(6):
-                            if should_stop:
-                                break
-
-                            links = await page.locator('a[href*="/reel/"]').all()
-                            for link in links:
-                                try:
-                                    href = await link.get_attribute("href")
-                                    if not href or href in seen_reels_in_page:
-                                        continue
-                                    seen_reels_in_page.add(href)
-                                    full_reel_url = f"https://www.instagram.com{href}" if href.startswith("/") else href
-                                    r_id = self._extract_post_id(full_reel_url)
-                                    if not r_id:
-                                        continue
-
-                                    if not forced and await self.db.check_post_exists(r_id, self.PLATFORM):
-                                        logger.info(f"{TAG_CRAWL} Stop-condition Reels: reel {r_id} sudah ada di DB.")
-                                        should_stop = True
-                                        break
-
-                                    reels_urls.append(full_reel_url)
-                                except Exception:
-                                    pass
-
-                            await page.evaluate("window.scrollBy(0, window.innerHeight * 2.5)")
-                            await asyncio.sleep(random.uniform(2.0, 3.5))
-
-                except Exception as e:
-                    logger.debug(f"Info Reels fetch @{username}: {e}")
-
-                logger.info(f"[TAB 2/2] {len(reels_urls)} Reels ditemukan")
-
-            # ──────────────────────────────────────────
-            # FALLBACK: gallery-dl / yt-dlp jika Login Wall / Kosong
-            # ──────────────────────────────────────────
-            combined_urls = list(dict.fromkeys(feed_urls + reels_urls))
-            if not combined_urls and login_wall_encountered:
-                logger.info(f"{TAG_CRAWL} Menjalankan fallback extractor anonim (gallery-dl / yt-dlp) untuk @{username}...")
-                fallback_urls = await self._fetch_via_gallery_dl(canonical_url)
-                if not fallback_urls:
-                    fallback_urls = await self._fetch_via_ytdlp_flat(canonical_url)
-                combined_urls = fallback_urls
-
-            # ──────────────────────────────────────────
-            # TAHAP 3: Deduplikasi & Ekstraksi Metadata Hybrid
-            # ──────────────────────────────────────────
-            all_post_objects: list[PostMedia] = []
-
-            logger.info(f"{TAG_CRAWL} Memulai ekstraksi metadata untuk {len(combined_urls)} postingan Instagram...")
-            import time as _t
-            crawl_start_time = _t.monotonic()
-            _max_crawl_minutes = int(os.getenv("MAX_INSTAGRAM_CRAWL_MINUTES", "10"))
-            MAX_CRAWL_DURATION = _max_crawl_minutes * 60.0
-
-            for target_url in combined_urls:
-                if _t.monotonic() - crawl_start_time > MAX_CRAWL_DURATION:
-                    logger.warning(
-                        f"{TAG_WARN} Batas waktu crawl Instagram ({_max_crawl_minutes}m) tercapai untuk @{username}."
-                    )
-                    break
-
-                post_id = self._extract_post_id(target_url)
-                if not post_id:
-                    continue
-
-                if not forced and await self.db.check_post_exists(post_id, self.PLATFORM):
-                    continue
-
-                # 1. Coba ekstraktor cepat yt-dlp
-                post_data = await self._extract_metadata_via_ytdlp(target_url)
-
-                # 2. Fallback browser jika yt-dlp gagal dan browser tidak dalam login wall
-                if not post_data and not login_wall_encountered:
-                    post_data = await self._scrape_single_post(page, target_url)
-                    await asyncio.sleep(random.uniform(2.5, 4.5))
-
-                # 3. Minimal PostMedia jika masih belum ada metadata detail
-                if not post_data:
-                    is_reel = "/reel/" in target_url
-                    post_data = PostMedia(
-                        post_id=post_id,
-                        post_url=target_url,
-                        profile_url=canonical_url,
-                        platform=self.PLATFORM,
-                        media_type=MediaType.VIDEO if is_reel else MediaType.PHOTO,
-                        cookies_file=str(self.netscape_cookie_path) if self.netscape_cookie_path.exists() else None,
-                    )
-
-                if post_data:
-                    all_post_objects.append(post_data)
-
-            # ──────────────────────────────────────────
-            # TAHAP 4: Urutkan Kronologis (Oldest-First ke Downstream)
-            # ──────────────────────────────────────────
-            all_post_objects.sort(
-                key=lambda x: str(x.timestamp) if x.timestamp else "1970-01-01T00:00:00.000Z",
-                reverse=False,
-            )
-
-            logger.info(f"[⚙️ SYSTEM] Mengirim {len(all_post_objects)} post Instagram ke downstream pipeline...")
-            for post_media in all_post_objects:
-                yield post_media
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-
+                    logger.debug(f"Instagram Public Web API returned HTTP {resp.status_code}")
         except Exception as e:
-            logger.error(f"{TAG_ERROR} Instagram scraper error untuk @{username}: {e}")
-        finally:
-            await self.close()
+            logger.debug(f"Tier 1 Public Web API extraction info: {e}")
 
-    async def _fetch_via_gallery_dl(self, url: str) -> list[str]:
-        """Fallback ekstraksi URL postingan via gallery-dl subprocess dengan anti-zombie safety guard."""
-        found_urls: list[str] = []
+        # ─────────────────────────────────────────────────────────────────────
+        # TIER 2: gallery-dl Subprocess Extractor (Guest Mode Fallback)
+        # ─────────────────────────────────────────────────────────────────────
+        if not collected_posts:
+            logger.info(f"{TAG_CRAWL} [TIER 2] Menjalankan gallery-dl subprocess untuk @{username} (Zero-Login)...")
+            gdl_posts = await self._fetch_via_gallery_dl(canonical_url)
+            for p in gdl_posts:
+                if p.post_id not in seen_shortcodes:
+                    seen_shortcodes.add(p.post_id)
+                    collected_posts.append(p)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # TIER 3: yt-dlp Flat-Playlist Extractor (Guest Mode Fallback)
+        # ─────────────────────────────────────────────────────────────────────
+        if not collected_posts:
+            logger.info(f"{TAG_CRAWL} [TIER 3] Menjalankan yt-dlp flat-playlist untuk @{username} (Zero-Login)...")
+            ytdl_posts = await self._fetch_via_ytdlp_flat(canonical_url)
+            for p in ytdl_posts:
+                if p.post_id not in seen_shortcodes:
+                    seen_shortcodes.add(p.post_id)
+                    collected_posts.append(p)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # TIER 4: Playwright Stealth Browser (Guest Mode DOM Fallback)
+        # ─────────────────────────────────────────────────────────────────────
+        if not collected_posts:
+            logger.info(f"{TAG_CRAWL} [TIER 4] Menjalankan Playwright Guest Browser untuk @{username}...")
+            browser_posts = await self._fetch_via_guest_browser(canonical_url, username)
+            for p in browser_posts:
+                if p.post_id not in seen_shortcodes:
+                    seen_shortcodes.add(p.post_id)
+                    collected_posts.append(p)
+
+        logger.info(f"{TAG_CRAWL} Total {len(collected_posts)} postingan @{username} berhasil dikumpulkan.")
+
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 5: DSU Sorting & SQLite Checkpoint
+        # Urutan: Evaluasi stop-condition dari post terbaru -> Yield oldest-first ke Discord
+        # ─────────────────────────────────────────────────────────────────────
+        # 1. Sort newest-first untuk evaluasi checkpoint database
+        collected_posts.sort(
+            key=lambda x: str(x.timestamp) if x.timestamp else "1970-01-01T00:00:00.000Z",
+            reverse=True,
+        )
+
+        pending_posts: list[PostMedia] = []
+        for post in collected_posts:
+            if not forced and await self.db.check_post_exists(post.post_id, self.PLATFORM):
+                logger.info(f"{TAG_CRAWL} Stop-condition: post {post.post_id} sudah ada di DB — checkpoint tercapai.")
+                break
+            pending_posts.append(post)
+
+        # 2. Re-sort ke kronologis tertib (oldest-to-newest) untuk pengiriman teratur ke Discord
+        pending_posts.sort(
+            key=lambda x: str(x.timestamp) if x.timestamp else "1970-01-01T00:00:00.000Z",
+            reverse=False,
+        )
+
+        logger.info(f"[⚙️ SYSTEM] Mengirim {len(pending_posts)} post Instagram ke downstream pipeline...")
+        for post_media in pending_posts:
+            yield post_media
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+
+    async def _fetch_via_gallery_dl(self, url: str) -> list[PostMedia]:
+        """Fallback ekstraksi metadata via gallery-dl subprocess dalam Guest Mode."""
+        results: list[PostMedia] = []
         try:
             cmd = ["gallery-dl", "--dump-json", "--range", "1-20", url]
-            if self.netscape_cookie_path.exists():
-                cmd.extend(["--cookies", str(self.netscape_cookie_path)])
-
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -342,14 +272,27 @@ class InstagramScraper(BaseScraper):
                     for line in stdout.decode("utf-8", errors="ignore").splitlines():
                         try:
                             data = json.loads(line.strip())
-                            if isinstance(data, list) and len(data) >= 2 and isinstance(data[1], dict):
-                                shortcode = data[1].get("shortcode")
-                                if shortcode:
-                                    found_urls.append(f"https://www.instagram.com/p/{shortcode}/")
-                            elif isinstance(data, dict):
-                                shortcode = data.get("shortcode") or data.get("code")
-                                if shortcode:
-                                    found_urls.append(f"https://www.instagram.com/p/{shortcode}/")
+                            item_data = data[1] if (isinstance(data, list) and len(data) >= 2 and isinstance(data[1], dict)) else (data if isinstance(data, dict) else {})
+                            shortcode = item_data.get("shortcode") or item_data.get("code")
+                            if not shortcode:
+                                continue
+
+                            caption = item_data.get("description") or item_data.get("caption") or ""
+                            date_str = item_data.get("date")
+                            is_video = bool(item_data.get("video_url") or item_data.get("format") == "video")
+
+                            results.append(
+                                PostMedia(
+                                    post_id=shortcode,
+                                    post_url=f"https://www.instagram.com/p/{shortcode}/",
+                                    profile_url=url,
+                                    platform=self.PLATFORM,
+                                    media_type=MediaType.VIDEO if is_video else MediaType.PHOTO,
+                                    caption=caption,
+                                    timestamp=date_str,
+                                    cookies_file=None,
+                                )
+                            )
                         except Exception:
                             pass
             except asyncio.TimeoutError:
@@ -357,17 +300,14 @@ class InstagramScraper(BaseScraper):
                 await proc.wait()
                 logger.warning(f"{TAG_WARN} gallery-dl subprocess timeout dibatalkan.")
         except Exception as e:
-            logger.debug(f"gallery-dl fallback error: {e}")
-        return list(dict.fromkeys(found_urls))
+            logger.debug(f"gallery-dl guest extractor info: {e}")
+        return results
 
-    async def _fetch_via_ytdlp_flat(self, url: str) -> list[str]:
-        """Fallback ekstraksi URL postingan via yt-dlp flat playlist dengan anti-zombie safety guard."""
-        found_urls: list[str] = []
+    async def _fetch_via_ytdlp_flat(self, url: str) -> list[PostMedia]:
+        """Fallback ekstraksi URL postingan via yt-dlp flat playlist dalam Guest Mode."""
+        results: list[PostMedia] = []
         try:
             cmd = ["yt-dlp", "--flat-playlist", "--dump-json", "--no-warnings", url]
-            if self.netscape_cookie_path.exists():
-                cmd.extend(["--cookies", str(self.netscape_cookie_path)])
-
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -381,164 +321,95 @@ class InstagramScraper(BaseScraper):
                             data = json.loads(line.strip())
                             p_url = data.get("url") or data.get("webpage_url")
                             if p_url and ("/p/" in p_url or "/reel/" in p_url):
-                                found_urls.append(p_url.split("?")[0])
+                                shortcode = self._extract_post_id(p_url)
+                                if shortcode:
+                                    is_video = "/reel/" in p_url
+                                    results.append(
+                                        PostMedia(
+                                            post_id=shortcode,
+                                            post_url=p_url.split("?")[0],
+                                            profile_url=url,
+                                            platform=self.PLATFORM,
+                                            media_type=MediaType.VIDEO if is_video else MediaType.PHOTO,
+                                            caption=data.get("description") or data.get("title") or "",
+                                            cookies_file=None,
+                                        )
+                                    )
                         except Exception:
                             pass
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
-                logger.warning(f"{TAG_WARN} yt-dlp subprocess timeout dibatalkan.")
+                logger.warning(f"{TAG_WARN} yt-dlp flat-playlist timeout dibatalkan.")
         except Exception as e:
-            logger.debug(f"yt-dlp flat-playlist error: {e}")
-        return list(dict.fromkeys(found_urls))
+            logger.debug(f"yt-dlp flat-playlist guest info: {e}")
+        return results
 
-    async def _extract_metadata_via_ytdlp(self, url: str) -> Optional[PostMedia]:
-        """Ekstrak metadata via yt-dlp tanpa membuka browser."""
-        import yt_dlp
-        from datetime import datetime, timezone
-
-        post_id = self._extract_post_id(url)
-        if not post_id:
-            return None
-
-        cookies_file = (
-            str(self.netscape_cookie_path)
-            if self.netscape_cookie_path and self.netscape_cookie_path.exists()
-            else None
-        )
-
-        ydl_opts = {
-            "skip_download": True,
-            "quiet": True,
-            "no_warnings": True,
-            "playlist_items": "1",
-        }
-        if cookies_file:
-            ydl_opts["cookiefile"] = cookies_file
-
+    async def _fetch_via_guest_browser(self, url: str, username: str) -> list[PostMedia]:
+        """Fallback ekstraksi DOM via Playwright Guest Mode Browser."""
+        results: list[PostMedia] = []
         try:
-            loop = asyncio.get_running_loop()
-
-            def _extract():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # pyright: ignore[reportArgumentType]
-                    return ydl.extract_info(url, download=False)
-
-            info = await loop.run_in_executor(None, _extract)
-            if not info:
-                return None
-
-            caption = info.get("description") or info.get("title") or ""
-            timestamp = None
-            upload_timestamp = info.get("timestamp")
-            if upload_timestamp:
-                timestamp = datetime.fromtimestamp(upload_timestamp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            else:
-                upload_date = info.get("upload_date")
-                if upload_date:
-                    try:
-                        dt = datetime.strptime(upload_date, "%Y%m%d").replace(tzinfo=timezone.utc)
-                        timestamp = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                    except Exception:
-                        pass
-
-            is_video = any(
-                f.get("vcodec") is not None and f.get("vcodec") != "none"
-                for f in (info.get("formats") or [])
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+            self._browser, self._context = await BaseScraper.create_stealth_browser(
+                self._playwright,
+                headed=self.headed,
+                viewport={"width": 1280, "height": 800},
             )
-            media_type = MediaType.VIDEO if is_video else MediaType.PHOTO
+            page = await self._context.new_page()
 
-            return PostMedia(
-                post_id=post_id,
-                post_url=url,
-                profile_url=f"https://www.instagram.com/{self._profile_url_username}/" if hasattr(self, "_profile_url_username") and self._profile_url_username else url,
-                platform=self.PLATFORM,
-                media_type=media_type,
-                media_urls=[],
-                caption=caption,
-                timestamp=timestamp,
-                cookies_file=cookies_file,
-            )
-        except Exception:
-            return None
-
-    async def _scrape_single_post(
-        self, page: Page, post_url: str
-    ) -> Optional[PostMedia]:
-        """Ekstrak detail satu postingan menggunakan Playwright Stealth."""
-        post_id = self._extract_post_id(post_url)
-        if not post_id:
-            return None
-
-        caption = ""
-        timestamp = None
-        media_type = MediaType.UNKNOWN
-        media_urls: list[str] = []
-
-        try:
-            await page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2.0)
 
-            # Caption
-            for sel in ["article h1", "[data-testid='post-caption'] h1", "h1"]:
-                try:
-                    c_el = page.locator(sel).first
-                    if await c_el.count() > 0:
-                        caption = (await c_el.inner_text()).strip()
-                        if caption:
-                            break
-                except Exception:
-                    pass
+            # Cek login wall instan
+            current_url = page.url.lower()
+            if "accounts/login" in current_url or "challenge" in current_url:
+                logger.warning(f"{TAG_WARN} Instagram mengalihkan @{username} ke login wall — melewati browser pass.")
+                await page.close()
+                return []
 
-            # Timestamp
+            # Dismiss modal popup jika ada
             try:
-                t_el = page.locator("time").first
-                if await t_el.count() > 0:
-                    timestamp = await t_el.get_attribute("datetime")
+                close_btn = await page.query_selector(
+                    'button:has-text("Not Now"), button:has-text("Lain Kali"), [aria-label="Close"], [aria-label="Tutup"]'
+                )
+                if close_btn:
+                    await close_btn.click()
+                    await asyncio.sleep(1.0)
             except Exception:
                 pass
 
-            # Media Detection
-            carousel_items = await page.locator("div[role='presentation'] ul li").all()
-            if len(carousel_items) > 1:
-                media_type = MediaType.CAROUSEL
-                for item in carousel_items:
-                    v_el = item.locator("video source").first
-                    if await v_el.count() > 0:
-                        src = await v_el.get_attribute("src")
-                        if src and not src.startswith("blob:"):
-                            media_urls.append(src)
-                            continue
-                    img_el = item.locator("img").first
-                    if await img_el.count() > 0:
-                        src = await img_el.get_attribute("src")
-                        if src and not src.startswith("blob:") and "instagram" in src:
-                            media_urls.append(src)
-            else:
-                v_el = page.locator("video").first
-                if await v_el.count() > 0:
-                    media_type = MediaType.VIDEO
-                    src = await v_el.get_attribute("src")
-                    if src and not src.startswith("blob:"):
-                        media_urls.append(src)
-                else:
-                    media_type = MediaType.PHOTO
+            links = await page.locator('a[href*="/p/"], a[href*="/reel/"]').all()
+            seen_ids = set()
+            for link in links:
+                try:
+                    href = await link.get_attribute("href")
+                    if href:
+                        p_url = f"https://www.instagram.com{href}" if href.startswith("/") else href
+                        p_id = self._extract_post_id(p_url)
+                        if p_id and p_id not in seen_ids:
+                            seen_ids.add(p_id)
+                            is_reel = "/reel/" in p_url
+                            results.append(
+                                PostMedia(
+                                    post_id=p_id,
+                                    post_url=p_url.split("?")[0],
+                                    profile_url=url,
+                                    platform=self.PLATFORM,
+                                    media_type=MediaType.VIDEO if is_reel else MediaType.PHOTO,
+                                    cookies_file=None,
+                                )
+                            )
+                except Exception:
+                    pass
 
+            await page.close()
         except Exception as e:
-            logger.debug(f"Single post fetch error for {post_url}: {e}")
+            logger.debug(f"Guest browser fallback error: {e}")
+        finally:
+            await self.close()
 
-        cookies_file_str = str(self.netscape_cookie_path) if self.netscape_cookie_path.exists() else None
-
-        return PostMedia(
-            post_id=post_id,
-            post_url=post_url,
-            profile_url=f"https://www.instagram.com/{self._profile_url_username}/" if hasattr(self, "_profile_url_username") and self._profile_url_username else post_url,
-            platform=self.PLATFORM,
-            media_type=media_type,
-            media_urls=media_urls,
-            caption=caption,
-            timestamp=timestamp,
-            cookies_file=cookies_file_str,
-        )
+        return results
 
     async def close(self) -> None:
         """Cleanup browser resources."""

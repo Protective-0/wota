@@ -1,10 +1,10 @@
 """
 scrapers/tiktok.py
-Engine Scraper Profil TikTok terintegrasi Scrapling Anti-Bot Stealth Engine, Dual-Endpoint Fallback & Pure Guest Mode.
+Engine Scraper Profil TikTok 100% Guest Mode (Zero-Login).
 
 Fitur & Keamanan:
-1. Pure Guest Mode (Zero-Login):
-   - Tidak menyuntikkan cookie akun pribadi saat crawling profil agar tidak memicu security challenge atau "Something went wrong".
+1. 100% Zero-Login Architecture:
+   - Tidak memerlukan cookie/akun login pengguna sama sekali, bebas dari resiko ban atau security challenge.
 2. Scrapling TLS Engine:
    - Integrasi `scrapling.fetchers.AsyncFetcher` dengan TLS Chrome Impersonation (`chrome124`) untuk bypass proteksi anti-bot WAF.
 3. Dual-Endpoint Fallback:
@@ -12,10 +12,12 @@ Fitur & Keamanan:
 4. Strict Author Verification:
    - Validasi ketat `author.uniqueId == target_username`.
    - Mengabaikan postingan dari tab Repost, Likes, maupun sidebar video recommendation.
-5. Chronological DSU Sorting:
-   - Stop-condition evaluation pada postingan terbaru, lalu yield ke downstream secara kronologis (oldest-first).
-6. SQLite Stop-Condition:
-   - Mencegah redundant crawl dengan checkpoint database lokal.
+5. Multi-Tier Subprocess & API Fallback:
+   - Pass 1: Scrapling Fast SSR Rehydration (Desktop & Mobile).
+   - Pass 2: yt-dlp Flat-Playlist (Guest Mode tanpa cookie).
+   - Pass 3: Playwright Stealth Browser (Zero-Login DOM parser dengan Captcha early abort).
+6. Chronological DSU Sorting:
+   - Stop-condition evaluation pada post terbaru, lalu dispatch ke downstream secara kronologis (oldest-first).
 """
 
 import asyncio
@@ -56,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 class TikTokScraper(BaseScraper):
     """
-    Scraper profil TikTok berbasis Scrapling Anti-Bot Engine dengan strict author filtering dan pure guest mode.
+    Scraper profil TikTok 100% Guest Mode (Zero-Login) berbasis Scrapling Anti-Bot Engine dan Multi-Tier Fallback.
     """
 
     PLATFORM = "tiktok"
@@ -66,7 +68,6 @@ class TikTokScraper(BaseScraper):
         self.headed = headed
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        self.netscape_cookie_path = self.session_dir / "tiktok_cookies.txt"
         self._playwright = None
         self._browser = None
         self._context = None
@@ -120,7 +121,7 @@ class TikTokScraper(BaseScraper):
         forced: bool = False,
     ) -> AsyncGenerator[PostMedia, None]:
         """
-        Crawl profil TikTok menggunakan Scrapling Engine & Fast Rehydration dengan pure guest mode.
+        Crawl profil TikTok secara 100% Guest Mode (Zero-Login).
         """
         username = self._extract_username(profile_url)
         if not username:
@@ -129,7 +130,7 @@ class TikTokScraper(BaseScraper):
 
         canonical_url = f"https://www.tiktok.com/@{username}"
         mobile_url = f"https://m.tiktok.com/@{username}"
-        logger.info(f"{TAG_CRAWL} Memulai scraping profil @{username} (tiktok): {canonical_url}")
+        logger.info(f"{TAG_CRAWL} Memulai scraping profil @{username} (tiktok, Zero-Login Mode): {canonical_url}")
 
         collected_urls: list[str] = []
         seen_urls: set[str] = set()
@@ -137,9 +138,9 @@ class TikTokScraper(BaseScraper):
 
         # ─────────────────────────────────────────────────────────────────────
         # PASS 1 (PRIMARY): Scrapling AsyncFetcher — Fast SSR Rehydration Parser
-        # Dual-Endpoint: Coba desktop dulu, jika error "Something went wrong", coba mobile
+        # Dual-Endpoint: Desktop & Mobile (Guest Mode murni tanpa cookie)
         # ─────────────────────────────────────────────────────────────────────
-        logger.info(f"{TAG_CRAWL} [PASS 1] Menjalankan Scrapling Fast SSR Rehydration untuk @{username} (Guest Mode)...")
+        logger.info(f"{TAG_CRAWL} [PASS 1] Menjalankan Scrapling Fast SSR Rehydration untuk @{username} (Zero-Login)...")
         headers = {
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -165,8 +166,8 @@ class TikTokScraper(BaseScraper):
                         )
                         if response.status == 200:
                             html_text = response.text
-                            if "Something went wrong" in html_text or "verify-center" in html_text:
-                                logger.warning(f"{TAG_WARN} TikTok mengembalikan 'Something went wrong' pada {target_url}")
+                            if "Something went wrong" in html_text or "verify-center" in html_text or "secsdk" in html_text:
+                                logger.warning(f"{TAG_WARN} TikTok mengembalikan challenge/interstitial pada {target_url}")
                                 html_text = ""
                     except Exception as sc_err:
                         logger.debug(f"Scrapling AsyncFetcher note ({target_url}): {sc_err}")
@@ -180,7 +181,7 @@ class TikTokScraper(BaseScraper):
                         resp = await client.get(target_url)
                         if resp.status_code == 200:
                             html_text = resp.text
-                            if "Something went wrong" in html_text or "verify-center" in html_text:
+                            if "Something went wrong" in html_text or "verify-center" in html_text or "secsdk" in html_text:
                                 html_text = ""
 
                 if html_text:
@@ -202,10 +203,10 @@ class TikTokScraper(BaseScraper):
                 logger.debug(f"Fast HTTP Rehydration info ({target_url}): {e}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 2: yt-dlp Flat-Playlist Extractor (Strict Author Matching)
+        # PASS 2: yt-dlp Flat-Playlist Extractor (Guest Mode tanpa cookie)
         # ─────────────────────────────────────────────────────────────────────
         if not collected_urls:
-            logger.info(f"{TAG_CRAWL} [PASS 2] Mencoba ekstraksi postingan @{username} via yt-dlp flat-playlist...")
+            logger.info(f"{TAG_CRAWL} [PASS 2] Mencoba ekstraksi postingan @{username} via yt-dlp flat-playlist (Zero-Login)...")
             try:
                 cmd = [
                     "yt-dlp",
@@ -247,16 +248,15 @@ class TikTokScraper(BaseScraper):
                 except asyncio.TimeoutError:
                     proc.kill()
                     await proc.wait()
-                    logger.warning(f"{TAG_WARN} yt-dlp flat-playlist timeout.")
+                    logger.warning(f"{TAG_WARN} yt-dlp flat-playlist timeout dibatalkan.")
             except Exception as e:
                 logger.warning(f"{TAG_WARN} yt-dlp flat-playlist info: {e}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 3: Scrapling Dynamic Stealth Browser Automation (Pure Guest Mode)
-        # Digunakan jika Pass 1 & 2 kosong atau profil memerlukan interaksi DOM
+        # PASS 3: Playwright Dynamic Stealth Browser (Guest Mode DOM Fallback)
         # ─────────────────────────────────────────────────────────────────────
         if not collected_urls or (expected_video_count > 0 and len(collected_urls) < expected_video_count):
-            logger.info(f"{TAG_CRAWL} [PASS 3] Mengaktifkan Scrapling Dynamic Stealth Browser untuk @{username} (Guest Mode)...")
+            logger.info(f"{TAG_CRAWL} [PASS 3] Mengaktifkan Playwright Dynamic Stealth Browser untuk @{username} (Zero-Login)...")
             intercepted_urls: set[str] = set()
 
             try:
@@ -297,8 +297,8 @@ class TikTokScraper(BaseScraper):
                 # Cek login wall & Captcha verification challenge
                 current_url = page.url.lower()
                 page_content = await page.content()
-                if "captcha" in current_url or "verify" in current_url:
-                    logger.error(f"[🚨 BLOCKED] TikTok menyajikan Captcha/Verification challenge untuk @{username}!")
+                if "captcha" in current_url or "verify" in current_url or "secsdk" in page_content:
+                    logger.error(f"[🚨 BLOCKED] TikTok menyajikan Captcha challenge untuk @{username} — early abort browser.")
                 elif "Something went wrong" in page_content:
                     logger.warning(f"{TAG_WARN} TikTok menampilkan 'Something went wrong' pada browser pass.")
                 else:
@@ -390,8 +390,6 @@ class TikTokScraper(BaseScraper):
         # Re-sort ke kronologis tertib (oldest-first) untuk pengiriman teratur ke Discord
         pending_posts.sort(key=lambda x: x[0], reverse=False)
 
-        cookies_file_str = str(self.netscape_cookie_path) if self.netscape_cookie_path.exists() else None
-
         for _, post_url in pending_posts:
             post_id = self._extract_post_id(post_url)
             if not post_id:
@@ -404,7 +402,7 @@ class TikTokScraper(BaseScraper):
                 profile_url=profile_url,
                 platform=self.PLATFORM,
                 media_type=media_type,
-                cookies_file=cookies_file_str,
+                cookies_file=None,
             )
 
     def _parse_rehydration_from_html(self, html: str, username: str) -> dict:
