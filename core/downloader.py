@@ -422,9 +422,6 @@ class MediaDownloader:
                     post_url, post_id, cookies_file
                 )
 
-                # NOTE: /photo/ URLs no longer reach this branch \u2014 is_tiktok_photo bypasses yt-dlp above.
-                # Audio-discard guard removed: dead code eliminated.
-
                 if not downloaded_files and ("twitter.com" in post_url or "x.com" in post_url):
                     download_failed = True
                 elif not downloaded_files and "tiktok.com" in post_url:
@@ -432,9 +429,12 @@ class MediaDownloader:
                         # ── Jalur Khusus Video TikTok ────────────────────────────
                         logger.warning(f"{TAG_WARN} yt-dlp kosong untuk TikTok Video — mencoba Browser & TikWM Video Fallback...")
                         
-                        # Step A: Playwright Video Extractor
-                        video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, cookies_file)
-                        if video_url:
+                        # Step A: Playwright Video Extractor + In-flight Network Stream Capture
+                        captured_file, video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, post_id, cookies_file)
+                        if captured_file and captured_file.exists() and captured_file.stat().st_size > 100_000:
+                            downloaded_files = [captured_file]
+                            real_caption = browser_caption
+                        elif video_url:
                             out_path = await self._download_tiktok_cdn_video(video_url, post_id, browser_cookies, cookies_file)
                             if out_path:
                                 downloaded_files = [out_path]
@@ -443,27 +443,11 @@ class MediaDownloader:
                         # Step B: TikWM Clean API Video Fallback
                         if not downloaded_files:
                             logger.info(f"{TAG_DOWN} Mencoba TikWM Clean API fallback untuk video {post_id}...")
-                            try:
-                                async with httpx.AsyncClient(timeout=15.0) as tw_client:
-                                    tw_res = await tw_client.get(f"https://www.tikwm.com/api/?url={post_url}")
-                                    if tw_res.status_code == 200:
-                                        tw_json = tw_res.json()
-                                        if tw_json.get("code") == 0 and tw_json.get("data"):
-                                            tw_d = tw_json["data"]
-                                            tw_play = tw_d.get("play") or tw_d.get("wmplay")
-                                            tw_title = tw_d.get("title") or ""
-                                            if tw_play:
-                                                v_out = self.temp_dir / f"{post_id}_video.mp4"
-                                                v_resp = await tw_client.get(tw_play)
-                                                if v_resp.status_code == 200 and len(v_resp.content) > 1000:
-                                                    async with aiofiles.open(v_out, "wb") as f:
-                                                        await f.write(v_resp.content)
-                                                    downloaded_files = [v_out]
-                                                    if tw_title:
-                                                        real_caption = tw_title
-                                                    logger.info(f"{TAG_DOWN} TikWM Video terunduh: {v_out.name} ({fmt_size(v_out.stat().st_size)})")
-                            except Exception as tw_err:
-                                logger.debug(f"TikWM video fallback note: {tw_err}")
+                            tw_file, tw_caption = await self._download_via_tikwm(post_url, post_id)
+                            if tw_file:
+                                downloaded_files = [tw_file]
+                                if tw_caption:
+                                    real_caption = tw_caption
                     else:
                         # ── Jalur Khusus Foto / Carousel TikTok ──────────────────
                         logger.warning(f"{TAG_WARN} yt-dlp kosong untuk TikTok Photo — mencoba Carousel Extractor...")
@@ -506,40 +490,27 @@ class MediaDownloader:
                 original_err = e
                 yt_error = str(e)
                 if "twitter.com" in post_url or "x.com" in post_url:
-                    logger.warning(f"{TAG_WARN} yt-dlp gagal untuk Twitter \u2014 fallback image handler: {yt_error}")
+                    logger.warning(f"{TAG_WARN} yt-dlp gagal untuk Twitter — fallback image handler: {yt_error}")
                     download_failed = True
                 elif "tiktok.com" in post_url:
                     if "/video/" in post_url or "/v/" in post_url:
                         logger.warning(f"{TAG_WARN} yt-dlp gagal untuk TikTok Video ({yt_error}) — menjalankan Video Fallback...")
-                        video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, cookies_file)
-                        if video_url:
+                        captured_file, video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, post_id, cookies_file)
+                        if captured_file and captured_file.exists() and captured_file.stat().st_size > 100_000:
+                            downloaded_files = [captured_file]
+                            real_caption = browser_caption
+                        elif video_url:
                             out_path = await self._download_tiktok_cdn_video(video_url, post_id, browser_cookies, cookies_file)
                             if out_path:
                                 downloaded_files = [out_path]
                                 real_caption = browser_caption
 
                         if not downloaded_files:
-                            try:
-                                async with httpx.AsyncClient(timeout=15.0) as tw_client:
-                                    tw_res = await tw_client.get(f"https://www.tikwm.com/api/?url={post_url}")
-                                    if tw_res.status_code == 200:
-                                        tw_json = tw_res.json()
-                                        if tw_json.get("code") == 0 and tw_json.get("data"):
-                                            tw_d = tw_json["data"]
-                                            tw_play = tw_d.get("play") or tw_d.get("wmplay")
-                                            tw_title = tw_d.get("title") or ""
-                                            if tw_play:
-                                                v_out = self.temp_dir / f"{post_id}_video.mp4"
-                                                v_resp = await tw_client.get(tw_play)
-                                                if v_resp.status_code == 200 and len(v_resp.content) > 1000:
-                                                    async with aiofiles.open(v_out, "wb") as f:
-                                                        await f.write(v_resp.content)
-                                                    downloaded_files = [v_out]
-                                                    if tw_title:
-                                                        real_caption = tw_title
-                                                    logger.info(f"{TAG_DOWN} TikWM Video terunduh (exc path): {v_out.name} ({fmt_size(v_out.stat().st_size)})")
-                            except Exception as tw_err:
-                                logger.debug(f"TikWM video fallback note: {tw_err}")
+                            tw_file, tw_caption = await self._download_via_tikwm(post_url, post_id)
+                            if tw_file:
+                                downloaded_files = [tw_file]
+                                if tw_caption:
+                                    real_caption = tw_caption
                     else:
                         logger.warning(f"{TAG_WARN} yt-dlp gagal untuk TikTok Photo — coba Carousel Fallback: {yt_error}")
                         try:
@@ -1290,15 +1261,19 @@ class MediaDownloader:
 
 
     async def _extract_tiktok_video_via_browser(
-        self, post_url: str, cookies_file: Optional[str] = None
-    ) -> tuple[Optional[str], str, list[dict]]:
+        self, post_url: str, post_id: str, cookies_file: Optional[str] = None
+    ) -> tuple[Optional[Path], Optional[str], str, list[dict]]:
         """
         Stealth Browser Fallback Extractor khusus TikTok Video.
-        Membuka halaman postingan TikTok, menanti pemuatan tag video, dan mengekstrak direct CDN URL serta caption.
+        Menangkap binary video langsung dari in-flight network stream Playwright (bypass HTTP 403),
+        atau mengekstrak direct CDN URL serta caption dari rehydration JSON / DOM tag.
         """
-        video_url = None
+        captured_file: Optional[Path] = None
+        video_url: Optional[str] = None
         caption = ""
         browser_cookies: list[dict] = []
+        output_path = self.temp_dir / f"{post_id}_video.mp4"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
         tiktok_session_id = os.getenv("TIKTOK_SESSION_ID")
         cookies_to_add: list[dict] = []
@@ -1326,13 +1301,29 @@ class MediaDownloader:
             })
 
         async def _video_page_action(page):
-            nonlocal video_url, caption, browser_cookies
+            nonlocal video_url, caption, browser_cookies, captured_file
 
-            # Network Interceptor: Tangkap payload item/detail internal TikTok
+            # Network Interceptor: Tangkap binary video stream & payload item/detail internal TikTok
             async def _on_v_resp(response):
-                nonlocal video_url, caption
+                nonlocal video_url, caption, captured_file
                 try:
                     r_url = response.url.lower()
+                    c_type = response.headers.get("content-type", "").lower()
+                    
+                    # 1. In-flight Binary Stream Capture (Bypass HTTP 403)
+                    if response.status in (200, 206) and not captured_file:
+                        if "video/mp4" in c_type or ".mp4" in r_url or "mime_type=video_mp4" in r_url or ("video/" in c_type and not "image" in c_type):
+                            try:
+                                body = await response.body()
+                                if len(body) > 100_000:
+                                    async with aiofiles.open(output_path, "wb") as f:
+                                        await f.write(body)
+                                    captured_file = output_path
+                                    logger.info(f"{TAG_DOWN} Playwright Stream Intercept: Video berhasil dicapture ({fmt_size(len(body))})")
+                            except Exception as b_err:
+                                logger.debug(f"Direct stream capture body note: {b_err}")
+
+                    # 2. JSON Payload Parser (Metadata & playAddr)
                     if ("item/detail" in r_url or "/api/post" in r_url or "aweme/v1" in r_url) and response.status == 200:
                         data = await response.json()
                         v_detail = data.get("itemInfo", {}).get("itemStruct", {}) or data.get("aweme_detail", {})
@@ -1449,7 +1440,42 @@ class MediaDownloader:
         except Exception as e:
             logger.warning(f"Browser video fallback extractor failed: {e}")
 
-        return video_url, caption, cast(list[dict], browser_cookies)
+        return captured_file, video_url, caption, cast(list[dict], browser_cookies)
+
+    async def _download_via_tikwm(self, url: str, post_id: str) -> tuple[Optional[Path], str]:
+        """
+        Download video TikTok menggunakan public TikWM Clean API.
+        Bypass watermark dan CDN restrictions tanpa memerlukan login cookie.
+        """
+        import httpx
+        output_path = self.temp_dir / f"{post_id}_video.mp4"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        headers = {
+            "User-Agent": SHARED_USER_AGENT,
+            "Referer": "https://www.tikwm.com/",
+            "Accept": "application/json, text/plain, */*",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0, headers=headers, follow_redirects=True) as client:
+                res = await client.get(f"https://www.tikwm.com/api/?url={url}")
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get("code") == 0 and data.get("data"):
+                        d = data["data"]
+                        title = d.get("title") or ""
+                        # Prioritaskan play (no watermark), lalu hdplay, lalu wmplay
+                        play_url = d.get("play") or d.get("hdplay") or d.get("wmplay")
+                        if play_url:
+                            logger.info(f"{TAG_DOWN} TikWM API: Mengunduh stream video...")
+                            v_res = await client.get(play_url)
+                            if v_res.status_code in (200, 206) and len(v_res.content) > 100_000:
+                                async with aiofiles.open(output_path, "wb") as f:
+                                    await f.write(v_res.content)
+                                logger.info(f"{TAG_DOWN} TikWM Video terunduh: {output_path.name} ({fmt_size(output_path.stat().st_size)})")
+                                return output_path, title
+        except Exception as e:
+            logger.debug(f"TikWM video downloader error: {e}")
+        return None, ""
 
     async def _download_tiktok_cdn_video(
         self,
@@ -1573,6 +1599,7 @@ class MediaDownloader:
 
         if "tiktok.com" in url:
             cmd += [
+                "--extractor-args", "tiktok:api_hostname=api16-normal-c-useast1a.tiktokv.com",
                 "--add-header", f"User-Agent:{SHARED_USER_AGENT}",
                 "--add-header", "Referer:https://www.tiktok.com/",
             ]
