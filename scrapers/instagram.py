@@ -1,17 +1,20 @@
 """
 scrapers/instagram.py
-Engine Scraper Profil Instagram 100% Guest Mode (Zero-Login).
+Engine Scraper Profil Instagram 100% Guest Mode (Zero-Login) dengan Pagination & Ekstraksi Reels Lengkap.
 
 Fitur & Keamanan:
 1. Zero-Login Architecture:
    - Tidak memerlukan cookie akun login pengguna sama sekali, bebas dari resiko ban atau checkpoint akun.
-2. Multi-Tier Public Extraction:
-   - Tier 1: Instagram Public Web API (api/v1/users/web_profile_info/?username={username}) menggunakan curl_cffi TLS impersonation (Chrome 124) dan X-IG-App-ID header resmi (936619743392459).
+2. Multi-Tier Full Pagination & Reels Extraction:
+   - Tier 1: Instagram Public Web API (web_profile_info) + API v1 Feed Pagination (/api/v1/feed/user/{user_id}/?max_id={cursor})
+     menggunakan curl_cffi TLS impersonation (Chrome 124) dan X-IG-App-ID resmi (936619743392459).
+   - Ekstraksi Tab Reels: Memproses `edge_felix_video_timeline` dan feed video/clips secara menyeluruh.
    - Tier 2: gallery-dl Subprocess Extractor (ekstraksi feed publik langsung tanpa browser).
    - Tier 3: yt-dlp Flat-Playlist (fallback metadata ekstraksi cepat).
-   - Tier 4: Playwright Stealth Browser (fallback DOM parser dengan deteksi login wall instan).
-3. Direct Video & Image CDN URL Resolution:
-   - Menyimpan direct CDN URL video (video_url) dan foto (display_url / sidecar) langsung pada PostMedia sehingga downloader tidak perlu re-scrape jika URL sudah tersedia.
+   - Tier 4: Playwright Stealth Browser (Dual-Tab crawling Feed & Reels dengan dynamic scroll loop).
+3. Direct Video & Image CDN Resolution:
+   - Menyimpan direct CDN URL video (video_url / video_versions) dan foto (display_url / carousel_media)
+     langsung pada PostMedia agar downloader efisien tanpa redundant fetch.
 4. Anti-Zombie Subprocess Guards:
    - Seluruh subprocess dilengkapi asyncio.TimeoutError handler dengan proc.kill() dan proc.wait().
 5. DSU Chronological Sorting:
@@ -60,7 +63,7 @@ IG_WEB_APP_ID = "936619743392459"
 
 class InstagramScraper(BaseScraper):
     """
-    Scraper profil Instagram 100% Guest Mode (Zero-Login) berbasis Multi-Tier API & Subprocess Fallback.
+    Scraper profil Instagram 100% Guest Mode (Zero-Login) dengan dukungan Full Pagination & Reels.
     """
 
     PLATFORM = "instagram"
@@ -95,7 +98,7 @@ class InstagramScraper(BaseScraper):
         forced: bool = False,
     ) -> AsyncGenerator[PostMedia, None]:
         """
-        Crawl profil Instagram secara 100% Guest Mode tanpa memerlukan akun login.
+        Crawl profil Instagram secara 100% Guest Mode dengan full pagination dan Reels.
         """
         username = self._extract_username(profile_url)
         if not username:
@@ -108,12 +111,17 @@ class InstagramScraper(BaseScraper):
 
         collected_posts: list[PostMedia] = []
         seen_shortcodes: set[str] = set()
+        user_id = ""
+        stop_condition_met = False
 
         # ─────────────────────────────────────────────────────────────────────
-        # TIER 1: Instagram Public Web API (curl_cffi TLS Impersonation + X-IG-App-ID)
-        # Super cepat, tanpa browser overhead, mengekstrak timeline publik
+        # TIER 1: Instagram Public Web API (Initial Profile Snapshot + Reels)
+        # Mengambil snapshot awal timeline, tab reels (felix), dan user_id untuk pagination
         # ─────────────────────────────────────────────────────────────────────
         logger.info(f"{TAG_CRAWL} [TIER 1] Menjalankan Instagram Public Web API untuk @{username}...")
+        end_cursor = None
+        has_next_page = False
+
         try:
             api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
             headers = {
@@ -151,17 +159,35 @@ class InstagramScraper(BaseScraper):
                         logger.warning(f"{TAG_WARN} Profil @{username} bersifat Private — tidak dapat diakses dalam Guest Mode.")
                         return
 
+                    user_id = str(user_data.get("id") or "")
                     media_timeline = user_data.get("edge_owner_to_timeline_media", {})
-                    edges = media_timeline.get("edges", [])
-                    logger.info(f"{TAG_CRAWL} [TIER 1] Public Web API menemukan {len(edges)} post pada timeline @{username}.")
+                    page_info = media_timeline.get("page_info", {})
+                    has_next_page = bool(page_info.get("has_next_page", False))
+                    end_cursor = page_info.get("end_cursor")
 
-                    for edge in edges:
+                    timeline_edges = media_timeline.get("edges", [])
+                    reels_timeline = user_data.get("edge_felix_video_timeline", {})
+                    reels_edges = reels_timeline.get("edges", [])
+
+                    all_initial_edges = timeline_edges + reels_edges
+                    logger.info(
+                        f"{TAG_CRAWL} [TIER 1] Initial Snapshot: {len(timeline_edges)} feed + {len(reels_edges)} reels @{username}."
+                    )
+
+                    for edge in all_initial_edges:
                         node = edge.get("node", {})
                         shortcode = node.get("shortcode")
                         if not shortcode or shortcode in seen_shortcodes:
                             continue
 
                         seen_shortcodes.add(shortcode)
+
+                        # Cek SQLite checkpoint stop condition
+                        if not forced and await self.db.check_post_exists(shortcode, self.PLATFORM):
+                            logger.info(f"{TAG_CRAWL} Stop-condition tercapai pada post {shortcode} di DB.")
+                            stop_condition_met = True
+                            break
+
                         p_url = f"https://www.instagram.com/p/{shortcode}/"
                         is_video = node.get("is_video", False)
                         media_type = MediaType.VIDEO if is_video else MediaType.PHOTO
@@ -177,7 +203,7 @@ class InstagramScraper(BaseScraper):
                         if ts_val:
                             ts_str = datetime.fromtimestamp(ts_val, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-                        # Media direct URLs
+                        # Direct Media URLs
                         media_urls = []
                         if is_video:
                             v_url = node.get("video_url")
@@ -187,7 +213,6 @@ class InstagramScraper(BaseScraper):
                             display_url = node.get("display_url")
                             if display_url:
                                 media_urls.append(display_url)
-                            # Cek carousel items jika ada
                             sidecar = node.get("edge_sidecar_to_children", {}).get("edges", [])
                             if len(sidecar) > 1:
                                 media_type = MediaType.CAROUSEL
@@ -211,6 +236,119 @@ class InstagramScraper(BaseScraper):
                                 cookies_file=None,
                             )
                         )
+
+            # ─────────────────────────────────────────────────────────────────
+            # TIER 1B: API v1 Feed Pagination Loop (/api/v1/feed/user/{user_id}/)
+            # Iterasi cursor berkelanjutan melewati batas 12 post awal hingga seluruh profil terambil
+            # ─────────────────────────────────────────────────────────────────
+            if user_id and end_cursor and has_next_page and not stop_condition_met:
+                logger.info(f"{TAG_CRAWL} [TIER 1B] Memulai pagination API feed untuk @{username} (cursor: {end_cursor[:20]}...)...")
+                curr_cursor = end_cursor
+                page_idx = 1
+                max_pages = 20  # Batas aman max 240 postingan per scraping run
+
+                while curr_cursor and not stop_condition_met and page_idx <= max_pages:
+                    feed_api_url = f"https://www.instagram.com/api/v1/feed/user/{user_id}/?count=12&max_id={curr_cursor}"
+                    feed_data = None
+
+                    if HAS_CURL_CFFI:
+                        try:
+                            async with curl_requests.AsyncSession(impersonate="chrome124") as session:
+                                f_resp = await session.get(feed_api_url, headers=headers, timeout=15)
+                                if f_resp.status_code == 200:
+                                    feed_data = f_resp.json()
+                        except Exception as c_err:
+                            logger.debug(f"curl_cffi feed pagination error (page {page_idx}): {c_err}")
+
+                    if not feed_data:
+                        try:
+                            async with httpx.AsyncClient(headers=headers, timeout=15.0) as client:
+                                f_resp = await client.get(feed_api_url)
+                                if f_resp.status_code == 200:
+                                    feed_data = f_resp.json()
+                        except Exception:
+                            pass
+
+                    if not feed_data or not isinstance(feed_data, dict):
+                        logger.debug(f"Feed pagination berhenti pada halaman {page_idx} (response invalid).")
+                        break
+
+                    items = feed_data.get("items", [])
+                    if not items:
+                        break
+
+                    logger.info(f"{TAG_CRAWL} [TIER 1B] Halaman {page_idx+1}: {len(items)} post tambahan ditemukan.")
+
+                    for it in items:
+                        shortcode = it.get("code")
+                        if not shortcode or shortcode in seen_shortcodes:
+                            continue
+
+                        seen_shortcodes.add(shortcode)
+
+                        # Stop condition check
+                        if not forced and await self.db.check_post_exists(shortcode, self.PLATFORM):
+                            logger.info(f"{TAG_CRAWL} Stop-condition tercapai pada pagination post {shortcode}.")
+                            stop_condition_met = True
+                            break
+
+                        p_url = f"https://www.instagram.com/p/{shortcode}/"
+                        raw_m_type = it.get("media_type")
+                        is_v = raw_m_type == 2 or bool(it.get("video_versions"))
+                        is_carousel = raw_m_type == 8
+
+                        media_type = MediaType.VIDEO if is_v else (MediaType.CAROUSEL if is_carousel else MediaType.PHOTO)
+
+                        # Caption & Timestamp
+                        caption = (it.get("caption") or {}).get("text", "") or ""
+                        taken_at = it.get("taken_at")
+                        ts_str = None
+                        if taken_at:
+                            ts_str = datetime.fromtimestamp(taken_at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                        # Media Direct URLs
+                        media_urls = []
+                        if is_v:
+                            v_vers = it.get("video_versions", [])
+                            if v_vers:
+                                media_urls.append(v_vers[0].get("url"))
+                        elif is_carousel:
+                            c_items = it.get("carousel_media", [])
+                            for c in c_items:
+                                if c.get("media_type") == 2 and c.get("video_versions"):
+                                    media_urls.append(c["video_versions"][0].get("url"))
+                                elif c.get("image_versions2"):
+                                    cands = c["image_versions2"].get("candidates", [])
+                                    if cands:
+                                        media_urls.append(cands[0].get("url"))
+                        else:
+                            cands = it.get("image_versions2", {}).get("candidates", [])
+                            if cands:
+                                media_urls.append(cands[0].get("url"))
+
+                        collected_posts.append(
+                            PostMedia(
+                                post_id=shortcode,
+                                post_url=p_url,
+                                profile_url=canonical_url,
+                                platform=self.PLATFORM,
+                                media_type=media_type,
+                                media_urls=[u for u in media_urls if u],
+                                caption=caption,
+                                timestamp=ts_str,
+                                cookies_file=None,
+                            )
+                        )
+
+                    # Update pagination cursor
+                    more_available = feed_data.get("more_available", False)
+                    curr_cursor = feed_data.get("next_max_id")
+                    if not more_available or not curr_cursor:
+                        break
+
+                    page_idx += 1
+                    await asyncio.sleep(random.uniform(1.0, 2.0))
+
         except Exception as e:
             logger.debug(f"Tier 1 Public Web API extraction info: {e}")
 
@@ -237,10 +375,10 @@ class InstagramScraper(BaseScraper):
                     collected_posts.append(p)
 
         # ─────────────────────────────────────────────────────────────────────
-        # TIER 4: Playwright Stealth Browser (Guest Mode DOM Fallback)
+        # TIER 4: Playwright Dual-Tab Guest Browser (Feed & Reels Scrolling Fallback)
         # ─────────────────────────────────────────────────────────────────────
         if not collected_posts:
-            logger.info(f"{TAG_CRAWL} [TIER 4] Menjalankan Playwright Guest Browser untuk @{username}...")
+            logger.info(f"{TAG_CRAWL} [TIER 4] Menjalankan Playwright Guest Browser untuk @{username} (Dual-Tab)...")
             browser_posts = await self._fetch_via_guest_browser(canonical_url, username)
             for p in browser_posts:
                 if p.post_id not in seen_shortcodes:
@@ -253,7 +391,6 @@ class InstagramScraper(BaseScraper):
         # STEP 5: DSU Sorting & SQLite Checkpoint
         # Urutan: Evaluasi stop-condition dari post terbaru -> Yield oldest-first ke Discord
         # ─────────────────────────────────────────────────────────────────────
-        # 1. Sort newest-first untuk evaluasi checkpoint database
         collected_posts.sort(
             key=lambda x: str(x.timestamp) if x.timestamp else "1970-01-01T00:00:00.000Z",
             reverse=True,
@@ -266,7 +403,7 @@ class InstagramScraper(BaseScraper):
                 break
             pending_posts.append(post)
 
-        # 2. Re-sort ke kronologis tertib (oldest-to-newest) untuk pengiriman teratur ke Discord
+        # Re-sort ke kronologis tertib (oldest-to-newest) untuk pengiriman teratur ke Discord
         pending_posts.sort(
             key=lambda x: str(x.timestamp) if x.timestamp else "1970-01-01T00:00:00.000Z",
             reverse=False,
@@ -281,7 +418,7 @@ class InstagramScraper(BaseScraper):
         """Fallback ekstraksi metadata via gallery-dl subprocess dalam Guest Mode."""
         results: list[PostMedia] = []
         try:
-            cmd = ["gallery-dl", "--dump-json", "--range", "1-20", url]
+            cmd = ["gallery-dl", "--dump-json", "--range", "1-50", url]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -367,8 +504,10 @@ class InstagramScraper(BaseScraper):
         return results
 
     async def _fetch_via_guest_browser(self, url: str, username: str) -> list[PostMedia]:
-        """Fallback ekstraksi DOM via Playwright Guest Mode Browser."""
+        """Fallback ekstraksi DOM Dual-Tab (Feed & Reels) via Playwright Guest Browser."""
         results: list[PostMedia] = []
+        seen_ids = set()
+
         try:
             from playwright.async_api import async_playwright
             self._playwright = await async_playwright().start()
@@ -379,50 +518,61 @@ class InstagramScraper(BaseScraper):
             )
             page = await self._context.new_page()
 
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(2.0)
+            targets = [
+                f"https://www.instagram.com/{username}/",
+                f"https://www.instagram.com/{username}/reels/",
+            ]
 
-            # Cek login wall instan
-            current_url = page.url.lower()
-            if "accounts/login" in current_url or "challenge" in current_url:
-                logger.warning(f"{TAG_WARN} Instagram mengalihkan @{username} ke login wall — melewati browser pass.")
-                await page.close()
-                return []
-
-            # Dismiss modal popup jika ada
-            try:
-                close_btn = await page.query_selector(
-                    'button:has-text("Not Now"), button:has-text("Lain Kali"), [aria-label="Close"], [aria-label="Tutup"]'
-                )
-                if close_btn:
-                    await close_btn.click()
-                    await asyncio.sleep(1.0)
-            except Exception:
-                pass
-
-            links = await page.locator('a[href*="/p/"], a[href*="/reel/"]').all()
-            seen_ids = set()
-            for link in links:
+            for target_tab in targets:
                 try:
-                    href = await link.get_attribute("href")
-                    if href:
-                        p_url = f"https://www.instagram.com{href}" if href.startswith("/") else href
-                        p_id = self._extract_post_id(p_url)
-                        if p_id and p_id not in seen_ids:
-                            seen_ids.add(p_id)
-                            is_reel = "/reel/" in p_url
-                            results.append(
-                                PostMedia(
-                                    post_id=p_id,
-                                    post_url=p_url.split("?")[0],
-                                    profile_url=url,
-                                    platform=self.PLATFORM,
-                                    media_type=MediaType.VIDEO if is_reel else MediaType.PHOTO,
-                                    cookies_file=None,
-                                )
-                            )
-                except Exception:
-                    pass
+                    await page.goto(target_tab, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(2.0)
+
+                    if "accounts/login" in page.url.lower() or "challenge" in page.url.lower():
+                        logger.warning(f"{TAG_WARN} Instagram mengalihkan {target_tab} ke login wall.")
+                        continue
+
+                    # Dismiss modal dialog popup jika ada
+                    try:
+                        close_btn = await page.query_selector(
+                            'button:has-text("Not Now"), button:has-text("Lain Kali"), [aria-label="Close"], [aria-label="Tutup"]'
+                        )
+                        if close_btn:
+                            await close_btn.click()
+                            await asyncio.sleep(1.0)
+                    except Exception:
+                        pass
+
+                    # Scrolling pagination loop
+                    for _ in range(8):
+                        links = await page.locator('a[href*="/p/"], a[href*="/reel/"]').all()
+                        for link in links:
+                            try:
+                                href = await link.get_attribute("href")
+                                if href:
+                                    p_url = f"https://www.instagram.com{href}" if href.startswith("/") else href
+                                    p_id = self._extract_post_id(p_url)
+                                    if p_id and p_id not in seen_ids:
+                                        seen_ids.add(p_id)
+                                        is_reel = "/reel/" in p_url
+                                        results.append(
+                                            PostMedia(
+                                                post_id=p_id,
+                                                post_url=p_url.split("?")[0],
+                                                profile_url=url,
+                                                platform=self.PLATFORM,
+                                                media_type=MediaType.VIDEO if is_reel else MediaType.PHOTO,
+                                                cookies_file=None,
+                                            )
+                                        )
+                            except Exception:
+                                pass
+
+                        await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
+                        await asyncio.sleep(random.uniform(1.5, 2.5))
+
+                except Exception as tab_err:
+                    logger.debug(f"Guest browser tab error ({target_tab}): {tab_err}")
 
             await page.close()
         except Exception as e:
