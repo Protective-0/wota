@@ -6,16 +6,16 @@ Fitur & Keamanan:
 1. Zero-Login Architecture:
    - Tidak memerlukan cookie akun login pengguna sama sekali, bebas dari resiko ban atau checkpoint akun.
 2. Multi-Tier Public Extraction:
-   - Tier 1: Instagram Public Web API (api/v1/users/web_profile_info/?username={username}) menggunakan X-IG-App-ID header resmi (936619743392459).
+   - Tier 1: Instagram Public Web API (api/v1/users/web_profile_info/?username={username}) menggunakan curl_cffi TLS impersonation (Chrome 124) dan X-IG-App-ID header resmi (936619743392459).
    - Tier 2: gallery-dl Subprocess Extractor (ekstraksi feed publik langsung tanpa browser).
    - Tier 3: yt-dlp Flat-Playlist (fallback metadata ekstraksi cepat).
    - Tier 4: Playwright Stealth Browser (fallback DOM parser dengan deteksi login wall instan).
-3. Anti-Zombie Subprocess Guards:
+3. Direct Video & Image CDN URL Resolution:
+   - Menyimpan direct CDN URL video (video_url) dan foto (display_url / sidecar) langsung pada PostMedia sehingga downloader tidak perlu re-scrape jika URL sudah tersedia.
+4. Anti-Zombie Subprocess Guards:
    - Seluruh subprocess dilengkapi asyncio.TimeoutError handler dengan proc.kill() dan proc.wait().
-4. DSU Chronological Sorting:
+5. DSU Chronological Sorting:
    - Stop-condition evaluation pada post terbaru, lalu dispatch ke downstream secara kronologis (oldest-first).
-5. Clean Error Handling:
-   - Melewati profil private atau terblokir secara bersih tanpa looping tak berujung.
 """
 
 import asyncio
@@ -29,6 +29,12 @@ from typing import AsyncGenerator, Optional, Any
 from datetime import datetime, timezone
 
 import httpx
+
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
 
 from .base import (
     BaseScraper,
@@ -104,7 +110,7 @@ class InstagramScraper(BaseScraper):
         seen_shortcodes: set[str] = set()
 
         # ─────────────────────────────────────────────────────────────────────
-        # TIER 1: Instagram Public Web API (X-IG-App-ID)
+        # TIER 1: Instagram Public Web API (curl_cffi TLS Impersonation + X-IG-App-ID)
         # Super cepat, tanpa browser overhead, mengekstrak timeline publik
         # ─────────────────────────────────────────────────────────────────────
         logger.info(f"{TAG_CRAWL} [TIER 1] Menjalankan Instagram Public Web API untuk @{username}...")
@@ -121,75 +127,90 @@ class InstagramScraper(BaseScraper):
                 "Sec-Fetch-Site": "same-origin",
             }
 
-            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15.0) as client:
-                resp = await client.get(api_url)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    user_data = data.get("data", {}).get("user")
-                    if user_data:
-                        is_private = user_data.get("is_private", False)
-                        if is_private:
-                            logger.warning(f"{TAG_WARN} Profil @{username} bersifat Private — tidak dapat diakses dalam Guest Mode.")
-                            return
+            resp_json = None
+            if HAS_CURL_CFFI:
+                try:
+                    async with curl_requests.AsyncSession(impersonate="chrome124") as session:
+                        resp = await session.get(api_url, headers=headers, timeout=15)
+                        if resp.status_code == 200:
+                            resp_json = resp.json()
+                except Exception as curl_err:
+                    logger.debug(f"curl_cffi web_profile_info note: {curl_err}")
 
-                        media_timeline = user_data.get("edge_owner_to_timeline_media", {})
-                        edges = media_timeline.get("edges", [])
-                        logger.info(f"{TAG_CRAWL} [TIER 1] Public Web API menemukan {len(edges)} post pada timeline @{username}.")
+            if not resp_json:
+                async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15.0) as client:
+                    resp = await client.get(api_url)
+                    if resp.status_code == 200:
+                        resp_json = resp.json()
 
-                        for edge in edges:
-                            node = edge.get("node", {})
-                            shortcode = node.get("shortcode")
-                            if not shortcode or shortcode in seen_shortcodes:
-                                continue
+            if resp_json:
+                user_data = resp_json.get("data", {}).get("user")
+                if user_data:
+                    is_private = user_data.get("is_private", False)
+                    if is_private:
+                        logger.warning(f"{TAG_WARN} Profil @{username} bersifat Private — tidak dapat diakses dalam Guest Mode.")
+                        return
 
-                            seen_shortcodes.add(shortcode)
-                            p_url = f"https://www.instagram.com/p/{shortcode}/"
-                            is_video = node.get("is_video", False)
-                            media_type = MediaType.VIDEO if is_video else MediaType.PHOTO
+                    media_timeline = user_data.get("edge_owner_to_timeline_media", {})
+                    edges = media_timeline.get("edges", [])
+                    logger.info(f"{TAG_CRAWL} [TIER 1] Public Web API menemukan {len(edges)} post pada timeline @{username}.")
 
-                            # Caption & Timestamp
-                            caption = ""
-                            edges_caption = node.get("edge_media_to_caption", {}).get("edges", [])
-                            if edges_caption:
-                                caption = edges_caption[0].get("node", {}).get("text", "") or ""
+                    for edge in edges:
+                        node = edge.get("node", {})
+                        shortcode = node.get("shortcode")
+                        if not shortcode or shortcode in seen_shortcodes:
+                            continue
 
-                            ts_val = node.get("taken_at_timestamp")
-                            ts_str = None
-                            if ts_val:
-                                ts_str = datetime.fromtimestamp(ts_val, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        seen_shortcodes.add(shortcode)
+                        p_url = f"https://www.instagram.com/p/{shortcode}/"
+                        is_video = node.get("is_video", False)
+                        media_type = MediaType.VIDEO if is_video else MediaType.PHOTO
 
-                            # Media direct URLs
-                            media_urls = []
-                            if not is_video:
-                                display_url = node.get("display_url")
-                                if display_url:
-                                    media_urls.append(display_url)
-                                # Cek carousel items jika ada
-                                sidecar = node.get("edge_sidecar_to_children", {}).get("edges", [])
-                                if len(sidecar) > 1:
-                                    media_type = MediaType.CAROUSEL
-                                    media_urls = []
-                                    for c_edge in sidecar:
-                                        c_node = c_edge.get("node", {})
-                                        c_url = c_node.get("display_url") or c_node.get("video_url")
-                                        if c_url:
-                                            media_urls.append(c_url)
+                        # Caption & Timestamp
+                        caption = ""
+                        edges_caption = node.get("edge_media_to_caption", {}).get("edges", [])
+                        if edges_caption:
+                            caption = edges_caption[0].get("node", {}).get("text", "") or ""
 
-                            collected_posts.append(
-                                PostMedia(
-                                    post_id=shortcode,
-                                    post_url=p_url,
-                                    profile_url=canonical_url,
-                                    platform=self.PLATFORM,
-                                    media_type=media_type,
-                                    media_urls=media_urls,
-                                    caption=caption,
-                                    timestamp=ts_str,
-                                    cookies_file=None,
-                                )
+                        ts_val = node.get("taken_at_timestamp")
+                        ts_str = None
+                        if ts_val:
+                            ts_str = datetime.fromtimestamp(ts_val, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                        # Media direct URLs
+                        media_urls = []
+                        if is_video:
+                            v_url = node.get("video_url")
+                            if v_url:
+                                media_urls.append(v_url)
+                        else:
+                            display_url = node.get("display_url")
+                            if display_url:
+                                media_urls.append(display_url)
+                            # Cek carousel items jika ada
+                            sidecar = node.get("edge_sidecar_to_children", {}).get("edges", [])
+                            if len(sidecar) > 1:
+                                media_type = MediaType.CAROUSEL
+                                media_urls = []
+                                for c_edge in sidecar:
+                                    c_node = c_edge.get("node", {})
+                                    c_url = c_node.get("video_url") if c_node.get("is_video") else c_node.get("display_url")
+                                    if c_url:
+                                        media_urls.append(c_url)
+
+                        collected_posts.append(
+                            PostMedia(
+                                post_id=shortcode,
+                                post_url=p_url,
+                                profile_url=canonical_url,
+                                platform=self.PLATFORM,
+                                media_type=media_type,
+                                media_urls=media_urls,
+                                caption=caption,
+                                timestamp=ts_str,
+                                cookies_file=None,
                             )
-                else:
-                    logger.debug(f"Instagram Public Web API returned HTTP {resp.status_code}")
+                        )
         except Exception as e:
             logger.debug(f"Tier 1 Public Web API extraction info: {e}")
 

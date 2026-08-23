@@ -1502,8 +1502,11 @@ class MediaScraperBot(commands.Bot):
             async def download_one(i, url):
                 ext = url.split("?")[0].split(".")[-1].lower()
                 if ext not in {"jpg", "jpeg", "png", "webp", "mp4", "mov"}:
-                    ext = "jpg"
-                filename = f"{post.post_id}_{i}.{ext}"
+                    if post.media_type == MediaType.VIDEO or "/v/" in url or ".mp4" in url or "video" in url:
+                        ext = "mp4"
+                    else:
+                        ext = "jpg"
+                filename = f"{post.post_id}_{i+1:03d}.{ext}"
                 return await self.downloader.download_direct_url(url, filename)
 
             tasks = [download_one(i, url) for i, url in enumerate(post.media_urls)]

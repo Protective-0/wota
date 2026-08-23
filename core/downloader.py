@@ -683,7 +683,271 @@ class MediaDownloader:
                         except Exception as dl_err:
                             logger.error(f"Error download gambar Twitter {img_url}: {dl_err}")
 
+        # Instagram Fallback Handler (API / Browser)
+        if (download_failed or not downloaded_files) and ("instagram.com" in post_url):
+            logger.info(f"{TAG_DOWN} Instagram Fallback Handler (API / Browser) aktif untuk: {post_url}")
+            ig_files, ig_caption, ig_ts = await self._extract_instagram_media_via_api_or_browser(post_url, post_id)
+            if ig_files:
+                downloaded_files = ig_files
+                if ig_caption:
+                    real_caption = ig_caption
+                if ig_ts:
+                    ytdl_timestamp = ig_ts
+
+        # ── Video / Thumbnail File Isolation ─────────────────────────────────────
+        # Jika postingan menghasilkan file video (.mp4, .mov, .webm, .mkv), pastikan
+        # HANYA file video yang dikembalikan. Hapus thumbnail/cover (.jpg, .png, .webp)
+        # yang mungkin ikut terunduh oleh yt-dlp agar Discord hanya menerima video asli.
+        video_files = [f for f in downloaded_files if f.suffix.lower() in {".mp4", ".mov", ".webm", ".mkv"}]
+        if video_files:
+            image_files = [f for f in downloaded_files if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
+            for img_f in image_files:
+                try:
+                    img_f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            downloaded_files = video_files
+
         return downloaded_files, real_caption, ytdl_timestamp
+
+    async def _extract_instagram_media_via_api_or_browser(
+        self, post_url: str, post_id: str
+    ) -> tuple[list[Path], str, Optional[str]]:
+        """
+        Ekstraksi dan unduh media Instagram (Video / Carousel / Foto) dalam 100% Guest Mode.
+        Tier 1: Instagram Public Web API (curl_cffi TLS impersonation chrome124)
+        Tier 2: Playwright Stealth Browser Fallback (dengan seleksi ketat <video> tanpa og:image)
+        """
+        import httpx
+        from datetime import datetime, timezone
+
+        downloaded: list[Path] = []
+        caption = ""
+        timestamp = None
+
+        # Ekstrak username & shortcode dari URL
+        username = ""
+        u_match = re.search(r"instagram\.com/([^/?&#/]+)", post_url)
+        if u_match:
+            u_cand = u_match.group(1).lower().strip()
+            if u_cand not in {"p", "reel", "explore", "stories", "accounts"}:
+                username = u_cand
+
+        shortcode = post_id
+        s_match = re.search(r"/(?:p|reel)/([A-Za-z0-9_-]+)", post_url)
+        if s_match:
+            shortcode = s_match.group(1)
+
+        # ── Tier 1: Instagram Public Web API via curl_cffi / httpx ──
+        if username:
+            try:
+                api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "X-IG-App-ID": "936619743392459",
+                    "Accept": "*/*",
+                    "Referer": f"https://www.instagram.com/{username}/",
+                }
+
+                resp_data = None
+                try:
+                    from curl_cffi import requests as curl_requests
+                    async with curl_requests.AsyncSession(impersonate="chrome124") as session:
+                        resp = await session.get(api_url, headers=headers, timeout=15)
+                        if resp.status_code == 200:
+                            resp_data = resp.json()
+                except Exception:
+                    pass
+
+                if not resp_data:
+                    async with httpx.AsyncClient(headers=headers, timeout=15.0) as client:
+                        resp = await client.get(api_url)
+                        if resp.status_code == 200:
+                            resp_data = resp.json()
+
+                if resp_data:
+                    edges = resp_data.get("data", {}).get("user", {}).get("edge_owner_to_timeline_media", {}).get("edges", [])
+                    target_node = None
+                    for e in edges:
+                        node = e.get("node", {})
+                        if node.get("shortcode") == shortcode:
+                            target_node = node
+                            break
+
+                    if target_node:
+                        # Caption & Timestamp
+                        edges_caption = target_node.get("edge_media_to_caption", {}).get("edges", [])
+                        if edges_caption:
+                            caption = edges_caption[0].get("node", {}).get("text", "") or ""
+
+                        ts_val = target_node.get("taken_at_timestamp")
+                        if ts_val:
+                            timestamp = datetime.fromtimestamp(ts_val, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                        is_video = target_node.get("is_video", False)
+                        video_url = target_node.get("video_url")
+                        sidecar = target_node.get("edge_sidecar_to_children", {}).get("edges", [])
+
+                        if is_video and video_url:
+                            # Direct download video (.mp4)
+                            v_out = self.temp_dir / f"{post_id}_video.mp4"
+                            async with httpx.AsyncClient(headers={"User-Agent": SHARED_USER_AGENT}, timeout=60.0) as client:
+                                v_resp = await client.get(video_url)
+                                if v_resp.status_code == 200:
+                                    async with aiofiles.open(v_out, "wb") as f:
+                                        await f.write(v_resp.content)
+                                    logger.info(f"{TAG_DOWN} Instagram Video API terunduh: {v_out.name} ({fmt_size(v_out.stat().st_size)})")
+                                    return [v_out], caption, timestamp
+
+                        elif sidecar:
+                            # Carousel items (bisa campuran gambar & video)
+                            sidecar_files = []
+                            for idx, c_edge in enumerate(sidecar):
+                                c_node = c_edge.get("node", {})
+                                c_is_v = c_node.get("is_video", False)
+                                c_url = c_node.get("video_url") if c_is_v else c_node.get("display_url")
+                                if not c_url:
+                                    continue
+                                ext = "mp4" if c_is_v else "jpg"
+                                out_p = self.temp_dir / f"{post_id}_{idx+1:03d}.{ext}"
+                                try:
+                                    async with httpx.AsyncClient(headers={"User-Agent": SHARED_USER_AGENT}, timeout=60.0) as client:
+                                        c_res = await client.get(c_url)
+                                        if c_res.status_code == 200:
+                                            async with aiofiles.open(out_p, "wb") as f:
+                                                await f.write(c_res.content)
+                                            sidecar_files.append(out_p)
+                                except Exception as c_err:
+                                    logger.warning(f"Gagal unduh sidecar item {idx+1}: {c_err}")
+
+                            if sidecar_files:
+                                logger.info(f"{TAG_DOWN} Instagram Carousel API terunduh: {len(sidecar_files)} file")
+                                return sidecar_files, caption, timestamp
+
+                        else:
+                            # Single photo
+                            display_url = target_node.get("display_url")
+                            if display_url:
+                                out_p = self.temp_dir / f"{post_id}_001.jpg"
+                                async with httpx.AsyncClient(headers={"User-Agent": SHARED_USER_AGENT}, timeout=30.0) as client:
+                                    d_res = await client.get(display_url)
+                                    if d_res.status_code == 200:
+                                        async with aiofiles.open(out_p, "wb") as f:
+                                            await f.write(d_res.content)
+                                        logger.info(f"{TAG_DOWN} Instagram Photo API terunduh: {out_p.name} ({fmt_size(out_p.stat().st_size)})")
+                                        return [out_p], caption, timestamp
+            except Exception as api_err:
+                logger.debug(f"Instagram Tier 1 API fallback note: {api_err}")
+
+        # ── Tier 2: Playwright Stealth Browser Fallback (Video-First Selection) ──
+        logger.info(f"{TAG_DOWN} Menjalankan Playwright stealth fallback untuk Instagram: {post_url}")
+        try:
+            browser = await self.get_browser()
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 900},
+                locale="id-ID",
+            )
+            page = await context.new_page()
+
+            try:
+                await page.goto(post_url, wait_until="domcontentloaded", timeout=25000)
+                await asyncio.sleep(2.5)
+
+                # Cek login wall
+                if "accounts/login" in page.url.lower():
+                    logger.warning(f"{TAG_WARN} Instagram post mengalihkan ke login page.")
+                else:
+                    # Caption
+                    for sel in ["article h1", "[data-testid='post-caption'] h1", "h1"]:
+                        try:
+                            c_el = page.locator(sel).first
+                            if await c_el.count() > 0:
+                                caption = (await c_el.inner_text()).strip()
+                                if caption:
+                                    break
+                        except Exception:
+                            pass
+
+                    # Timestamp
+                    try:
+                        t_el = page.locator("time").first
+                        if await t_el.count() > 0:
+                            timestamp = await t_el.get_attribute("datetime")
+                    except Exception:
+                        pass
+
+                    # 1. Prioritas Utama: Cek Video tag
+                    video_urls = []
+                    videos = await page.locator("video").all()
+                    for v in videos:
+                        src = await v.get_attribute("src")
+                        if src and not src.startswith("blob:"):
+                            video_urls.append(src)
+                        sources = await v.locator("source").all()
+                        for s in sources:
+                            s_src = await s.get_attribute("src")
+                            if s_src and not s_src.startswith("blob:"):
+                                video_urls.append(s_src)
+
+                    if not video_urls:
+                        og_v_loc = page.locator('meta[property="og:video"], meta[property="og:video:secure_url"]')
+                        if await og_v_loc.count() > 0:
+                            og_src = await og_v_loc.first.get_attribute("content")
+                            if og_src:
+                                video_urls.append(og_src)
+
+                    if video_urls:
+                        # Ini adalah VIDEO: Download video mp4, JANGAN ambil thumbnail image!
+                        clean_v_url = video_urls[0]
+                        v_out = self.temp_dir / f"{post_id}_video.mp4"
+                        async with httpx.AsyncClient(headers={"User-Agent": SHARED_USER_AGENT}, timeout=60.0) as client:
+                            v_res = await client.get(clean_v_url)
+                            if v_res.status_code == 200:
+                                async with aiofiles.open(v_out, "wb") as f:
+                                    await f.write(v_res.content)
+                                logger.info(f"{TAG_DOWN} Instagram Video (Browser) terunduh: {v_out.name} ({fmt_size(v_out.stat().st_size)})")
+                                return [v_out], caption, timestamp
+
+                    # 2. Jika BUKAN video, ambil gambar
+                    img_urls = []
+                    imgs = await page.locator('article img, div[role="presentation"] img').all()
+                    for img in imgs:
+                        src = await img.get_attribute("src")
+                        if src and not src.startswith("blob:") and "instagram" in src:
+                            img_urls.append(src)
+
+                    if not img_urls:
+                        og_img_loc = page.locator('meta[property="og:image"]')
+                        if await og_img_loc.count() > 0:
+                            og_img = await og_img_loc.first.get_attribute("content")
+                            if og_img:
+                                img_urls.append(og_img)
+
+                    unique_imgs = list(dict.fromkeys(img_urls))
+                    img_files = []
+                    for idx, img_u in enumerate(unique_imgs):
+                        out_p = self.temp_dir / f"{post_id}_{idx+1:03d}.jpg"
+                        try:
+                            async with httpx.AsyncClient(headers={"User-Agent": SHARED_USER_AGENT}, timeout=30.0) as client:
+                                i_res = await client.get(img_u)
+                                if i_res.status_code == 200:
+                                    async with aiofiles.open(out_p, "wb") as f:
+                                        await f.write(i_res.content)
+                                    img_files.append(out_p)
+                        except Exception as i_err:
+                            logger.warning(f"Gagal unduh gambar Instagram: {i_err}")
+
+                    if img_files:
+                        logger.info(f"{TAG_DOWN} Instagram Photo (Browser) terunduh: {len(img_files)} foto")
+                        return img_files, caption, timestamp
+
+            finally:
+                await context.close()
+        except Exception as b_err:
+            logger.error(f"{TAG_ERROR} Playwright Instagram fallback error: {b_err}")
+
+        return [], caption, timestamp
 
     async def _extract_tiktok_carousel_urls(self, url: str, cookies_file: Optional[str] = None) -> tuple[list[str], str]:
         """
