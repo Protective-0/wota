@@ -20,6 +20,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional, cast, Any
 
+import shutil
 import yt_dlp
 from yt_dlp.utils import DownloadError
 import gallery_dl.job
@@ -2008,6 +2009,14 @@ class MediaDownloader:
             )
             return file_path, False
 
+        # Cek ketersediaan binary ffmpeg di system PATH sebelum memulai
+        if not shutil.which("ffmpeg"):
+            logger.warning(
+                f"{TAG_COMPR} {file_path.name} ({fmt_size(file_size)}) melebihi limit ({fmt_size(self.max_file_size_bytes)}), "
+                f"tetapi FFmpeg binary tidak terpasang di system PATH — melewati kompresi dan kirim file original."
+            )
+            return file_path, True
+
         logger.info(
             f"{TAG_COMPR} {file_path.name} ({fmt_size(file_size)}) melebihi limit "
             f"— memulai kompresi ffmpeg..."
@@ -2082,53 +2091,62 @@ class MediaDownloader:
         """
         Ambil durasi video menggunakan ffprobe, dengan fallback ke ffmpeg -i jika ffprobe tidak ditemukan/error.
         """
+        has_ffprobe = bool(shutil.which("ffprobe"))
+        has_ffmpeg = bool(shutil.which("ffmpeg"))
+
+        if not has_ffprobe and not has_ffmpeg:
+            logger.warning(f"{TAG_WARN} ffprobe/ffmpeg binary tidak terpasang di PATH — skip duration probe.")
+            return None
+
         # Method 1: ffprobe
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "ffprobe",
-                "-v",
-                "quiet",
-                "-print_format",
-                "json",
-                "-show_format",
-                str(file_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            data = json.loads(stdout.decode())
-            # Safe dict access to prevent KeyError on corrupted/malformed media probe
-            format_dict = data.get("format", {})
-            raw_duration = format_dict.get("duration")
-            if raw_duration is not None:
-                duration = float(raw_duration)
-                logger.debug(f"Durasi video (ffprobe): {duration:.1f}s")
-                return duration
-        except FileNotFoundError:
-            logger.warning("ffprobe tidak ditemukan di PATH — mencoba fallback via ffmpeg...")
-        except Exception as e:
-            logger.warning(f"ffprobe error ({e}) — mencoba fallback duration probe via ffmpeg...")
+        if has_ffprobe:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffprobe",
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_format",
+                    str(file_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                data = json.loads(stdout.decode())
+                # Safe dict access to prevent KeyError on corrupted/malformed media probe
+                format_dict = data.get("format", {})
+                raw_duration = format_dict.get("duration")
+                if raw_duration is not None:
+                    duration = float(raw_duration)
+                    logger.debug(f"Durasi video (ffprobe): {duration:.1f}s")
+                    return duration
+            except FileNotFoundError:
+                logger.warning("ffprobe tidak ditemukan di PATH — mencoba fallback via ffmpeg...")
+            except Exception as e:
+                logger.warning(f"ffprobe error ({e}) — mencoba fallback duration probe via ffmpeg...")
 
         # Method 2: ffmpeg -i parse stderr
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-i",
-                str(file_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", stderr.decode("utf-8", errors="ignore"))
-            if match:
-                hours, minutes, seconds = map(float, match.groups())
-                duration = hours * 3600 + minutes * 60 + seconds
-                logger.debug(f"Durasi video (ffmpeg fallback): {duration:.1f}s")
-                return duration
-        except FileNotFoundError:
-            logger.error("ffmpeg tidak ditemukan di PATH.")
-        except Exception as e:
-            logger.warning(f"ffmpeg duration probe error: {e}")
+        if has_ffmpeg:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-i",
+                    str(file_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+                match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", stderr.decode("utf-8", errors="ignore"))
+                if match:
+                    hours, minutes, seconds = map(float, match.groups())
+                    duration = hours * 3600 + minutes * 60 + seconds
+                    logger.debug(f"Durasi video (ffmpeg fallback): {duration:.1f}s")
+                    return duration
+            except FileNotFoundError:
+                logger.error("ffmpeg tidak ditemukan di PATH.")
+            except Exception as e:
+                logger.warning(f"ffmpeg duration probe error: {e}")
 
         return None
 
@@ -2142,12 +2160,10 @@ class MediaDownloader:
         Jalankan ffmpeg untuk mengompres video dengan target bitrate tertentu.
         Menggunakan asyncio.create_subprocess_exec (non-blocking) agar event loop
         tidak tertahan selama kompresi — konsisten dengan pola yt-dlp di codebase ini.
-
-        FIX (dari audit): sebelumnya menggunakan subprocess.run() sinkron di dalam
-        loop.run_in_executor(). Ini menyebabkan thread pool saturasi jika 4+ kompresi
-        berjalan serentak. Migrasi ke async subprocess menghilangkan ketergantungan
-        pada executor thread pool untuk operasi I/O-bound ini.
         """
+        if not shutil.which("ffmpeg"):
+            logger.error("ffmpeg binary tidak terpasang di system PATH.")
+            return False
         target_kbps = target_bitrate_bps // 1000
         bufsize_kbps = target_kbps * 2
 

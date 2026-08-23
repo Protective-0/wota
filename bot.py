@@ -1139,35 +1139,9 @@ class MediaScraperBot(commands.Bot):
                     logger.info(f"{tag} @{username} ({platform}) tidak memiliki postingan (akun kosong).")
                 return True
 
-            # 2. Filter post baru dibanding last_scraped_id
-            new_posts: list[PostMedia] = []
-            if last_scraped_id:
-                # FIX: detect when last_scraped_id no longer exists in scraped set
-                # (post deleted on platform). Without this check, the for-loop exhausts
-                # without breaking, leaving new_posts == all_scraped and triggering
-                # a full re-upload of the entire profile history.
-                scraped_ids = {p.post_id for p in all_scraped}
-                if last_scraped_id not in scraped_ids:
-                    logger.warning(
-                        f"{tag} last_scraped_id '{last_scraped_id}' tidak ditemukan di scrape hasil "
-                        f"@{username} ({platform}). Post mungkin dihapus. "
-                        f"Menggunakan deduplikasi DB sebagai fallback untuk mencegah re-upload penuh."
-                    )
-                    # Fall through to DB dedup filter below — it will skip already-seen posts.
-                    new_posts = list(all_scraped)
-                else:
-                    for post in all_scraped:
-                        if post.post_id == last_scraped_id:
-                            break
-                        new_posts.append(post)
-            else:
-                # Historical dump: ambil SEMUA postingan untuk di-upload pertama kali
-                new_posts = list(all_scraped)
-
-            # Filter tambahan: deduplikasi di level post_id terhadap scraped_posts
-            # Pass platform to avoid cross-platform post_id collision
+            # 2. Filter post baru dibanding last_scraped_id & database deduplication
             filtered_posts = []
-            for post in new_posts:
+            for post in all_scraped:
                 is_scraped = await self.db.is_post_scraped(post.post_id, platform)
                 if not is_scraped:
                     filtered_posts.append(post)
@@ -1179,12 +1153,19 @@ class MediaScraperBot(commands.Bot):
                 )
                 return True
 
-            logger.info(
-                f"{tag} Ditemukan {len(new_posts)} post baru untuk @{username} ({platform})"
+            # Pastikan urutan kronologis tertib: DARI TERLAMA KE TERBARU (Oldest to Newest)
+            # agar postingan terlama dikirim terlebih dahulu dan postingan terbaru ada di bagian bawah chat Discord.
+            new_posts.sort(
+                key=lambda p: (
+                    str(p.timestamp) if p.timestamp else "1970-01-01T00:00:00Z",
+                    int(p.post_id) if str(p.post_id).isdigit() else str(p.post_id),
+                ),
+                reverse=False,
             )
 
-            # Balik urutan agar postingan terlama diposting terlebih dahulu
-            new_posts.reverse()
+            logger.info(
+                f"{tag} Ditemukan {len(new_posts)} post baru untuk @{username} ({platform}) [Urutan: Oldest -> Newest]"
+            )
 
             # Fase 1: Download Semua
             downloaded_data_list = []
@@ -1367,11 +1348,17 @@ class MediaScraperBot(commands.Bot):
                     filtered_posts.append(post)
             all_posts = filtered_posts
 
-            # Balik urutan agar postingan terlama diposting terlebih dahulu (older to latest)
-            all_posts.reverse()
+            # Pastikan urutan kronologis tertib: DARI TERLAMA KE TERBARU (Oldest to Newest)
+            all_posts.sort(
+                key=lambda p: (
+                    str(p.timestamp) if p.timestamp else "1970-01-01T00:00:00Z",
+                    int(p.post_id) if str(p.post_id).isdigit() else str(p.post_id),
+                ),
+                reverse=False,
+            )
 
             logger.info(
-                f"[⚙️ SYSTEM] Total {len(all_posts)} post baru siap diproses — mulai sekuensial processing"
+                f"[⚙️ SYSTEM] Total {len(all_posts)} post baru siap diproses (Oldest -> Newest) — mulai sekuensial processing"
             )
 
             if all_posts:
