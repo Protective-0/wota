@@ -428,49 +428,76 @@ class MediaDownloader:
                 if not downloaded_files and ("twitter.com" in post_url or "x.com" in post_url):
                     download_failed = True
                 elif not downloaded_files and "tiktok.com" in post_url:
-                    logger.warning(f"{TAG_WARN} yt-dlp kosong untuk TikTok \u2014 coba lightweight carousel extractor.")
-                    try:
-                        result = await self._extract_tiktok_carousel_urls(post_url, cookies_file)
-                        image_urls, fallback_cap = result if isinstance(result, tuple) and len(result) == 2 else ([], "")
-                    except Exception:
-                        image_urls, fallback_cap = [], ""
-
-                    if image_urls:
-                        logger.info(f"Carousel lightweight fallback: {len(image_urls)} foto ditemukan")
-                        cookies_dict = self._parse_netscape_cookies(cookies_file) if cookies_file else {}
-                        headers = {"User-Agent": SHARED_USER_AGENT, "Referer": "https://www.tiktok.com/"}
-                        async def _dl_img_fb(idx, img_url):
-                            fname = f"{post_id}_{idx+1:03d}.jpg"
-                            return await self.download_direct_url(img_url, fname, headers=headers, cookies=cookies_dict)
-                        fb_results = await asyncio.gather(*[_dl_img_fb(i, u) for i, u in enumerate(image_urls)])
-                        downloaded_files = [p for p in fb_results if p is not None]
-                        if fallback_cap:
-                            real_caption = fallback_cap
-
-                    if not downloaded_files:
-                        logger.warning("Lightweight carousel fallback kosong, mencoba Playwright carousel fallback...")
-                        image_urls, browser_caption, browser_cookies = await self._extract_tiktok_carousel_via_browser(post_url, cookies_file)
-                        if image_urls:
-                            logger.info(f"Carousel browser fallback: {len(image_urls)} foto ditemukan")
-                            cookies_dict = {c["name"]: c["value"] for c in browser_cookies}
-                            if cookies_file:
-                                cookies_dict.update(self._parse_netscape_cookies(cookies_file))
-                            img_headers = {"User-Agent": SHARED_USER_AGENT, "Referer": "https://www.tiktok.com/"}
-                            async def _dl_img_fb_pw(idx, img_url):
-                                fname = f"{post_id}_{idx+1:03d}.jpg"
-                                return await self.download_direct_url(img_url, fname, headers=img_headers, cookies=cookies_dict)
-                            fb_results = await asyncio.gather(*[_dl_img_fb_pw(i, u) for i, u in enumerate(image_urls)])
-                            downloaded_files = [p for p in fb_results if p is not None]
-                            if browser_caption:
+                    if "/video/" in post_url or "/v/" in post_url:
+                        # ── Jalur Khusus Video TikTok ────────────────────────────
+                        logger.warning(f"{TAG_WARN} yt-dlp kosong untuk TikTok Video — mencoba Browser & TikWM Video Fallback...")
+                        
+                        # Step A: Playwright Video Extractor
+                        video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, cookies_file)
+                        if video_url:
+                            out_path = await self._download_tiktok_cdn_video(video_url, post_id, browser_cookies, cookies_file)
+                            if out_path:
+                                downloaded_files = [out_path]
                                 real_caption = browser_caption
-                        else:
-                            logger.warning("Carousel fallback kosong, mencoba Playwright video fallback...")
-                            video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, cookies_file)
-                            if video_url:
-                                # FIX: route ke authenticated CDN downloader, bukan generic download_direct_url
-                                out_path = await self._download_tiktok_cdn_video(video_url, post_id, browser_cookies, cookies_file)
-                                if out_path:
-                                    downloaded_files = [out_path]
+
+                        # Step B: TikWM Clean API Video Fallback
+                        if not downloaded_files:
+                            logger.info(f"{TAG_DOWN} Mencoba TikWM Clean API fallback untuk video {post_id}...")
+                            try:
+                                async with httpx.AsyncClient(timeout=15.0) as tw_client:
+                                    tw_res = await tw_client.get(f"https://www.tikwm.com/api/?url={post_url}")
+                                    if tw_res.status_code == 200:
+                                        tw_json = tw_res.json()
+                                        if tw_json.get("code") == 0 and tw_json.get("data"):
+                                            tw_d = tw_json["data"]
+                                            tw_play = tw_d.get("play") or tw_d.get("wmplay")
+                                            tw_title = tw_d.get("title") or ""
+                                            if tw_play:
+                                                v_out = self.temp_dir / f"{post_id}_video.mp4"
+                                                v_resp = await tw_client.get(tw_play)
+                                                if v_resp.status_code == 200 and len(v_resp.content) > 1000:
+                                                    async with aiofiles.open(v_out, "wb") as f:
+                                                        await f.write(v_resp.content)
+                                                    downloaded_files = [v_out]
+                                                    if tw_title:
+                                                        real_caption = tw_title
+                                                    logger.info(f"{TAG_DOWN} TikWM Video terunduh: {v_out.name} ({fmt_size(v_out.stat().st_size)})")
+                            except Exception as tw_err:
+                                logger.debug(f"TikWM video fallback note: {tw_err}")
+                    else:
+                        # ── Jalur Khusus Foto / Carousel TikTok ──────────────────
+                        logger.warning(f"{TAG_WARN} yt-dlp kosong untuk TikTok Photo — mencoba Carousel Extractor...")
+                        try:
+                            result = await self._extract_tiktok_carousel_urls(post_url, cookies_file)
+                            image_urls, fallback_cap = result if isinstance(result, tuple) and len(result) == 2 else ([], "")
+                        except Exception:
+                            image_urls, fallback_cap = [], ""
+
+                        if image_urls:
+                            logger.info(f"Carousel lightweight fallback: {len(image_urls)} foto ditemukan")
+                            cookies_dict = self._parse_netscape_cookies(cookies_file) if cookies_file else {}
+                            headers = {"User-Agent": SHARED_USER_AGENT, "Referer": "https://www.tiktok.com/"}
+                            async def _dl_img_fb(idx, img_url):
+                                fname = f"{post_id}_{idx+1:03d}.jpg"
+                                return await self.download_direct_url(img_url, fname, headers=headers, cookies=cookies_dict)
+                            fb_results = await asyncio.gather(*[_dl_img_fb(i, u) for i, u in enumerate(image_urls)])
+                            downloaded_files = [p for p in fb_results if p is not None]
+                            if fallback_cap:
+                                real_caption = fallback_cap
+
+                        if not downloaded_files:
+                            image_urls, browser_caption, browser_cookies = await self._extract_tiktok_carousel_via_browser(post_url, cookies_file)
+                            if image_urls:
+                                cookies_dict = {c["name"]: c["value"] for c in browser_cookies}
+                                if cookies_file:
+                                    cookies_dict.update(self._parse_netscape_cookies(cookies_file))
+                                img_headers = {"User-Agent": SHARED_USER_AGENT, "Referer": "https://www.tiktok.com/"}
+                                async def _dl_img_fb_pw(idx, img_url):
+                                    fname = f"{post_id}_{idx+1:03d}.jpg"
+                                    return await self.download_direct_url(img_url, fname, headers=img_headers, cookies=cookies_dict)
+                                fb_results = await asyncio.gather(*[_dl_img_fb_pw(i, u) for i, u in enumerate(image_urls)])
+                                downloaded_files = [p for p in fb_results if p is not None]
+                                if browser_caption:
                                     real_caption = browser_caption
             except Exception as e:
                 # FIX: bind original_err immediately so nested awaits cannot rebind `e`
@@ -482,60 +509,70 @@ class MediaDownloader:
                     logger.warning(f"{TAG_WARN} yt-dlp gagal untuk Twitter \u2014 fallback image handler: {yt_error}")
                     download_failed = True
                 elif "tiktok.com" in post_url:
-                    logger.warning(f"{TAG_WARN} yt-dlp gagal untuk TikTok \u2014 coba Carousel Fallback: {yt_error}")
-
-                    # FIX: Carousel first, then video — photo posts have no <video> element
-                    # Step 1: Lightweight rehydration scraper (no browser, fast)
-                    try:
-                        result = await self._extract_tiktok_carousel_urls(post_url, cookies_file)
-                        carousel_urls, carousel_cap = result if isinstance(result, tuple) and len(result) == 2 else ([], "")
-                    except Exception:
-                        carousel_urls, carousel_cap = [], ""
-
-                    if carousel_urls:
-                        logger.info(f"Carousel lightweight fallback (exc path): {len(carousel_urls)} foto ditemukan")
-                        cookies_dict = self._parse_netscape_cookies(cookies_file) if cookies_file else {}
-                        c_headers = {"User-Agent": SHARED_USER_AGENT, "Referer": "https://www.tiktok.com/"}
-                        async def _dl_c_exc(idx, img_url):
-                            fname = f"{post_id}_{idx+1:03d}.jpg"
-                            return await self.download_direct_url(img_url, fname, headers=c_headers, cookies=cookies_dict)
-                        c_results = await asyncio.gather(*[_dl_c_exc(i, u) for i, u in enumerate(carousel_urls)])
-                        downloaded_files = [p for p in c_results if p is not None]
-                        if carousel_cap:
-                            real_caption = carousel_cap
-
-                    if not downloaded_files:
-                        # Step 2: Playwright carousel (full browser, handles JS-rendered state)
-                        logger.warning("Lightweight carousel kosong, mencoba Playwright carousel fallback (exc path)...")
-                        image_urls_pw, browser_caption_pw, browser_cookies_pw = await self._extract_tiktok_carousel_via_browser(post_url, cookies_file)
-                        if image_urls_pw:
-                            logger.info(f"Playwright carousel fallback (exc path): {len(image_urls_pw)} foto ditemukan")
-                            cookies_dict = {c["name"]: c["value"] for c in browser_cookies_pw}
-                            if cookies_file:
-                                cookies_dict.update(self._parse_netscape_cookies(cookies_file))
-                            pw_headers = {"User-Agent": SHARED_USER_AGENT, "Referer": "https://www.tiktok.com/"}
-                            async def _dl_pw_exc(idx, img_url):
-                                fname = f"{post_id}_{idx+1:03d}.jpg"
-                                return await self.download_direct_url(img_url, fname, headers=pw_headers, cookies=cookies_dict)
-                            pw_results = await asyncio.gather(*[_dl_pw_exc(i, u) for i, u in enumerate(image_urls_pw)])
-                            downloaded_files = [p for p in pw_results if p is not None]
-                            if browser_caption_pw:
-                                real_caption = browser_caption_pw
-
-                    if not downloaded_files:
-                        # Step 3: Playwright video — only if carousel returned nothing
-                        logger.warning("Carousel fallback kosong, mencoba Playwright video fallback (exc path)...")
+                    if "/video/" in post_url or "/v/" in post_url:
+                        logger.warning(f"{TAG_WARN} yt-dlp gagal untuk TikTok Video ({yt_error}) — menjalankan Video Fallback...")
                         video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, cookies_file)
                         if video_url:
-                            # FIX: route ke authenticated CDN downloader, bukan generic download_direct_url
                             out_path = await self._download_tiktok_cdn_video(video_url, post_id, browser_cookies, cookies_file)
                             if out_path:
                                 downloaded_files = [out_path]
                                 real_caption = browser_caption
-                            else:
-                                logger.error("Playwright video fallback download gagal.")
-                                # FIX: raise with chained context — original_err preserves yt-dlp root cause
-                                raise RuntimeError(f"TikTok CDN download gagal untuk {post_url}") from original_err
+
+                        if not downloaded_files:
+                            try:
+                                async with httpx.AsyncClient(timeout=15.0) as tw_client:
+                                    tw_res = await tw_client.get(f"https://www.tikwm.com/api/?url={post_url}")
+                                    if tw_res.status_code == 200:
+                                        tw_json = tw_res.json()
+                                        if tw_json.get("code") == 0 and tw_json.get("data"):
+                                            tw_d = tw_json["data"]
+                                            tw_play = tw_d.get("play") or tw_d.get("wmplay")
+                                            tw_title = tw_d.get("title") or ""
+                                            if tw_play:
+                                                v_out = self.temp_dir / f"{post_id}_video.mp4"
+                                                v_resp = await tw_client.get(tw_play)
+                                                if v_resp.status_code == 200 and len(v_resp.content) > 1000:
+                                                    async with aiofiles.open(v_out, "wb") as f:
+                                                        await f.write(v_resp.content)
+                                                    downloaded_files = [v_out]
+                                                    if tw_title:
+                                                        real_caption = tw_title
+                                                    logger.info(f"{TAG_DOWN} TikWM Video terunduh (exc path): {v_out.name} ({fmt_size(v_out.stat().st_size)})")
+                            except Exception as tw_err:
+                                logger.debug(f"TikWM video fallback note: {tw_err}")
+                    else:
+                        logger.warning(f"{TAG_WARN} yt-dlp gagal untuk TikTok Photo — coba Carousel Fallback: {yt_error}")
+                        try:
+                            result = await self._extract_tiktok_carousel_urls(post_url, cookies_file)
+                            carousel_urls, carousel_cap = result if isinstance(result, tuple) and len(result) == 2 else ([], "")
+                        except Exception:
+                            carousel_urls, carousel_cap = [], ""
+
+                        if carousel_urls:
+                            cookies_dict = self._parse_netscape_cookies(cookies_file) if cookies_file else {}
+                            c_headers = {"User-Agent": SHARED_USER_AGENT, "Referer": "https://www.tiktok.com/"}
+                            async def _dl_c_exc(idx, img_url):
+                                fname = f"{post_id}_{idx+1:03d}.jpg"
+                                return await self.download_direct_url(img_url, fname, headers=c_headers, cookies=cookies_dict)
+                            c_results = await asyncio.gather(*[_dl_c_exc(i, u) for i, u in enumerate(carousel_urls)])
+                            downloaded_files = [p for p in c_results if p is not None]
+                            if carousel_cap:
+                                real_caption = carousel_cap
+
+                        if not downloaded_files:
+                            image_urls_pw, browser_caption_pw, browser_cookies_pw = await self._extract_tiktok_carousel_via_browser(post_url, cookies_file)
+                            if image_urls_pw:
+                                cookies_dict = {c["name"]: c["value"] for c in browser_cookies_pw}
+                                if cookies_file:
+                                    cookies_dict.update(self._parse_netscape_cookies(cookies_file))
+                                pw_headers = {"User-Agent": SHARED_USER_AGENT, "Referer": "https://www.tiktok.com/"}
+                                async def _dl_pw_exc(idx, img_url):
+                                    fname = f"{post_id}_{idx+1:03d}.jpg"
+                                    return await self.download_direct_url(img_url, fname, headers=pw_headers, cookies=cookies_dict)
+                                pw_results = await asyncio.gather(*[_dl_pw_exc(i, u) for i, u in enumerate(image_urls_pw)])
+                                downloaded_files = [p for p in pw_results if p is not None]
+                                if browser_caption_pw:
+                                    real_caption = browser_caption_pw
                         else:
                             logger.error(f"{TAG_ERROR} Semua fallback TikTok habis \u2014 tidak ada media yang bisa diunduh.")
                             # FIX: same — chain from original yt-dlp error, not raw `raise e`
@@ -1110,10 +1147,14 @@ class MediaDownloader:
         self, post_url: str, cookies_file: Optional[str] = None
     ) -> tuple[list[str], str, list[dict]]:
         """
-        Stealth Browser Fallback Extractor khusus TikTok Carousel.
+        Stealth Browser Fallback Extractor khusus TikTok Carousel / Photo.
         Membuka halaman postingan TikTok di browser stealth, menangkap response API internal,
         dan mengekstrak data rehydration JSON serta DOM image elements.
         """
+        # Guard: Jangan pernah jalankan carousel extraction pada URL /video/
+        if "/video/" in post_url or "/v/" in post_url:
+            return [], "", []
+
         import os
         import json
 
@@ -1197,25 +1238,12 @@ class MediaDownloader:
                 except Exception as json_err:
                     logger.warning(f"Gagal memparsing rehydration JSON TikTok: {json_err}")
 
-            # Path B: DOM img element selectors
+            # Path B: DOM img element selectors khusus Photo Mode (tanpa menangkap cover/thumbnail video)
             if not image_urls:
                 image_urls = await page.evaluate("""() => {
                     const results = new Set();
-                    document.querySelectorAll('img[src*="photomode"], img[src*="tos-"]').forEach(el => {
-                        if (el.src && !el.src.includes('avatar') && !el.src.includes('cover') && !el.src.includes('icon')) {
-                            results.add(el.src);
-                        }
-                    });
-                    document.querySelectorAll('img[srcset*="photomode"], img[srcset*="tos-"]').forEach(el => {
-                        const srcset = el.srcset || '';
-                        const parts = srcset.split(',');
-                        if (parts.length) {
-                            const last = parts[parts.length - 1].trim().split(' ')[0];
-                            if (last && !last.includes('avatar') && !last.includes('icon')) results.add(last);
-                        }
-                    });
-                    document.querySelectorAll('.swiper-slide img, [class*="PhotoSwiper"] img, [class*="ImageWrapper"] img, [data-e2e*="image"] img').forEach(el => {
-                        if (el.src && el.src.startsWith('http') && !el.src.includes('avatar') && !el.src.includes('icon')) {
+                    document.querySelectorAll('img[src*="photomode"], [data-e2e="photo-item"] img, .swiper-slide img, [class*="PhotoSwiper"] img').forEach(el => {
+                        if (el.src && el.src.startsWith('http') && !el.src.includes('avatar') && !el.src.includes('cover') && !el.src.includes('icon') && !el.src.includes('profile')) {
                             results.add(el.src);
                         }
                     });
@@ -1381,62 +1409,41 @@ class MediaDownloader:
     ) -> Optional[Path]:
         """
         Download TikTok CDN video URL dengan full session cookie auth untuk bypass HTTP 403.
-
-        TikTok CDN URLs mengandung signed token yang divalidasi bersama session cookies.
-        Mengirim GET tanpa cookies → 403 Forbidden. Fix: bangun cookies_dict dari tiga sumber:
-          1. browser_cookies (dari Playwright context.cookies() setelah page load)
-          2. Netscape cookies file (sessions/tiktok_cookies.txt)
-          3. TIKTOK_SESSION_ID env var sebagai fallback minimal
-
-        Kenapa tidak pakai download_direct_url?
-        download_direct_url adalah generic downloader. Untuk TikTok CDN, kita butuh
-        full-cookie-string di header Cookie (bukan hanya dict) agar token signature match.
         """
         import httpx
 
         output_path = self.temp_dir / f"{post_id}_video.mp4"
-        # FIX: ensure temp_dir exists — can be wiped by /reset_bot mid-session
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # ── Bangun cookies_dict dari semua sumber tersedia ──────────────────
         cookies_dict: dict = {}
-
-        # Sumber 1: Netscape cookie file (paling lengkap — hasil inject + rotate browser)
         netscape_path = Path("sessions/tiktok_cookies.txt")
         if cookies_file and Path(cookies_file).exists():
             netscape_path = Path(cookies_file)
         if netscape_path.exists():
             cookies_dict.update(self._parse_netscape_cookies(str(netscape_path)))
-            logger.debug(f"TikTok CDN: {len(cookies_dict)} cookies dari Netscape file")
 
-        # Sumber 2: Playwright context cookies (termasuk cookies yang di-set saat JS render)
-        # Overwrite Netscape values jika ada yang lebih fresh dari browser session
         for c in browser_cookies:
             name = c.get("name", "")
             value = c.get("value", "")
             if name and value:
                 cookies_dict[name] = value
-        logger.debug(f"TikTok CDN: {len(cookies_dict)} cookies setelah merge browser session")
 
-        # Sumber 3: Env var fallback — pastikan sessionid selalu ada
         tiktok_session_id = os.getenv("TIKTOK_SESSION_ID", "").strip()
         if tiktok_session_id and "sessionid" not in cookies_dict:
             cookies_dict["sessionid"] = tiktok_session_id
-            logger.debug("TikTok CDN: sessionid diisi dari TIKTOK_SESSION_ID env var")
 
-        # ── Headers wajib untuk CDN signed URL ─────────────────────────────
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Referer": "https://www.tiktok.com/",
             "Origin": "https://www.tiktok.com",
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Range": "bytes=0-",  # CDN signed URLs sometimes require Range header
+            "Range": "bytes=0-",
         }
 
-        # ── Coba curl_cffi dulu (browser impersonation bypass WAF) ──────────
+        # Coba curl_cffi dulu
         try:
-            from curl_cffi import requests as curl_requests  # pyright: ignore[reportMissingImports]
+            from curl_cffi import requests as curl_requests
             logger.info(f"TikTok CDN: Mengunduh via curl_cffi chrome impersonation...")
             async with curl_requests.AsyncSession(impersonate="chrome124") as session:
                 resp = await session.get(
@@ -1446,21 +1453,12 @@ class MediaDownloader:
                     timeout=120,
                     allow_redirects=True,
                 )
-                if resp.status_code in (200, 206):
-                    # FIX: stream chunk-write instead of resp.content (loads full video to RAM).
-                    # Large TikTok videos (100+ MB) would cause OOM with in-memory load.
-                    # Supports both curl_cffi (aiter_content) and httpx (aiter_bytes).
+                if resp.status_code in (200, 206) and resp.content:
                     async with aiofiles.open(output_path, "wb") as f:
-                        if hasattr(resp, "aiter_content"):
-                            async for chunk in resp.aiter_content(8192):
-                                await f.write(chunk)
-                        elif hasattr(resp, "aiter_bytes"):
-                            async for chunk in resp.aiter_bytes(8192):
-                                await f.write(chunk)
-                        else:
-                            await f.write(resp.content)
-                    logger.info(f"TikTok CDN: Download sukses via curl_cffi ({output_path.stat().st_size // 1024} KB)")
-                    return output_path
+                        await f.write(resp.content)
+                    if output_path.exists() and output_path.stat().st_size > 1000:
+                        logger.info(f"TikTok CDN: Download sukses via curl_cffi ({output_path.stat().st_size // 1024} KB)")
+                        return output_path
                 else:
                     logger.warning(f"TikTok CDN curl_cffi: HTTP {resp.status_code} — fallback ke httpx")
         except (ImportError, ModuleNotFoundError):
@@ -1468,9 +1466,8 @@ class MediaDownloader:
         except Exception as ce:
             logger.warning(f"TikTok CDN curl_cffi error: {ce} — fallback ke httpx")
 
-        # ── Fallback: httpx dengan full cookie string di header ─────────────
+        # Fallback: httpx dengan streaming
         try:
-            # Build Cookie header string — lebih reliable daripada cookies= dict untuk CDN
             cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items())
             if cookie_str:
                 headers["Cookie"] = cookie_str
@@ -1481,15 +1478,14 @@ class MediaDownloader:
                 timeout=120.0,
                 follow_redirects=True,
             ) as client:
-                # FIX: use streaming response to avoid loading entire video into RAM.
-                # resp.content on a 200 MB video would spike memory by 200 MB instantly.
                 async with client.stream("GET", video_url) as resp:
                     if resp.status_code in (200, 206):
                         async with aiofiles.open(output_path, "wb") as f:
                             async for chunk in resp.aiter_bytes(8192):
                                 await f.write(chunk)
-                        logger.info(f"TikTok CDN: Download sukses via httpx ({output_path.stat().st_size // 1024} KB)")
-                        return output_path
+                        if output_path.exists() and output_path.stat().st_size > 1000:
+                            logger.info(f"TikTok CDN: Download sukses via httpx ({output_path.stat().st_size // 1024} KB)")
+                            return output_path
                     else:
                         logger.error(f"TikTok CDN httpx: HTTP {resp.status_code} — cookies tidak valid atau URL expired")
                         return None
