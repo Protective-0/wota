@@ -1004,7 +1004,7 @@ class MediaDownloader:
 
         # ── Tier 1: TikWM Clean API (Fastest & most reliable for unauthenticated photo posts) ──
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=12.0) as client:
                 tw_resp = await client.get(f"https://www.tikwm.com/api/?url={url}")
                 if tw_resp.status_code == 200:
                     tw_data = tw_resp.json()
@@ -1012,7 +1012,7 @@ class MediaDownloader:
                         d = tw_data["data"]
                         tw_images = d.get("images", [])
                         tw_title = d.get("title", "") or ""
-                        if tw_images and isinstance(tw_images, list):
+                        if tw_images and isinstance(tw_images, list) and len(tw_images) > 0:
                             logger.info(f"{TAG_DOWN} TikWM API: Berhasil menemukan {len(tw_images)} foto TikTok.")
                             return tw_images, tw_title
         except Exception as e:
@@ -1242,7 +1242,7 @@ class MediaDownloader:
             if not image_urls:
                 image_urls = await page.evaluate("""() => {
                     const results = new Set();
-                    document.querySelectorAll('img[src*="photomode"], [data-e2e="photo-item"] img, .swiper-slide img, [class*="PhotoSwiper"] img').forEach(el => {
+                    document.querySelectorAll('img[src*="photomode"], [data-e2e="photo-mode-image"] img, div[class*="PhotoSwiper"] img, [data-e2e="photo-item"] img, .swiper-slide img').forEach(el => {
                         if (el.src && el.src.startsWith('http') && !el.src.includes('avatar') && !el.src.includes('cover') && !el.src.includes('icon') && !el.src.includes('profile')) {
                             results.add(el.src);
                         }
@@ -1293,7 +1293,7 @@ class MediaDownloader:
         self, post_url: str, cookies_file: Optional[str] = None
     ) -> tuple[Optional[str], str, list[dict]]:
         """
-        Scrapling Stealth Fallback Extractor khusus TikTok Video.
+        Stealth Browser Fallback Extractor khusus TikTok Video.
         Membuka halaman postingan TikTok, menanti pemuatan tag video, dan mengekstrak direct CDN URL serta caption.
         """
         video_url = None
@@ -1327,6 +1327,26 @@ class MediaDownloader:
 
         async def _video_page_action(page):
             nonlocal video_url, caption, browser_cookies
+
+            # Network Interceptor: Tangkap payload item/detail internal TikTok
+            async def _on_v_resp(response):
+                nonlocal video_url, caption
+                try:
+                    r_url = response.url.lower()
+                    if ("item/detail" in r_url or "/api/post" in r_url or "aweme/v1" in r_url) and response.status == 200:
+                        data = await response.json()
+                        v_detail = data.get("itemInfo", {}).get("itemStruct", {}) or data.get("aweme_detail", {})
+                        if v_detail:
+                            v_info = v_detail.get("video", {})
+                            cand_url = v_info.get("playAddr") or v_info.get("downloadAddr")
+                            if cand_url and not video_url:
+                                video_url = cand_url
+                            if not caption:
+                                caption = v_detail.get("desc") or ""
+                except Exception:
+                    pass
+
+            page.on("response", _on_v_resp)
             await asyncio.sleep(2.0)
 
             try:
@@ -1336,6 +1356,12 @@ class MediaDownloader:
 
             # Ambil rehydration JSON
             json_content = await page.evaluate("""() => {
+                if (window.__UNIVERSAL_DATA_FOR_REHYDRATION__) {
+                    return JSON.stringify(window.__UNIVERSAL_DATA_FOR_REHYDRATION__);
+                }
+                if (window.SIGI_STATE) {
+                    return JSON.stringify(window.SIGI_STATE);
+                }
                 const el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
                 if (el) return el.textContent;
                 const sigi = document.getElementById('SIGI_STATE');
@@ -1343,7 +1369,7 @@ class MediaDownloader:
                 return null;
             }""")
 
-            if json_content:
+            if json_content and not video_url:
                 try:
                     raw_data = json.loads(json_content)
                     try:
@@ -1355,7 +1381,8 @@ class MediaDownloader:
                         item_struct = video_detail.get("itemInfo", {}).get("itemStruct", {})
                         video_info = item_struct.get("video", {})
                         video_url = video_info.get("playAddr") or video_info.get("downloadAddr")
-                        caption = item_struct.get("desc") or ""
+                        if not caption:
+                            caption = item_struct.get("desc") or ""
                         if video_url:
                             logger.info("Berhasil mengekstrak direct video CDN URL dari rehydration JSON")
                     except Exception as parse_err:
@@ -1363,16 +1390,40 @@ class MediaDownloader:
                 except Exception as json_err:
                     logger.warning(f"Gagal memparsing rehydration JSON untuk video TikTok: {json_err}")
 
+            # Fallback ke elemen DOM <video>
             if not video_url:
+                try:
+                    await page.wait_for_selector("video", timeout=8000)
+                except Exception:
+                    pass
+
                 video_url = await page.evaluate("""() => {
                     const video = document.querySelector('video');
-                    if (video && video.src && !video.src.startsWith('blob:')) {
-                        return video.src;
+                    if (video) {
+                        if (video.src && !video.src.startsWith('blob:')) {
+                            return video.src;
+                        }
+                        const source = video.querySelector('source');
+                        if (source && source.src && !source.src.startsWith('blob:')) {
+                            return source.src;
+                        }
                     }
                     return null;
                 }""")
                 if video_url:
-                    logger.info("Berhasil mengekstrak video URL dari tag video (non-blob)")
+                    logger.info("Berhasil mengekstrak video URL dari tag video (DOM)")
+
+            if not caption:
+                try:
+                    caption = await page.evaluate("""() => {
+                        const h1 = document.querySelector('h1');
+                        if (h1 && h1.innerText) return h1.innerText.trim();
+                        const meta = document.querySelector('meta[property="og:description"]');
+                        if (meta && meta.content) return meta.content;
+                        return '';
+                    }""") or ""
+                except Exception:
+                    pass
 
             if hasattr(page, "context"):
                 try:
