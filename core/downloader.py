@@ -690,10 +690,15 @@ class MediaDownloader:
         Ekstrak list URL gambar carousel dan caption dari webpage TikTok secara async.
         Multi-tier fallback:
           Tier 1: TikWM Clean API (cepat, direct CDN URL)
-          Tier 2: SSR HTML Rehydration Parser (__UNIVERSAL_DATA_FOR_REHYDRATION__)
-          Tier 3: TikTok Official Web Detail API
+          Tier 2: Scrapling AsyncFetcher / SSR HTML Rehydration Parser (__UNIVERSAL_DATA_FOR_REHYDRATION__)
+          Tier 3: TikTok Official Web Detail API dengan TLS Impersonation
         """
         import httpx
+        try:
+            from scrapling.fetchers import AsyncFetcher
+            has_scrapling = True
+        except ImportError:
+            has_scrapling = False
 
         # ── Tier 1: TikWM Clean API (Fastest & most reliable for unauthenticated photo posts) ──
         try:
@@ -711,10 +716,10 @@ class MediaDownloader:
         except Exception as e:
             logger.debug(f"TikWM API extraction error: {e}")
 
-        # ── Tier 2: SSR HTML Rehydration Parser ──
+        # ── Tier 2: Scrapling AsyncFetcher / SSR HTML Rehydration Parser ──
         headers = {
             "User-Agent": SHARED_USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.tiktok.com/",
         }
@@ -727,18 +732,34 @@ class MediaDownloader:
                 logger.warning(f"Gagal parse Netscape cookie file: {e}")
 
         html_content = ""
-        try:
-            async with httpx.AsyncClient(
-                headers=headers,
-                cookies=cookies_dict if cookies_dict else None,
-                follow_redirects=True,
-                timeout=15.0,
-            ) as client:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    html_content = resp.text
-        except Exception as e:
-            logger.debug(f"HTTPX fetch info: {e}")
+        if has_scrapling:
+            try:
+                response = await AsyncFetcher.get(
+                    url,
+                    headers=headers,
+                    cookies=cookies_dict if cookies_dict else None,
+                    timeout=15,
+                    impersonate="chrome124",
+                )
+                if response.status == 200:
+                    html_content = response.text
+                    logger.debug("Tier 2: Scrapling AsyncFetcher berhasil mengambil HTML.")
+            except Exception as sc_err:
+                logger.debug(f"Tier 2 Scrapling AsyncFetcher note: {sc_err}")
+
+        if not html_content:
+            try:
+                async with httpx.AsyncClient(
+                    headers=headers,
+                    cookies=cookies_dict if cookies_dict else None,
+                    follow_redirects=True,
+                    timeout=15.0,
+                ) as client:
+                    resp = await client.get(url)
+                    if resp.status_code == 200:
+                        html_content = resp.text
+            except Exception as e:
+                logger.debug(f"HTTPX fetch info: {e}")
 
         if html_content:
             try:
@@ -767,22 +788,43 @@ class MediaDownloader:
                         pass
 
                     if image_urls:
+                        logger.info(f"{TAG_DOWN} Rehydration Parser: Berhasil menemukan {len(image_urls)} foto.")
                         return image_urls, caption
             except Exception as e:
                 logger.debug(f"Gagal ekstrak rehydration JSON: {e}")
 
-        # ── Tier 3: TikTok Official Item Detail Web API ──
+        # ── Tier 3: TikTok Official Item Detail Web API dengan Scrapling / TLS Impersonation ──
         post_id_match = re.search(r"/(?:video|photo|v)/(\d+)", url)
         if post_id_match:
             item_id = post_id_match.group(1)
+            api_url = f"https://www.tiktok.com/api/item/detail/?itemId={item_id}"
+            api_headers = {
+                "User-Agent": SHARED_USER_AGENT,
+                "Referer": url,
+                "Accept": "application/json, text/plain, */*",
+            }
+            if has_scrapling:
+                try:
+                    api_resp = await AsyncFetcher.get(
+                        api_url,
+                        headers=api_headers,
+                        cookies=cookies_dict if cookies_dict else None,
+                        timeout=15,
+                        impersonate="chrome124",
+                    )
+                    if api_resp.status == 200:
+                        api_data = api_resp.json()
+                        image_urls = _extract_tiktok_image_urls_from_rehydration(api_data)
+                        caption = api_data.get("itemInfo", {}).get("itemStruct", {}).get("desc") or ""
+                        if image_urls:
+                            logger.info(f"{TAG_DOWN} TikTok Item API (Scrapling): Berhasil menemukan {len(image_urls)} foto.")
+                            return image_urls, caption
+                except Exception as sc_api_err:
+                    logger.debug(f"Scrapling API fetch note: {sc_api_err}")
+
             try:
-                api_url = f"https://www.tiktok.com/api/item/detail/?itemId={item_id}"
                 async with httpx.AsyncClient(
-                    headers={
-                        "User-Agent": SHARED_USER_AGENT,
-                        "Referer": url,
-                        "Accept": "application/json, text/plain, */*",
-                    },
+                    headers=api_headers,
                     cookies=cookies_dict if cookies_dict else None,
                     timeout=15.0,
                 ) as client:
@@ -792,7 +834,7 @@ class MediaDownloader:
                         image_urls = _extract_tiktok_image_urls_from_rehydration(api_data)
                         caption = api_data.get("itemInfo", {}).get("itemStruct", {}).get("desc") or ""
                         if image_urls:
-                            logger.info(f"{TAG_DOWN} TikTok Item API: Berhasil menemukan {len(image_urls)} foto.")
+                            logger.info(f"{TAG_DOWN} TikTok Item API (HTTPX): Berhasil menemukan {len(image_urls)} foto.")
                             return image_urls, caption
             except Exception as e:
                 logger.debug(f"TikTok Item Detail API extraction error: {e}")

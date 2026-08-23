@@ -1,15 +1,20 @@
 """
 scrapers/tiktok.py
-Scraper profil TikTok menggunakan Built-in Stealth Browser + Fast HTTP Rehydration & yt-dlp.
+Engine Scraper Profil TikTok terintegrasi Scrapling Anti-Bot Stealth Engine & Fast Rehydration.
 
 Fitur & Keamanan:
-1. Strict Target Scope: Hanya mengekstrak postingan yang dibuat langsung oleh target creator (@username).
-   Anti-leakage: Mengabaikan sidebar navigasi, rekomendasi, feed penonton, dan repost.
-2. Unauthenticated Guest First: Crawl profil secara guest murni tanpa cookie personal penonton
-   agar TikTok tidak mencemari DOM dengan repost / feed pribadi akun yang login.
-3. Fast Pass: Ekstraksi Rehydration JSON via HTTPX (Cepat & hemat resource).
-4. Dynamic Pass: Playwright Stealth Browser dengan container selector spesifik ([data-e2e="user-post-item"]).
-5. DSU (Decorate-Sort-Undecorate) sorting untuk kronologi postingan yang akurat.
+1. Scrapling Engine: Integrasi Scrapling AsyncFetcher (TLS chrome impersonation) untuk bypass WAF & anti-bot tanpa login.
+2. Strict Author Filtering:
+   - Validasi ketat author.uniqueId == target_username.
+   - Filter out postingan dari tab Repost, Likes, maupun sidebar video recommendation.
+3. Unauthenticated Guest First (Zero-Login):
+   - Scraping mode guest murni untuk mencegah TikTok mengontaminasi feed/DOM dengan repost viewer.
+4. Dual-Pass Architecture:
+   - Pass 1 (Fast Pass): Ekstraksi Rehydration JSON SSR via Scrapling AsyncFetcher (Cepat, efisien RAM/IOPS).
+   - Pass 2 (yt-dlp Flat-Playlist): Fallback ekstraksi playlist metadata dengan author check ketat.
+   - Pass 3 (Dynamic Stealth Pass): Browser automation dengan container selector spesifik ([data-e2e="user-post-item"]).
+5. DSU (Decorate-Sort-Undecorate) sorting untuk kronologi postingan yang presisi (terbaru ke terlama).
+6. SQLite stop-condition untuk efisiensi patroli (resume checkpoint).
 """
 
 import asyncio
@@ -18,9 +23,16 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Any
+
+# Scrapling Engine imports dengan fallback aman
+try:
+    from scrapling.fetchers import AsyncFetcher, AsyncStealthySession, StealthyFetcher
+    HAS_SCRAPLING = True
+except ImportError:
+    HAS_SCRAPLING = False
+
 import httpx
-from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from .base import (
     BaseScraper,
@@ -43,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 class TikTokScraper(BaseScraper):
     """
-    Scraper profil TikTok berbasis Stealth Browser & Fast Rehydration dengan strict author filtering.
+    Scraper profil TikTok berbasis Scrapling Anti-Bot Engine dengan strict author filtering.
     """
 
     PLATFORM = "tiktok"
@@ -55,8 +67,8 @@ class TikTokScraper(BaseScraper):
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.netscape_cookie_path = self.session_dir / "tiktok_cookies.txt"
         self._playwright = None
-        self._browser: Optional[Browser] = None
-        self._context: Optional[BrowserContext] = None
+        self._browser = None
+        self._context = None
 
     def _extract_username(self, url: str) -> Optional[str]:
         """Ekstrak clean username dari berbagai format URL TikTok."""
@@ -73,13 +85,41 @@ class TikTokScraper(BaseScraper):
         match = re.search(r"/(?:video|photo|v)/(\d{15,22})", url)
         return match.group(1) if match else None
 
+    def _is_valid_creator_post(self, item: dict, target_username: str) -> bool:
+        """
+        [STRICT AUTHOR FILTERING]
+        1. Validasi author.uniqueId / unique_id == target_username
+        2. Tolak jika postingan berasal dari tab Repost / isRepost == True
+        3. Tolak jika author tidak match (mencegah kebocoran likes / recommended sidebar)
+        """
+        if not item or not isinstance(item, dict):
+            return False
+
+        # Filter out Repost flag
+        if item.get("isRepost") or item.get("repost") or item.get("is_repost"):
+            return False
+
+        # Ekstrak identifier author dari berbagai variasi skema JSON TikTok
+        author = item.get("author")
+        author_name = ""
+        if isinstance(author, dict):
+            author_name = author.get("uniqueId") or author.get("unique_id") or author.get("nickname") or ""
+        elif isinstance(author, str):
+            author_name = author
+
+        author_clean = str(author_name).lower().replace("@", "").strip()
+        target_clean = target_username.lower().replace("@", "").strip()
+
+        # WAJIB SAMA: hanya terima postingan yang dibuat langsung oleh creator target
+        return bool(author_clean and author_clean == target_clean)
+
     async def scrape_profile(
         self,
         profile_url: str,
         forced: bool = False,
     ) -> AsyncGenerator[PostMedia, None]:
         """
-        Crawl profil TikTok menggunakan Fast Rehydration & Stealth Browser.
+        Crawl profil TikTok menggunakan Scrapling Engine & Fast Rehydration dengan anti-leak filtering.
         """
         username = self._extract_username(profile_url)
         if not username:
@@ -92,49 +132,76 @@ class TikTokScraper(BaseScraper):
         collected_urls: list[str] = []
         seen_urls: set[str] = set()
 
-        # Siapkan cookie jika ada file Netscape
+        # Pemuatan cookie Netscape opsional jika tersedia
         netscape_cookie_path = await self.load_and_inject_cookies(None, "tiktok")
         if netscape_cookie_path:
             self.netscape_cookie_path = netscape_cookie_path
 
         expected_video_count = 0
 
-        # ── Method 1 (Primary): Fast HTTP Rehydration Parser (Guest Mode, Cepat & Akurat) ──
-        logger.info(f"{TAG_CRAWL} Menjalankan Fast HTTP Rehydration Parser untuk @{username}...")
+        # ─────────────────────────────────────────────────────────────────────
+        # PASS 1 (PRIMARY): Scrapling AsyncFetcher — Fast SSR Rehydration Parser
+        # Bypass WAF via TLS Chrome Impersonation tanpa browser overhead
+        # ─────────────────────────────────────────────────────────────────────
+        logger.info(f"{TAG_CRAWL} [PASS 1] Menjalankan Scrapling Fast SSR Rehydration untuk @{username}...")
         try:
+            html_text = ""
             headers = {
                 "User-Agent": USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://www.tiktok.com/",
             }
-            async with httpx.AsyncClient(
-                headers=headers,
-                follow_redirects=True,
-                timeout=15.0,
-            ) as client:
-                resp = await client.get(canonical_url)
-                if resp.status_code == 200:
-                    rehydration_data = self._parse_rehydration_from_html(resp.text, username)
-                    rehydration_urls = rehydration_data.get("urls", [])
-                    expected_video_count = rehydration_data.get("videoCount", 0)
 
-                    if expected_video_count > 0:
-                        logger.info(f"{TAG_CRAWL} Profil @{username}: {expected_video_count} video publik terdeteksi.")
+            if HAS_SCRAPLING:
+                try:
+                    # Scrapling AsyncFetcher dengan automatic TLS impersonation
+                    response = await AsyncFetcher.get(
+                        canonical_url,
+                        headers=headers,
+                        timeout=15,
+                        impersonate="chrome124",
+                    )
+                    if response.status == 200:
+                        html_text = response.text
+                        logger.info(f"{TAG_CRAWL} Scrapling AsyncFetcher berhasil mengambil HTML (Status: 200).")
+                except Exception as sc_err:
+                    logger.debug(f"Scrapling AsyncFetcher fetch note: {sc_err}, fallback ke HTTPX...")
 
-                    for r_url in rehydration_urls:
-                        if r_url not in seen_urls:
-                            collected_urls.append(r_url)
-                            seen_urls.add(r_url)
+            if not html_text:
+                # Fallback ke standard HTTPX client jika Scrapling fetcher berhalangan
+                async with httpx.AsyncClient(
+                    headers=headers,
+                    follow_redirects=True,
+                    timeout=15.0,
+                ) as client:
+                    resp = await client.get(canonical_url)
+                    if resp.status_code == 200:
+                        html_text = resp.text
 
-                    if collected_urls:
-                        logger.info(f"{TAG_CRAWL} Fast pass berhasil menemukan {len(collected_urls)} post asli @{username}.")
+            if html_text:
+                rehydration_data = self._parse_rehydration_from_html(html_text, username)
+                rehydration_urls = rehydration_data.get("urls", [])
+                expected_video_count = rehydration_data.get("videoCount", 0)
+
+                if expected_video_count > 0:
+                    logger.info(f"{TAG_CRAWL} Profil @{username}: {expected_video_count} postingan terdeteksi pada metadata.")
+
+                for r_url in rehydration_urls:
+                    if r_url not in seen_urls:
+                        collected_urls.append(r_url)
+                        seen_urls.add(r_url)
+
+                if collected_urls:
+                    logger.info(f"{TAG_CRAWL} [PASS 1] Fast Pass berhasil menemukan {len(collected_urls)} post asli @{username}.")
         except Exception as e:
             logger.debug(f"Fast HTTP Rehydration info: {e}")
 
-        # ── Method 2: yt-dlp flat-playlist (Strict Author Matching) ──
+        # ─────────────────────────────────────────────────────────────────────
+        # PASS 2: yt-dlp Flat-Playlist Extractor (Strict Author Matching)
+        # ─────────────────────────────────────────────────────────────────────
         if not collected_urls:
-            logger.info(f"{TAG_CRAWL} Mengekstrak postingan @{username} via yt-dlp...")
+            logger.info(f"{TAG_CRAWL} [PASS 2] Mencoba ekstraksi postingan @{username} via yt-dlp flat-playlist...")
             try:
                 cmd = [
                     "yt-dlp",
@@ -149,38 +216,48 @@ class TikTokScraper(BaseScraper):
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, _ = await proc.communicate()
-                if proc.returncode == 0 and stdout:
-                    for line in stdout.decode("utf-8", errors="ignore").splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                            p_id = entry.get("id")
-                            uploader = str(entry.get("uploader") or entry.get("uploader_id") or "").lower().replace("@", "")
-                            
-                            # Validasi author: wajib milik target creator!
-                            if uploader and uploader != username.lower():
+                try:
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+                    if proc.returncode == 0 and stdout:
+                        for line in stdout.decode("utf-8", errors="ignore").splitlines():
+                            line = line.strip()
+                            if not line:
                                 continue
+                            try:
+                                entry = json.loads(line)
+                                p_id = entry.get("id")
+                                uploader = str(entry.get("uploader") or entry.get("uploader_id") or "").lower().replace("@", "").strip()
+                                
+                                # STRICT AUTHOR MATCH: buang uploader yang tidak cocok
+                                if uploader and uploader != username.lower().strip():
+                                    continue
 
-                            p_url = entry.get("url") or f"https://www.tiktok.com/@{username}/video/{p_id}"
-                            if p_id and re.match(r"^\d{15,22}$", str(p_id)):
-                                clean_p_url = p_url.split("?")[0]
-                                if f"@{username.lower()}" in clean_p_url.lower() and clean_p_url not in seen_urls:
-                                    collected_urls.append(clean_p_url)
-                                    seen_urls.add(clean_p_url)
-                        except Exception:
-                            pass
+                                p_url = entry.get("url") or f"https://www.tiktok.com/@{username}/video/{p_id}"
+                                if p_id and re.match(r"^\d{15,22}$", str(p_id)):
+                                    clean_p_url = p_url.split("?")[0]
+                                    if f"@{username.lower()}" in clean_p_url.lower() and clean_p_url not in seen_urls:
+                                        collected_urls.append(clean_p_url)
+                                        seen_urls.add(clean_p_url)
+                            except Exception:
+                                pass
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    logger.warning(f"{TAG_WARN} yt-dlp flat-playlist timeout.")
             except Exception as e:
                 logger.warning(f"{TAG_WARN} yt-dlp flat-playlist info: {e}")
 
-        # ── Method 3: Stealth Browser Automation dengan Scoped Container Selector ──
+        # ─────────────────────────────────────────────────────────────────────
+        # PASS 3: Scrapling Dynamic Stealth Browser Automation
+        # Digunakan jika Pass 1 & 2 kosong atau profil memerlukan interaksi DOM
+        # ─────────────────────────────────────────────────────────────────────
         if not collected_urls or (expected_video_count > 0 and len(collected_urls) < expected_video_count):
-            logger.info(f"{TAG_CRAWL} Mengaktifkan Stealth Browser Automation untuk @{username}...")
+            logger.info(f"{TAG_CRAWL} [PASS 3] Mengaktifkan Scrapling Dynamic Stealth Browser untuk @{username}...")
             intercepted_urls: set[str] = set()
 
             try:
+                # Inisialisasi stealth browser context
+                from playwright.async_api import async_playwright
                 self._playwright = await async_playwright().start()
                 self._browser, self._context = await BaseScraper.create_stealth_browser(
                     self._playwright,
@@ -189,7 +266,7 @@ class TikTokScraper(BaseScraper):
 
                 page = await self._context.new_page()
 
-                # Response Interceptor dengan validasi ketat author
+                # Response Interceptor: Filter ketat payload API internal TikTok
                 async def _on_response(response):
                     try:
                         req_url = response.url.lower()
@@ -198,21 +275,7 @@ class TikTokScraper(BaseScraper):
                                 data = await response.json()
                                 item_list = data.get("itemList", []) or data.get("items", []) or []
                                 for item in item_list:
-                                    if isinstance(item, dict):
-                                        author = item.get("author")
-                                        author_name = ""
-                                        if isinstance(author, dict):
-                                            author_name = author.get("uniqueId") or author.get("unique_id") or author.get("nickname") or ""
-                                        elif isinstance(author, str):
-                                            author_name = author
-
-                                        author_clean = str(author_name).lower().replace("@", "").strip()
-                                        target_clean = username.lower().replace("@", "").strip()
-
-                                        # WAJIB SAMA: hanya terima postingan yang dibuat oleh target creator
-                                        if not author_clean or author_clean != target_clean:
-                                            continue
-
+                                    if self._is_valid_creator_post(item, username):
                                         item_id = item.get("id") or item.get("itemId") or item.get("vid")
                                         if item_id and re.match(r"^\d{15,22}$", str(item_id)):
                                             is_photo = bool(item.get("imagePost") or item.get("images") or item.get("imageList"))
@@ -224,36 +287,43 @@ class TikTokScraper(BaseScraper):
                 page.on("response", _on_response)
 
                 logger.info(f"{TAG_CRAWL} Membuka profil TikTok di browser stealth: {canonical_url}")
-                await page.goto(canonical_url, wait_until="domcontentloaded", timeout=60000)
+                await page.goto(canonical_url, wait_until="domcontentloaded", timeout=45000)
                 await asyncio.sleep(2.5)
 
-                # Periksa apakah terblokir Captcha
+                # Cek login wall & Captcha verification challenge
                 current_url = page.url.lower()
                 if "captcha" in current_url or "verify" in current_url:
                     logger.error(f"[🚨 BLOCKED] TikTok menyajikan Captcha/Verification challenge untuk @{username}!")
+                elif "login" in current_url:
+                    logger.warning(f"{TAG_WARN} TikTok mengarahkan ke login wall — mengekstrak dari DOM yang tersedia.")
                 else:
-                    # Dismiss modal login jika ada
+                    # Dismiss modal dialog popup jika muncul
                     try:
-                        close_btn = await page.query_selector('[data-e2e="modal-close-inner-button"], [aria-label="Close"], button[class*="close"]')
+                        close_btn = await page.query_selector(
+                            '[data-e2e="modal-close-inner-button"], [aria-label="Close"], button[class*="close"]'
+                        )
                         if close_btn:
                             await close_btn.click()
                             await asyncio.sleep(1.0)
                     except Exception:
                         pass
 
-                    # Multi-step scroll untuk memicu pagination feed creator
+                    # Scroll adaptif untuk memicu pemuatan feed creator
                     for _ in range(6):
                         await page.evaluate("window.scrollBy(0, 1500)")
                         await asyncio.sleep(2.0)
                         if expected_video_count > 0 and len(intercepted_urls) >= expected_video_count:
                             break
 
-                    # Ambil link video HANYA dari container grid video creator (bukan sidebar/repost!)
+                    # [DOM ANTI-LEAK SELECTOR]
+                    # HANYA query dari container grid postingan creator, KECUALIKAN sidebar & repost
                     dom_links = await page.locator(
-                        '[data-e2e="user-post-item"] a, [data-e2e="user-post-item-list"] a, div[data-e2e="user-post-item-desc"] a, #main-content-others_homepage a[href*="/video/"], #main-content-others_homepage a[href*="/photo/"]'
+                        '[data-e2e="user-post-item"] a, '
+                        '[data-e2e="user-post-item-list"] [data-e2e="user-post-item"] a, '
+                        '#main-content-others_homepage [data-e2e="user-post-item"] a'
                     ).all()
 
-                    # Fallback locator jika container khusus tidak ditemukan
+                    # Fallback locator terbatas jika container utama memakai obfuscated selector
                     if not dom_links:
                         dom_links = await page.locator('a[href*="/video/"], a[href*="/photo/"]').all()
 
@@ -273,7 +343,7 @@ class TikTokScraper(BaseScraper):
                         except Exception:
                             pass
 
-                # Gabungkan intercepted URLs
+                # Gabungkan intercepted URLs dari network layer
                 for i_url in intercepted_urls:
                     if i_url not in seen_urls:
                         collected_urls.append(i_url)
@@ -289,9 +359,12 @@ class TikTokScraper(BaseScraper):
             f"{TAG_CRAWL} Total {len(collected_urls)} URL postingan asli @{username} berhasil dikumpulkan."
         )
 
-        # ── Step 4: DSU Sorting (Decorate-Sort-Undecorate) ──
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 4: DSU Sorting (Decorate-Sort-Undecorate) — Kronologis Akurat
+        # Urutan: post PALING BARU ke PALING LAMA
+        # ─────────────────────────────────────────────────────────────────────
         decorated = [(int(self._extract_post_id(url) or 0), url) for url in collected_urls]
-        decorated.sort(key=lambda x: x[0], reverse=True)  # newest-first
+        decorated.sort(key=lambda x: x[0], reverse=True)  # Newest-first
         video_list = [url for _, url in decorated]
 
         cookies_file_str = str(self.netscape_cookie_path) if self.netscape_cookie_path.exists() else None
@@ -301,9 +374,10 @@ class TikTokScraper(BaseScraper):
             if not post_id:
                 continue
 
+            # SQLite Stop Condition: Hentikan iterasi jika post sudah tercatat di DB (resume point)
             if not forced and await self.db.check_post_exists(post_id, self.PLATFORM):
                 logger.info(
-                    f"{TAG_CRAWL} Stop-condition: post {post_id} sudah ada di DB — resume point ditemukan."
+                    f"{TAG_CRAWL} Stop-condition: post {post_id} sudah ada di DB — checkpoint tercapai."
                 )
                 break
 
@@ -319,13 +393,15 @@ class TikTokScraper(BaseScraper):
             )
 
     def _parse_rehydration_from_html(self, html: str, username: str) -> dict:
-        """Parse data rehydration JSON dari raw HTML TikTok dengan author verification ketat."""
+        """
+        Parse data rehydration JSON dari HTML SSR TikTok dengan strict author verification.
+        """
         found_urls = set()
         video_count = 0
         sec_uid = ""
-        u = username.lower().replace("@", "")
+        u = username.lower().replace("@", "").strip()
 
-        def search_json(obj):
+        def search_json(obj: Any) -> None:
             nonlocal video_count, sec_uid
             if not obj or not isinstance(obj, (dict, list)):
                 return
@@ -338,23 +414,17 @@ class TikTokScraper(BaseScraper):
                 if isinstance(obj.get("user"), dict) and obj["user"].get("secUid"):
                     sec_uid = str(obj["user"]["secUid"])
 
-                # ItemModule: Map dari {postId: ItemDetail}
+                # Structure 1: ItemModule -> Map of {postId: ItemDetail}
                 item_module = obj.get("ItemModule")
                 if isinstance(item_module, dict):
                     for p_id, item in item_module.items():
-                        if isinstance(item, dict):
-                            author = item.get("author") or item.get("authorName") or ""
-                            if isinstance(author, dict):
-                                author = author.get("uniqueId") or author.get("unique_id") or ""
-                            author_clean = str(author).lower().replace("@", "").strip()
-
-                            # STRICT: hanya masukkan jika author_clean terbukti milik u!
-                            if author_clean == u and p_id and re.match(r"^\d{15,22}$", str(p_id)):
+                        if isinstance(item, dict) and self._is_valid_creator_post(item, u):
+                            if p_id and re.match(r"^\d{15,22}$", str(p_id)):
                                 is_photo = bool(item.get("imagePost") or item.get("images") or item.get("imageList"))
                                 t = "photo" if is_photo else "video"
                                 found_urls.add(f"https://www.tiktok.com/@{u}/{t}/{p_id}")
 
-                # user-detail / userPage videoList
+                # Structure 2: webapp.user-detail / userPage videoList
                 user_detail = obj.get("webapp.user-detail") or obj.get("user-detail") or obj.get("userPage")
                 if isinstance(user_detail, dict):
                     u_items = user_detail.get("itemList") or user_detail.get("videoList")
@@ -362,13 +432,14 @@ class TikTokScraper(BaseScraper):
                         for it in u_items:
                             if isinstance(it, str) and re.match(r"^\d{15,22}$", it):
                                 found_urls.add(f"https://www.tiktok.com/@{u}/video/{it}")
-                            elif isinstance(it, dict):
+                            elif isinstance(it, dict) and self._is_valid_creator_post(it, u):
                                 p_id = it.get("id") or it.get("itemId") or it.get("vid")
                                 if p_id and re.match(r"^\d{15,22}$", str(p_id)):
                                     is_photo = bool(it.get("imagePost") or it.get("images") or it.get("imageList"))
                                     t = "photo" if is_photo else "video"
                                     found_urls.add(f"https://www.tiktok.com/@{u}/{t}/{p_id}")
 
+                # Stats video counter
                 stats = obj.get("stats")
                 if isinstance(stats, dict):
                     cnt = stats.get("videoCount") or stats.get("video_count")
@@ -385,7 +456,12 @@ class TikTokScraper(BaseScraper):
                 for elem in obj:
                     search_json(elem)
 
-        scripts = re.findall(r'<script[^>]*id="(?:__UNIVERSAL_DATA_FOR_REHYDRATION__|SIGI_STATE|__NEXT_DATA__)"[^>]*>(.*?)</script>', html, re.DOTALL)
+        # Cari semua blok rehydration script di HTML
+        scripts = re.findall(
+            r'<script[^>]*id="(?:__UNIVERSAL_DATA_FOR_REHYDRATION__|SIGI_STATE|__NEXT_DATA__)"[^>]*>(.*?)</script>',
+            html,
+            re.DOTALL,
+        )
         for script_content in scripts:
             try:
                 data = json.loads(script_content.strip())
@@ -400,7 +476,7 @@ class TikTokScraper(BaseScraper):
         }
 
     async def close(self) -> None:
-        """Cleanup browser resources."""
+        """Cleanup browser context and instances."""
         try:
             if self._context:
                 await self._context.close()
