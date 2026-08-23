@@ -2,12 +2,12 @@
 scrapers/instagram.py
 Scraper profil Instagram menggunakan Built-in Stealth Browser + Subprocess Fallback (gallery-dl / yt-dlp).
 
-Fitur & Keamanan:
+Fitur & Keamanan Linux/Debian Headless:
 1. Proactive Authentication Check: Validasi keberadaan cookie `sessionid` sebelum navigasi.
 2. Early Abort Login Wall: Jika terdeteksi redirect ke /accounts/login/ atau /challenge/, bot langsung berhenti scrolling halaman kosong dan beralih ke fallback extractor.
-3. Fallback Subprocess Extractor (gallery-dl / yt-dlp): Mengambil postingan akun publik tanpa bergantung pada browser yang terblokir.
+3. Fallback Subprocess Extractor (gallery-dl / yt-dlp): Mengambil postingan akun publik tanpa bergantung pada browser yang terblokir (dengan proteksi timeout & anti-zombie subprocess).
 4. Dual-Tab Crawling: Feed utama (/username/) lalu tab Reels (/username/reels/).
-5. DSU (Decorate-Sort-Undecorate) sorting untuk kronologi postingan yang presisi (terbaru ke terlama).
+5. DSU (Decorate-Sort-Undecorate) sorting untuk kronologi postingan yang presisi (oldest-first ke downstream).
 6. Smart stop-condition: berhenti saat menemukan postingan yang sudah ada di SQLite.
 """
 
@@ -141,6 +141,17 @@ class InstagramScraper(BaseScraper):
             try:
                 await page.goto(canonical_url, wait_until="domcontentloaded", timeout=45000)
                 await asyncio.sleep(random.uniform(2.0, 3.5))
+
+                # Dismiss dialog modal login banner jika ada
+                try:
+                    close_btn = await page.query_selector(
+                        'button:has-text("Not Now"), button:has-text("Lain Kali"), [aria-label="Close"], [aria-label="Tutup"]'
+                    )
+                    if close_btn:
+                        await close_btn.click()
+                        await asyncio.sleep(1.0)
+                except Exception:
+                    pass
 
                 # Early Abort Login Wall Check
                 current_url = page.url.lower()
@@ -295,11 +306,11 @@ class InstagramScraper(BaseScraper):
                     all_post_objects.append(post_data)
 
             # ──────────────────────────────────────────
-            # TAHAP 4: Urutkan Kronologis (Terbaru ke Terlama)
+            # TAHAP 4: Urutkan Kronologis (Oldest-First ke Downstream)
             # ──────────────────────────────────────────
             all_post_objects.sort(
                 key=lambda x: str(x.timestamp) if x.timestamp else "1970-01-01T00:00:00.000Z",
-                reverse=True,
+                reverse=False,
             )
 
             logger.info(f"[⚙️ SYSTEM] Mengirim {len(all_post_objects)} post Instagram ke downstream pipeline...")
@@ -313,7 +324,7 @@ class InstagramScraper(BaseScraper):
             await self.close()
 
     async def _fetch_via_gallery_dl(self, url: str) -> list[str]:
-        """Fallback ekstraksi URL postingan via gallery-dl subprocess."""
+        """Fallback ekstraksi URL postingan via gallery-dl subprocess dengan anti-zombie safety guard."""
         found_urls: list[str] = []
         try:
             cmd = ["gallery-dl", "--dump-json", "--range", "1-20", url]
@@ -325,27 +336,32 @@ class InstagramScraper(BaseScraper):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-            if proc.returncode == 0 and stdout:
-                for line in stdout.decode("utf-8", errors="ignore").splitlines():
-                    try:
-                        data = json.loads(line.strip())
-                        if isinstance(data, list) and len(data) >= 2 and isinstance(data[1], dict):
-                            shortcode = data[1].get("shortcode")
-                            if shortcode:
-                                found_urls.append(f"https://www.instagram.com/p/{shortcode}/")
-                        elif isinstance(data, dict):
-                            shortcode = data.get("shortcode") or data.get("code")
-                            if shortcode:
-                                found_urls.append(f"https://www.instagram.com/p/{shortcode}/")
-                    except Exception:
-                        pass
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+                if proc.returncode == 0 and stdout:
+                    for line in stdout.decode("utf-8", errors="ignore").splitlines():
+                        try:
+                            data = json.loads(line.strip())
+                            if isinstance(data, list) and len(data) >= 2 and isinstance(data[1], dict):
+                                shortcode = data[1].get("shortcode")
+                                if shortcode:
+                                    found_urls.append(f"https://www.instagram.com/p/{shortcode}/")
+                            elif isinstance(data, dict):
+                                shortcode = data.get("shortcode") or data.get("code")
+                                if shortcode:
+                                    found_urls.append(f"https://www.instagram.com/p/{shortcode}/")
+                        except Exception:
+                            pass
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.warning(f"{TAG_WARN} gallery-dl subprocess timeout dibatalkan.")
         except Exception as e:
             logger.debug(f"gallery-dl fallback error: {e}")
         return list(dict.fromkeys(found_urls))
 
     async def _fetch_via_ytdlp_flat(self, url: str) -> list[str]:
-        """Fallback ekstraksi URL postingan via yt-dlp flat playlist."""
+        """Fallback ekstraksi URL postingan via yt-dlp flat playlist dengan anti-zombie safety guard."""
         found_urls: list[str] = []
         try:
             cmd = ["yt-dlp", "--flat-playlist", "--dump-json", "--no-warnings", url]
@@ -357,16 +373,21 @@ class InstagramScraper(BaseScraper):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-            if proc.returncode == 0 and stdout:
-                for line in stdout.decode("utf-8", errors="ignore").splitlines():
-                    try:
-                        data = json.loads(line.strip())
-                        p_url = data.get("url") or data.get("webpage_url")
-                        if p_url and ("/p/" in p_url or "/reel/" in p_url):
-                            found_urls.append(p_url.split("?")[0])
-                    except Exception:
-                        pass
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+                if proc.returncode == 0 and stdout:
+                    for line in stdout.decode("utf-8", errors="ignore").splitlines():
+                        try:
+                            data = json.loads(line.strip())
+                            p_url = data.get("url") or data.get("webpage_url")
+                            if p_url and ("/p/" in p_url or "/reel/" in p_url):
+                                found_urls.append(p_url.split("?")[0])
+                        except Exception:
+                            pass
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.warning(f"{TAG_WARN} yt-dlp subprocess timeout dibatalkan.")
         except Exception as e:
             logger.debug(f"yt-dlp flat-playlist error: {e}")
         return list(dict.fromkeys(found_urls))
