@@ -1115,8 +1115,11 @@ class MediaScraperBot(commands.Bot):
                 async for post in scraper.scrape_profile(profile_url, forced=forced):
                     all_scraped.append(post)
 
-            # Jika scraper disetop karena browser/cookie initialization failure
-            if scraper.failed:
+            # Jika scraper disetop karena browser/cookie initialization failure atau terhalang Captcha
+            if scraper.failed or getattr(scraper, "blocked_by_challenge", False):
+                logger.warning(
+                    f"{tag} @{username} ({platform}) scraping tidak berhasil (failure/challenge) — membatalkan status selesai untuk dicoba ulang di siklus berikutnya."
+                )
                 return False
 
             if not all_scraped:
