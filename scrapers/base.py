@@ -149,10 +149,16 @@ class BaseScraper(ABC):
     @staticmethod
     def has_auth_configured(platform: str) -> bool:
         """
-        Pre-flight check: apakah platform ini punya auth yang valid?
-        Cek .env token ATAU JSON cookie file.
+        Pre-flight check: apakah platform ini punya auth yang valid atau didukung mode guest/public?
+        - Instagram & TikTok: 100% Guest Mode (Zero-Login) didukung tanpa perlu token/cookie.
+        - Twitter / lainnya: Cek token .env atau file cookie di sessions/.
         """
-        token_specs = BaseScraper.ENV_TOKEN_MAP.get(platform, [])
+        p = platform.lower().strip()
+        # TikTok & Instagram berjalan 100% dalam mode publik/guest tanpa perlu cookie login
+        if p in ("tiktok", "instagram"):
+            return True
+
+        token_specs = BaseScraper.ENV_TOKEN_MAP.get(p, [])
         if token_specs:
             all_present = all(os.getenv(spec["env_key"]) for spec in token_specs)
             if all_present:
@@ -161,13 +167,13 @@ class BaseScraper(ABC):
         # Cek 2: Cookie files di sessions/ atau COOKIE_DIR
         cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "sessions"))
         cookie_candidates = [
-            cookie_dir / f"{platform}.json",
-            cookie_dir / f"{platform}.txt",
-            cookie_dir / f"cookies_{platform}.json",
-            Path.cwd() / "sessions" / f"{platform}.json",
-            Path.cwd() / "sessions" / f"{platform}.txt",
-            Path.cwd() / "sessions" / f"cookies_{platform}.json",
-            Path.cwd() / "config" / "cookies" / f"{platform}.json",
+            cookie_dir / f"{p}.json",
+            cookie_dir / f"{p}.txt",
+            cookie_dir / f"cookies_{p}.json",
+            Path.cwd() / "sessions" / f"{p}.json",
+            Path.cwd() / "sessions" / f"{p}.txt",
+            Path.cwd() / "sessions" / f"cookies_{p}.json",
+            Path.cwd() / "config" / "cookies" / f"{p}.json",
         ]
         for candidate in cookie_candidates:
             if candidate.exists() and candidate.stat().st_size > 0:

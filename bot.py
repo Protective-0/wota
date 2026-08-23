@@ -1086,12 +1086,11 @@ class MediaScraperBot(commands.Bot):
             )
             return False
 
-        # Pre-flight: cek apakah auth tersedia (.env token ATAU JSON cookie)
+        # Pre-flight check: TikTok & Instagram berjalan dalam Guest Mode murni
         if not BaseScraper.has_auth_configured(platform):
-            logger.error(
-                f"{TAG_ERROR} Tidak ada autentikasi untuk {platform}! Skip @{username}."
+            logger.warning(
+                f"[⚠️ WARN  ] Tidak ada session cookies untuk {platform} — melanjutkan dengan Guest Mode (Zero-Login)..."
             )
-            return False
 
         # Acquire lock agar tidak bertabrakan dengan manual trigger atau patrol lainnya
         if wait_for_queue:
@@ -1321,17 +1320,11 @@ class MediaScraperBot(commands.Bot):
 
         sender = MediaSender(channel=cast(Any, target_channel), downloader=self.downloader)
 
-        # Pre-flight: cek apakah auth tersedia (.env token ATAU JSON cookie)
+        # Pre-flight check: TikTok & Instagram berjalan dalam Guest Mode murni
         if not BaseScraper.has_auth_configured(platform):
-            logger.error(
-                f"[❌ ERROR  ] Tidak ada autentikasi untuk {platform}! Melewati pipeline..."
+            logger.warning(
+                f"[⚠️ WARN  ] Tidak ada session cookies untuk {platform} — menggunakan Guest Mode (Zero-Login)..."
             )
-            await sender.send_text(
-                f"❌ **Error:** Tidak ada autentikasi untuk **{platform}**. "
-                f"Isi session token di `.env` atau taruh file `{platform}.json` di folder `sessions/`."
-            )
-            self.queue.release()
-            return
         try:
             await sender.send_text(
                 f"🚀 Memulai scraping profil **{platform.capitalize()}**...\n"
