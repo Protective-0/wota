@@ -1,23 +1,21 @@
 """
 scrapers/tiktok.py
-Engine Scraper Profil TikTok terintegrasi Scrapling Anti-Bot Stealth Engine & Multi-Tier Fallback.
+Engine Scraper Profil TikTok terintegrasi Scrapling Anti-Bot Stealth Engine, Dual-Endpoint Fallback & Pure Guest Mode.
 
 Fitur & Keamanan:
 1. Pure Guest Mode (Zero-Login):
-   - Tidak menyuntikkan cookie penonton pada crawling profil untuk mencegah TikTok mengontaminasi feed/DOM dengan repost viewer atau memicu bot flags.
+   - Tidak menyuntikkan cookie akun pribadi saat crawling profil agar tidak memicu security challenge atau "Something went wrong".
 2. Scrapling TLS Engine:
-   - Integrasi `scrapling.AsyncFetcher` dengan TLS Chrome Impersonation (`chrome124`) untuk bypass proteksi anti-bot WAF.
-3. Mobile URL Fallback:
-   - Fallback otomatis ke format URL mobile (`https://m.tiktok.com/@{username}`) jika halaman desktop menampilkan "Something went wrong" atau captcha challenge.
-4. Strict Author Filtering:
+   - Integrasi `scrapling.fetchers.AsyncFetcher` dengan TLS Chrome Impersonation (`chrome124`) untuk bypass proteksi anti-bot WAF.
+3. Dual-Endpoint Fallback:
+   - Mencoba endpoint desktop (https://www.tiktok.com/@username) dan otomatis fallback ke mobile endpoint (https://m.tiktok.com/@username) jika terdeteksi blokir atau empty feed.
+4. Strict Author Verification:
    - Validasi ketat `author.uniqueId == target_username`.
    - Mengabaikan postingan dari tab Repost, Likes, maupun sidebar video recommendation.
-5. Dual-Pass & Subprocess Fallback:
-   - Pass 1 (Fast Pass): Ekstraksi Rehydration JSON SSR via Scrapling AsyncFetcher (Desktop & Mobile endpoint).
-   - Pass 2 (yt-dlp Flat-Playlist): Fallback ekstraksi playlist metadata dengan author check ketat.
-   - Pass 3 (Dynamic Stealth Pass): Browser automation dengan container selector spesifik ([data-e2e="user-post-item"]).
-6. DSU (Decorate-Sort-Undecorate) sorting untuk kronologi postingan yang presisi (terbaru ke terlama).
-7. SQLite stop-condition untuk efisiensi patroli (resume checkpoint).
+5. Chronological DSU Sorting:
+   - Stop-condition evaluation pada postingan terbaru, lalu yield ke downstream secara kronologis (oldest-first).
+6. SQLite Stop-Condition:
+   - Mencegah redundant crawl dengan checkpoint database lokal.
 """
 
 import asyncio
@@ -58,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 class TikTokScraper(BaseScraper):
     """
-    Scraper profil TikTok berbasis Scrapling Anti-Bot Engine dengan strict author filtering dan mobile fallback.
+    Scraper profil TikTok berbasis Scrapling Anti-Bot Engine dengan strict author filtering dan pure guest mode.
     """
 
     PLATFORM = "tiktok"
@@ -135,14 +133,13 @@ class TikTokScraper(BaseScraper):
 
         collected_urls: list[str] = []
         seen_urls: set[str] = set()
-
         expected_video_count = 0
 
         # ─────────────────────────────────────────────────────────────────────
         # PASS 1 (PRIMARY): Scrapling AsyncFetcher — Fast SSR Rehydration Parser
-        # Bypass WAF via TLS Chrome Impersonation tanpa browser overhead (Desktop & Mobile Fallback)
+        # Dual-Endpoint: Coba desktop dulu, jika error "Something went wrong", coba mobile
         # ─────────────────────────────────────────────────────────────────────
-        logger.info(f"{TAG_CRAWL} [PASS 1] Menjalankan Scrapling Fast SSR Rehydration untuk @{username}...")
+        logger.info(f"{TAG_CRAWL} [PASS 1] Menjalankan Scrapling Fast SSR Rehydration untuk @{username} (Guest Mode)...")
         headers = {
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -150,16 +147,16 @@ class TikTokScraper(BaseScraper):
             "Referer": "https://www.tiktok.com/",
         }
 
-        # Coba endpoint desktop dulu, jika gagal coba endpoint mobile
-        target_fetch_urls = [canonical_url, mobile_url]
+        target_endpoints = [canonical_url, mobile_url]
 
-        for target_url in target_fetch_urls:
+        for target_url in target_endpoints:
             if collected_urls:
                 break
             try:
                 html_text = ""
                 if HAS_SCRAPLING:
                     try:
+                        # Scrapling AsyncFetcher dengan TLS Chrome Impersonation
                         response = await AsyncFetcher.get(
                             target_url,
                             headers=headers,
@@ -168,12 +165,11 @@ class TikTokScraper(BaseScraper):
                         )
                         if response.status == 200:
                             html_text = response.text
-                            # Cek error message "Something went wrong" pada HTML
                             if "Something went wrong" in html_text or "verify-center" in html_text:
                                 logger.warning(f"{TAG_WARN} TikTok mengembalikan 'Something went wrong' pada {target_url}")
                                 html_text = ""
                     except Exception as sc_err:
-                        logger.debug(f"Scrapling AsyncFetcher ({target_url}) error: {sc_err}")
+                        logger.debug(f"Scrapling AsyncFetcher note ({target_url}): {sc_err}")
 
                 if not html_text:
                     async with httpx.AsyncClient(
@@ -201,7 +197,7 @@ class TikTokScraper(BaseScraper):
                             seen_urls.add(r_url)
 
                     if collected_urls:
-                        logger.info(f"{TAG_CRAWL} [PASS 1] Fast Pass berhasil menemukan {len(collected_urls)} post asli @{username}.")
+                        logger.info(f"{TAG_CRAWL} [PASS 1] Fast Pass ({target_url}) berhasil menemukan {len(collected_urls)} post asli @{username}.")
             except Exception as e:
                 logger.debug(f"Fast HTTP Rehydration info ({target_url}): {e}")
 
@@ -256,11 +252,11 @@ class TikTokScraper(BaseScraper):
                 logger.warning(f"{TAG_WARN} yt-dlp flat-playlist info: {e}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 3: Scrapling Dynamic Stealth Browser Automation
+        # PASS 3: Scrapling Dynamic Stealth Browser Automation (Pure Guest Mode)
         # Digunakan jika Pass 1 & 2 kosong atau profil memerlukan interaksi DOM
         # ─────────────────────────────────────────────────────────────────────
         if not collected_urls or (expected_video_count > 0 and len(collected_urls) < expected_video_count):
-            logger.info(f"{TAG_CRAWL} [PASS 3] Mengaktifkan Scrapling Dynamic Stealth Browser untuk @{username}...")
+            logger.info(f"{TAG_CRAWL} [PASS 3] Mengaktifkan Scrapling Dynamic Stealth Browser untuk @{username} (Guest Mode)...")
             intercepted_urls: set[str] = set()
 
             try:
@@ -369,16 +365,15 @@ class TikTokScraper(BaseScraper):
         )
 
         # ─────────────────────────────────────────────────────────────────────
-        # STEP 4: DSU Sorting (Decorate-Sort-Undecorate) — Kronologis Akurat
-        # Urutan: post PALING BARU ke PALING LAMA
+        # STEP 4: DSU Sorting (Decorate-Sort-Undecorate) & SQLite Stop Condition
+        # Urutan Evaluasi: Post PALING BARU ke PALING LAMA untuk stop-condition DB
+        # Urutan Yield ke Downstream: KRONOLOGIS (PALING LAMA ke PALING BARU)
         # ─────────────────────────────────────────────────────────────────────
         decorated = [(int(self._extract_post_id(url) or 0), url) for url in collected_urls]
-        decorated.sort(key=lambda x: x[0], reverse=True)  # Newest-first
-        video_list = [url for _, url in decorated]
+        decorated.sort(key=lambda x: x[0], reverse=True)  # Newest-first for DB checkpoint check
 
-        cookies_file_str = str(self.netscape_cookie_path) if self.netscape_cookie_path.exists() else None
-
-        for post_url in video_list:
+        pending_posts: list[tuple[int, str]] = []
+        for post_id_num, post_url in decorated:
             post_id = self._extract_post_id(post_url)
             if not post_id:
                 continue
@@ -390,6 +385,17 @@ class TikTokScraper(BaseScraper):
                 )
                 break
 
+            pending_posts.append((post_id_num, post_url))
+
+        # Re-sort ke kronologis tertib (oldest-first) untuk pengiriman teratur ke Discord
+        pending_posts.sort(key=lambda x: x[0], reverse=False)
+
+        cookies_file_str = str(self.netscape_cookie_path) if self.netscape_cookie_path.exists() else None
+
+        for _, post_url in pending_posts:
+            post_id = self._extract_post_id(post_url)
+            if not post_id:
+                continue
             media_type = MediaType.PHOTO if "/photo/" in post_url else MediaType.VIDEO
 
             yield PostMedia(
