@@ -1,10 +1,29 @@
+"""
+scrapers/tiktok.py
+Engine Scraper Profil TikTok 100% Guest Mode (Zero-Login) murni berbasis Multi-Tier API-First Architecture.
+
+Arsitektur & Keamanan:
+1. 100% Zero-Browser (No-Playwright for Profile Crawling):
+   - Sepenuhnya bebas dari browser Playwright headless untuk mencegah deteksi bot WAF / Captcha di Linux server.
+2. Multi-Tier API-First Architecture:
+   - Pass 0 (Primary): TikWM User Posts API (Fast, no-auth, JSON response langsung).
+   - Pass 1: Scrapling / curl_cffi Chrome124 Fast SSR Rehydration Parser.
+   - Pass 2: yt-dlp Flat-Playlist dengan Mobile API extractor args.
+3. Strict Author Verification:
+   - Validasi ketat author UID dan format URL agar postingan Repost, Likes, maupun Feed Recommendation tidak ikut terambil.
+4. Chronological DSU Delivery:
+   - Stop-condition evaluation pada post terbaru ke terlama di SQLite, lalu yield ke downstream secara kronologis (oldest-first).
+5. Abort Guard:
+   - Jika semua layer API gagal, scraper menandai `failed = True` dan `blocked_by_challenge = True` agar tidak menandai scan selesai palsu.
+"""
+
 import asyncio
 import json
 import logging
 import os
 import re
 from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Any
 import httpx
 
 from .base import BaseScraper, MediaType, PostMedia, USER_AGENT
@@ -21,8 +40,7 @@ logger = logging.getLogger(__name__)
 
 class TikTokScraper(BaseScraper):
     """
-    Scraper profil TikTok Zero-Login dengan pendekatan API-First (Zero-Browser).
-    Dilengkapi Strict Author URL Validation untuk mencegah kebocoran link rekomendasi/sidebar akun lain.
+    Scraper profil TikTok Zero-Login murni berbasis API-First tanpa browser Playwright.
     """
 
     PLATFORM = "tiktok"
@@ -37,6 +55,7 @@ class TikTokScraper(BaseScraper):
         self.blocked_by_challenge = False
 
     def _extract_username(self, url: str) -> Optional[str]:
+        """Ekstrak clean username dari berbagai variasi format URL TikTok."""
         match = re.search(r"@([a-zA-Z0-9_\.\-]+)", url)
         if match:
             return match.group(1).lower().strip()
@@ -46,6 +65,7 @@ class TikTokScraper(BaseScraper):
         return cleaned.lower().strip() if cleaned else None
 
     def _extract_post_id(self, url: str) -> Optional[str]:
+        """Ekstrak numeric ID postingan TikTok dari URL."""
         match = re.search(r"/(?:video|photo|v)/(\d{15,22})", url)
         return match.group(1) if match else None
 
@@ -71,6 +91,9 @@ class TikTokScraper(BaseScraper):
         profile_url: str,
         forced: bool = False,
     ) -> AsyncGenerator[PostMedia, None]:
+        """
+        Crawl profil TikTok secara 100% Guest Mode (Zero-Login & Zero-Browser) berbasis API-First.
+        """
         self.failed = False
         self.blocked_by_challenge = False
 
@@ -80,12 +103,14 @@ class TikTokScraper(BaseScraper):
             return
 
         canonical_url = f"https://www.tiktok.com/@{username}"
-        logger.info(f"{TAG_CRAWL} Memulai scraping profil @{username} (tiktok, Zero-Login Mode): {canonical_url}")
+        logger.info(f"{TAG_CRAWL} Memulai scraping profil @{username} (tiktok, Zero-Login API-First Mode): {canonical_url}")
 
         collected_urls: list[str] = []
         seen_urls: set[str] = set()
 
-        # ── Pass 0 (Primary): TikWM User Posts API ────────────────────────────
+        # ─────────────────────────────────────────────────────────────────────
+        # PASS 0 (PRIMARY): TikWM User Posts API (No Browser Overhead)
+        # ─────────────────────────────────────────────────────────────────────
         logger.info(f"{TAG_CRAWL} [PASS 0] Menjalankan TikWM User Posts API untuk @{username}...")
         try:
             api_url = f"https://www.tikwm.com/api/user/posts?unique_id={username}&count=50"
@@ -135,7 +160,9 @@ class TikTokScraper(BaseScraper):
         except Exception as e:
             logger.debug(f"[PASS 0] TikWM API info: {e}")
 
-        # ── Pass 1: Scrapling / curl_cffi SSR Rehydration ────────────────────
+        # ─────────────────────────────────────────────────────────────────────
+        # PASS 1: Scrapling / curl_cffi Fast SSR Rehydration
+        # ─────────────────────────────────────────────────────────────────────
         if not collected_urls:
             logger.info(f"{TAG_CRAWL} [PASS 1] Menjalankan Scrapling Fast SSR Rehydration untuk @{username}...")
             try:
@@ -177,7 +204,9 @@ class TikTokScraper(BaseScraper):
             except Exception as e:
                 logger.debug(f"[PASS 1] SSR error: {e}")
 
-        # ── Pass 2: yt-dlp flat-playlist ─────────────────────────────────────
+        # ─────────────────────────────────────────────────────────────────────
+        # PASS 2: yt-dlp Flat-Playlist (Mobile API Mode)
+        # ─────────────────────────────────────────────────────────────────────
         if not collected_urls:
             logger.info(f"{TAG_CRAWL} [PASS 2] Mencoba ekstraksi postingan @{username} via yt-dlp flat-playlist...")
             try:
@@ -218,6 +247,9 @@ class TikTokScraper(BaseScraper):
             except Exception as e:
                 logger.debug(f"[PASS 2] yt-dlp error: {e}")
 
+        # ─────────────────────────────────────────────────────────────────────
+        # ABORT GUARD: Jika Semua Layer API Gagal
+        # ─────────────────────────────────────────────────────────────────────
         if not collected_urls:
             logger.warning(
                 f"{TAG_WARN} @{username} (tiktok) scraping tidak berhasil (semua pass API/HTTP kosong) — "
@@ -229,7 +261,9 @@ class TikTokScraper(BaseScraper):
 
         logger.info(f"{TAG_CRAWL} Total {len(collected_urls)} URL postingan asli @{username} berhasil dikumpulkan.")
 
-        # ── DSU Sorting: Urutkan dari TERLAMA ke TERBARU (Oldest to Newest) ──
+        # ─────────────────────────────────────────────────────────────────────
+        # DSU Sorting: Urutkan dari TERLAMA ke TERBARU (Oldest to Newest)
+        # ─────────────────────────────────────────────────────────────────────
         decorated = [(int(self._extract_post_id(url) or 0), url) for url in collected_urls]
         decorated.sort(key=lambda x: x[0], reverse=False)
         sorted_post_urls = [url for _, url in decorated]
@@ -257,10 +291,13 @@ class TikTokScraper(BaseScraper):
             )
 
     def _parse_rehydration_from_html(self, html: str, username: str) -> list[str]:
+        """
+        Parse data rehydration JSON dari HTML SSR TikTok dengan strict author verification.
+        """
         found_urls = set()
         u = username.lower().replace("@", "").strip()
 
-        def search_json(obj):
+        def search_json(obj: Any) -> None:
             if not obj or not isinstance(obj, (dict, list)):
                 return
             if isinstance(obj, dict):
@@ -324,4 +361,5 @@ class TikTokScraper(BaseScraper):
         return list(found_urls)
 
     async def close(self) -> None:
+        """Cleanup handler (no-op karena zero-browser architecture)."""
         pass
