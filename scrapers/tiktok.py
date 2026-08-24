@@ -144,7 +144,7 @@ class TikTokScraper(BaseScraper):
             # Gunakan tab aktif default (Tab 0) dari persistent context agar tidak membuat background tab
             page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 
-            # Network Interceptor: Tangkap payload internal TikTok saat dimuat
+            # Network Interceptor: Tangkap payload internal TikTok saat dimuat dengan verifikasi author ketat
             async def _on_page_response(resp):
                 r_url = resp.url
                 if any(k in r_url for k in ("item_list", "/api/post", "aweme/v1", "user/detail", "item/detail")) and resp.status == 200:
@@ -154,6 +154,15 @@ class TikTokScraper(BaseScraper):
                             items = data.get("itemList", []) or data.get("items", []) or data.get("aweme_list", []) or []
                             for item in items:
                                 if isinstance(item, dict):
+                                    author_info = item.get("author") or {}
+                                    author_uid = (
+                                        author_info.get("uniqueId")
+                                        or author_info.get("unique_id")
+                                        or (author_info if isinstance(author_info, str) else "")
+                                    )
+                                    if author_uid and str(author_uid).lower().replace("@", "").strip() != username:
+                                        continue
+
                                     v_id = str(item.get("id") or item.get("aweme_id") or item.get("itemId") or "")
                                     if v_id and re.match(r"^\d{15,22}$", v_id):
                                         is_photo = bool(item.get("imagePost") or item.get("images"))
@@ -226,12 +235,12 @@ class TikTokScraper(BaseScraper):
                 except Exception:
                     pass
 
-                # 3. Fallback regex dari full HTML DOM
+                # 3. Fallback regex dari full HTML DOM (hanya mencocokkan pola author target)
                 if not collected_urls:
                     try:
                         page_content = await page.content()
                         u_clean = username.lower().replace("@", "").strip()
-                        matched_ids = set(re.findall(rf'(?:tiktok\.com/@{u_clean}/(?:video|photo|v)/|/(?:video|photo|v)/)(\d{{15,22}})', page_content.lower()))
+                        matched_ids = set(re.findall(rf'tiktok\.com/@{u_clean}/(?:video|photo|v)/(\d{{15,22}})', page_content.lower()))
                         for mid in matched_ids:
                             cand_url = f"https://www.tiktok.com/@{username}/video/{mid}"
                             if self._is_valid_author_post_url(cand_url, username) and cand_url not in seen_urls:
@@ -507,24 +516,32 @@ class TikTokScraper(BaseScraper):
 
                 user_detail = obj.get("webapp.user-detail") or obj.get("user-detail") or obj.get("userPage")
                 if isinstance(user_detail, dict):
-                    u_items = user_detail.get("itemList") or user_detail.get("videoList")
-                    if isinstance(u_items, list):
-                        for it in u_items:
-                            if isinstance(it, str) and re.match(r"^\d{15,22}$", it):
-                                p_url = f"https://www.tiktok.com/@{u}/video/{it}"
-                                if self._is_valid_author_post_url(p_url, u):
-                                    found_urls.add(p_url)
-                            elif isinstance(it, dict):
-                                a_info = it.get("author") or {}
-                                a_uid = a_info.get("uniqueId") or a_info.get("unique_id") if isinstance(a_info, dict) else str(a_info)
-                                if str(a_uid).lower().replace("@", "").strip() == u:
-                                    p_id = it.get("id") or it.get("itemId") or it.get("vid")
-                                    if p_id and re.match(r"^\d{15,22}$", str(p_id)):
-                                        is_photo = bool(it.get("imagePost") or it.get("images"))
-                                        t = "photo" if is_photo else "video"
-                                        p_url = f"https://www.tiktok.com/@{u}/{t}/{p_id}"
-                                        if self._is_valid_author_post_url(p_url, u):
-                                            found_urls.add(p_url)
+                    user_info = user_detail.get("userInfo") or user_detail.get("user") or {}
+                    u_uid = (
+                        user_info.get("user", {}).get("uniqueId")
+                        or user_info.get("uniqueId")
+                        or user_info.get("unique_id")
+                        or ""
+                    ) if isinstance(user_info, dict) else str(user_info)
+                    if not u_uid or str(u_uid).lower().replace("@", "").strip() == u:
+                        u_items = user_detail.get("itemList") or user_detail.get("videoList")
+                        if isinstance(u_items, list):
+                            for it in u_items:
+                                if isinstance(it, str) and re.match(r"^\d{15,22}$", it):
+                                    p_url = f"https://www.tiktok.com/@{u}/video/{it}"
+                                    if self._is_valid_author_post_url(p_url, u):
+                                        found_urls.add(p_url)
+                                elif isinstance(it, dict):
+                                    a_info = it.get("author") or {}
+                                    a_uid = a_info.get("uniqueId") or a_info.get("unique_id") if isinstance(a_info, dict) else str(a_info)
+                                    if not a_uid or str(a_uid).lower().replace("@", "").strip() == u:
+                                        p_id = it.get("id") or it.get("itemId") or it.get("vid")
+                                        if p_id and re.match(r"^\d{15,22}$", str(p_id)):
+                                            is_photo = bool(it.get("imagePost") or it.get("images"))
+                                            t = "photo" if is_photo else "video"
+                                            p_url = f"https://www.tiktok.com/@{u}/{t}/{p_id}"
+                                            if self._is_valid_author_post_url(p_url, u):
+                                                found_urls.add(p_url)
 
                 for val in obj.values():
                     search_json(val)
