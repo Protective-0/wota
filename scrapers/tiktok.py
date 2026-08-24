@@ -1,22 +1,20 @@
 """
 scrapers/tiktok.py
-Engine Scraper Profil TikTok 100% Guest Mode (Zero-Login) dengan Multi-Layer API-First & Mobile Bypass.
+Engine Scraper Profil TikTok 100% Guest Mode (Zero-Login) berbasis Multi-Tier API-First Architecture.
 
-Fitur & Keamanan:
-1. Multi-Tier Zero-Login Architecture:
-   - Pass 0: External API Profile Extractor (TikWM / Mirror Public Endpoint tanpa browser).
-   - Pass 1: Scrapling / curl_cffi Fast SSR Rehydration (Desktop & Mobile) dengan TLS & Sec-Ch-Ua Impersonation.
-   - Pass 2: Direct TikTok Web / Mobile API query (item_list) dengan TLS Impersonation (chrome124).
-   - Pass 3: yt-dlp Flat-Playlist dengan mobile extractor args.
-   - Pass 4: Playwright Desktop Stealth Browser dengan Network Response Interceptor.
-   - Pass 5: Playwright Mobile Device Emulation (iPhone / Mobile Safari) jika desktop terhalang Captcha.
-2. Anti-False-Completion (Captcha Safety Guard):
-   - Jika scraper terhalang Captcha/WAF Challenge dan 0 postingan terkumpul, bot menandai `blocked_by_challenge = True`
-     sehingga patrol/historical scrape tidak salah menandai akun sebagai "kosong".
+Arsitektur & Keunggulan:
+1. 100% Zero-Browser (No-Playwright for Profile Crawling):
+   - Menghilangkan pembukaan browser Playwright headless yang memicu interactive Captcha / WAF block di server Linux.
+2. Multi-Tier API-First Fetching:
+   - Pass 0: Public TikWM User Posts API (Fast, no-auth, JSON response langsung).
+   - Pass 1: Fast Scrapling & curl_cffi Chrome124 SSR Rehydration + TikTok Web API (`/api/post/item_list/?aid=1988...`).
+   - Pass 2: yt-dlp Flat-Playlist dengan Mobile API hostname bypass.
 3. Strict Author Verification:
    - Validasi ketat `author.uniqueId == target_username` agar postingan Repost, Likes, maupun Feed Recommendation tidak ikut terambil.
-4. Chronological DSU Sorting:
-   - Stop-condition evaluation pada post terbaru, lalu dispatch ke downstream secara kronologis (oldest-first).
+4. Chronological DSU Delivery:
+   - Stop-condition evaluation pada post terbaru ke terlama, lalu yield ke downstream secara kronologis (oldest-first).
+5. Anti-False-Completion (Safety Guard):
+   - Jika semua layer API gagal, scraper menandai `blocked_by_challenge = True` dan tidak menandai akun selesai scan secara palsu.
 """
 
 import asyncio
@@ -27,7 +25,7 @@ import re
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Any
 
-# Scrapling Engine imports dengan fallback aman
+# Scrapling & curl_cffi imports dengan fallback aman
 try:
     from scrapling.fetchers import AsyncFetcher
     HAS_SCRAPLING = True
@@ -47,7 +45,6 @@ from .base import (
     MediaType,
     PostMedia,
     USER_AGENT,
-    DOCKER_CHROMIUM_FLAGS,
 )
 from core.utils import (
     TAG_CRAWL,
@@ -63,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 class TikTokScraper(BaseScraper):
     """
-    Scraper profil TikTok 100% Guest Mode (Zero-Login) berbasis Multi-Tier API, Scrapling & Mobile Fallback.
+    Scraper profil TikTok 100% Guest Mode (Zero-Login) berbasis Multi-Tier API-First tanpa browser.
     """
 
     PLATFORM = "tiktok"
@@ -74,9 +71,6 @@ class TikTokScraper(BaseScraper):
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.blocked_by_challenge = False
-        self._playwright = None
-        self._browser = None
-        self._context = None
 
     def _extract_username(self, url: str) -> Optional[str]:
         """Ekstrak clean username dari berbagai format URL TikTok."""
@@ -127,7 +121,7 @@ class TikTokScraper(BaseScraper):
         forced: bool = False,
     ) -> AsyncGenerator[PostMedia, None]:
         """
-        Crawl profil TikTok secara 100% Guest Mode (Zero-Login) dengan multi-tier fallback.
+        Crawl profil TikTok secara 100% Guest Mode (Zero-Login & Zero-Browser) berbasis API-First.
         """
         self.blocked_by_challenge = False
         username = self._extract_username(profile_url)
@@ -137,7 +131,7 @@ class TikTokScraper(BaseScraper):
 
         canonical_url = f"https://www.tiktok.com/@{username}"
         mobile_url = f"https://m.tiktok.com/@{username}"
-        logger.info(f"{TAG_CRAWL} Memulai scraping profil @{username} (tiktok, Zero-Login Mode): {canonical_url}")
+        logger.info(f"{TAG_CRAWL} Memulai scraping profil @{username} (tiktok, Zero-Login API-First Mode): {canonical_url}")
 
         collected_urls: list[str] = []
         seen_urls: set[str] = set()
@@ -146,51 +140,73 @@ class TikTokScraper(BaseScraper):
         challenge_hit = False
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 0 (API-FIRST): External User Posts API (TikWM & Mirror Extractor)
-        # Menghindari overhead browser jika feed profil publik tersedia via API
+        # PASS 0 (PRIMARY): Public TikWM User Posts API
+        # Ekstraksi instan feed tanpa overhead browser
         # ─────────────────────────────────────────────────────────────────────
-        logger.info(f"{TAG_CRAWL} [PASS 0] Mencoba API-first profile feed extractor untuk @{username}...")
-        try:
-            tw_api_urls = [
-                f"https://www.tikwm.com/api/user/posts?unique_id={username}&count=35",
-                f"https://tikwm.com/api/user/posts?unique_id={username}&count=35",
-            ]
-            tw_headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Referer": "https://www.tikwm.com/",
-                "Accept": "application/json, text/plain, */*",
-            }
-            for tw_url in tw_api_urls:
-                if collected_urls:
-                    break
-                try:
+        logger.info(f"{TAG_CRAWL} [PASS 0] Menjalankan TikWM User Posts API untuk @{username}...")
+        tw_api_urls = [
+            f"https://www.tikwm.com/api/user/posts?unique_id={username}&count=35",
+            f"https://tikwm.com/api/user/posts?unique_id={username}&count=35",
+        ]
+        tw_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://www.tikwm.com/",
+            "Accept": "application/json, text/plain, */*",
+        }
+
+        for tw_url in tw_api_urls:
+            if collected_urls:
+                break
+            try:
+                # Coba curl_cffi impersonate chrome124 dulu
+                if HAS_CURL_CFFI:
+                    try:
+                        async with curl_requests.AsyncSession(impersonate="chrome124") as tw_session:
+                            tw_res = await tw_session.get(tw_url, headers=tw_headers, timeout=12)
+                            if tw_res.status_code == 200:
+                                tw_json = tw_res.json()
+                                if tw_json.get("code") == 0 and tw_json.get("data"):
+                                    v_list = tw_json["data"].get("videos", []) or tw_json["data"].get("itemList", []) or []
+                                    for v_item in v_list:
+                                        if self._is_valid_creator_post(v_item, username):
+                                            v_id = v_item.get("video_id") or v_item.get("id") or v_item.get("itemId")
+                                            if v_id and re.match(r"^\d{15,22}$", str(v_id)):
+                                                is_photo = bool(v_item.get("images") or v_item.get("imagePost"))
+                                                t = "photo" if is_photo else "video"
+                                                c_url = f"https://www.tiktok.com/@{username}/{t}/{v_id}"
+                                                if c_url not in seen_urls:
+                                                    collected_urls.append(c_url)
+                                                    seen_urls.add(c_url)
+                    except Exception as c_err:
+                        logger.debug(f"Pass 0 curl_cffi note: {c_err}")
+
+                # Fallback httpx
+                if not collected_urls:
                     async with httpx.AsyncClient(timeout=12.0, headers=tw_headers, follow_redirects=True) as tw_client:
                         tw_resp = await tw_client.get(tw_url)
                         if tw_resp.status_code == 200:
                             tw_json = tw_resp.json()
                             if tw_json.get("code") == 0 and tw_json.get("data"):
-                                data_obj = tw_json["data"]
-                                video_list = data_obj.get("videos", []) or data_obj.get("itemList", []) or []
-                                for vid_item in video_list:
-                                    if self._is_valid_creator_post(vid_item, username):
-                                        vid_id = vid_item.get("video_id") or vid_item.get("id") or vid_item.get("itemId")
-                                        if vid_id and re.match(r"^\d{15,22}$", str(vid_id)):
-                                            is_photo = bool(vid_item.get("images") or vid_item.get("imagePost"))
+                                v_list = tw_json["data"].get("videos", []) or tw_json["data"].get("itemList", []) or []
+                                for v_item in v_list:
+                                    if self._is_valid_creator_post(v_item, username):
+                                        v_id = v_item.get("video_id") or v_item.get("id") or v_item.get("itemId")
+                                        if v_id and re.match(r"^\d{15,22}$", str(v_id)):
+                                            is_photo = bool(v_item.get("images") or v_item.get("imagePost"))
                                             t = "photo" if is_photo else "video"
-                                            c_url = f"https://www.tiktok.com/@{username}/{t}/{vid_id}"
+                                            c_url = f"https://www.tiktok.com/@{username}/{t}/{v_id}"
                                             if c_url not in seen_urls:
                                                 collected_urls.append(c_url)
                                                 seen_urls.add(c_url)
-                                if collected_urls:
-                                    logger.info(f"{TAG_CRAWL} [PASS 0] API Extractor berhasil menemukan {len(collected_urls)} post asli @{username}.")
-                except Exception as tw_err:
-                    logger.debug(f"Pass 0 TikWM query note: {tw_err}")
-        except Exception as p0_err:
-            logger.debug(f"Pass 0 outer note: {p0_err}")
+
+                if collected_urls:
+                    logger.info(f"{TAG_CRAWL} [PASS 0] TikWM API berhasil menemukan {len(collected_urls)} post asli @{username}.")
+            except Exception as p0_err:
+                logger.debug(f"Pass 0 query note ({tw_url}): {p0_err}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 1 (PRIMARY): Scrapling / curl_cffi Fast SSR Rehydration Parser
-        # Dual-Endpoint: Desktop & Mobile dengan TLS & Sec-Ch-Ua Impersonation
+        # PASS 1: Fast Scrapling & curl_cffi SSR Rehydration + Web Feed API
+        # Ekstraksi rehydration JSON publik dan query direct `/api/post/item_list`
         # ─────────────────────────────────────────────────────────────────────
         if not collected_urls:
             logger.info(f"{TAG_CRAWL} [PASS 1] Menjalankan Scrapling Fast SSR Rehydration untuk @{username} (Zero-Login)...")
@@ -272,49 +288,47 @@ class TikTokScraper(BaseScraper):
                                 seen_urls.add(r_url)
 
                         if collected_urls:
-                            logger.info(f"{TAG_CRAWL} [PASS 1] Fast Pass ({target_url}) berhasil menemukan {len(collected_urls)} post asli @{username}.")
+                            logger.info(f"{TAG_CRAWL} [PASS 1] Fast SSR ({target_url}) berhasil menemukan {len(collected_urls)} post asli @{username}.")
                 except Exception as e:
                     logger.debug(f"Fast HTTP Rehydration info ({target_url}): {e}")
 
-        # ─────────────────────────────────────────────────────────────────────
-        # PASS 2: TikTok Direct Web / Mobile API item_list via curl_cffi
-        # ─────────────────────────────────────────────────────────────────────
-        if not collected_urls and sec_uid:
-            logger.info(f"{TAG_CRAWL} [PASS 2] Menjalankan TikTok Mobile API item_list untuk @{username} (secUid: {sec_uid[:15]}...)...")
-            try:
-                api_urls = [
-                    f"https://www.tiktok.com/api/post/item_list/?count=35&secUid={sec_uid}",
-                    f"https://m.tiktok.com/api/post/item_list/?count=35&secUid={sec_uid}",
-                ]
-                for api_url in api_urls:
-                    if collected_urls:
-                        break
-                    if HAS_CURL_CFFI:
-                        async with curl_requests.AsyncSession(impersonate="chrome124") as session:
-                            a_resp = await session.get(api_url, headers=headers, timeout=12)
-                            if a_resp.status_code == 200:
-                                a_data = a_resp.json()
-                                items = a_data.get("itemList", []) or a_data.get("items", []) or []
-                                for item in items:
-                                    if self._is_valid_creator_post(item, username):
-                                        p_id = item.get("id") or item.get("itemId")
-                                        if p_id and re.match(r"^\d{15,22}$", str(p_id)):
-                                            is_photo = bool(item.get("imagePost") or item.get("images"))
-                                            t = "photo" if is_photo else "video"
-                                            c_url = f"https://www.tiktok.com/@{username}/{t}/{p_id}"
-                                            if c_url not in seen_urls:
-                                                collected_urls.append(c_url)
-                                                seen_urls.add(c_url)
-                                if collected_urls:
-                                    logger.info(f"{TAG_CRAWL} [PASS 2] TikTok API berhasil menemukan {len(collected_urls)} post @{username}.")
-            except Exception as api_err:
-                logger.debug(f"TikTok Direct API note: {api_err}")
+            # Sub-Pass 1B: Direct TikTok Web Feed API item_list via curl_cffi
+            if not collected_urls and sec_uid:
+                logger.info(f"{TAG_CRAWL} [PASS 1B] Menjalankan TikTok Web Feed API item_list untuk @{username} (secUid: {sec_uid[:15]}...)...")
+                try:
+                    api_urls = [
+                        f"https://www.tiktok.com/api/post/item_list/?aid=1988&count=35&secUid={sec_uid}",
+                        f"https://m.tiktok.com/api/post/item_list/?aid=1988&count=35&secUid={sec_uid}",
+                    ]
+                    for api_url in api_urls:
+                        if collected_urls:
+                            break
+                        if HAS_CURL_CFFI:
+                            async with curl_requests.AsyncSession(impersonate="chrome124") as session:
+                                a_resp = await session.get(api_url, headers=headers, timeout=12)
+                                if a_resp.status_code == 200:
+                                    a_data = a_resp.json()
+                                    items = a_data.get("itemList", []) or a_data.get("items", []) or []
+                                    for item in items:
+                                        if self._is_valid_creator_post(item, username):
+                                            p_id = item.get("id") or item.get("itemId")
+                                            if p_id and re.match(r"^\d{15,22}$", str(p_id)):
+                                                is_photo = bool(item.get("imagePost") or item.get("images"))
+                                                t = "photo" if is_photo else "video"
+                                                c_url = f"https://www.tiktok.com/@{username}/{t}/{p_id}"
+                                                if c_url not in seen_urls:
+                                                    collected_urls.append(c_url)
+                                                    seen_urls.add(c_url)
+                                    if collected_urls:
+                                        logger.info(f"{TAG_CRAWL} [PASS 1B] TikTok Feed API berhasil menemukan {len(collected_urls)} post @{username}.")
+                except Exception as api_err:
+                    logger.debug(f"TikTok Direct API note: {api_err}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 3: yt-dlp Flat-Playlist Extractor (Mobile API Mode)
+        # PASS 2: yt-dlp Flat-Playlist Extractor (Mobile API Mode)
         # ─────────────────────────────────────────────────────────────────────
         if not collected_urls:
-            logger.info(f"{TAG_CRAWL} [PASS 3] Mencoba ekstraksi postingan @{username} via yt-dlp flat-playlist (Zero-Login)...")
+            logger.info(f"{TAG_CRAWL} [PASS 2] Mencoba ekstraksi postingan @{username} via yt-dlp flat-playlist (Zero-Login)...")
             try:
                 cmd = [
                     "yt-dlp",
@@ -354,6 +368,8 @@ class TikTokScraper(BaseScraper):
                                         seen_urls.add(clean_p_url)
                             except Exception:
                                 pass
+                        if collected_urls:
+                            logger.info(f"{TAG_CRAWL} [PASS 2] yt-dlp flat-playlist berhasil menemukan {len(collected_urls)} post @{username}.")
                 except asyncio.TimeoutError:
                     proc.kill()
                     await proc.wait()
@@ -362,199 +378,12 @@ class TikTokScraper(BaseScraper):
                 logger.warning(f"{TAG_WARN} yt-dlp flat-playlist info: {e}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 4: Playwright Dynamic Stealth Browser (Desktop Mode)
+        # SAFETY GUARD: Deteksi Blokade Tanpa Membuka Browser Playwright
         # ─────────────────────────────────────────────────────────────────────
-        browser_captcha_hit = False
-        if not collected_urls or (expected_video_count > 0 and len(collected_urls) < expected_video_count):
-            logger.info(f"{TAG_CRAWL} [PASS 4] Mengaktifkan Playwright Dynamic Stealth Browser untuk @{username} (Desktop)...")
-            intercepted_urls: set[str] = set()
-
-            try:
-                from playwright.async_api import async_playwright
-                self._playwright = await async_playwright().start()
-                self._browser, self._context = await BaseScraper.create_stealth_browser(
-                    self._playwright,
-                    headed=self.headed,
-                )
-
-                page = await self._context.new_page()
-
-                async def _on_response(response):
-                    try:
-                        req_url = response.url.lower()
-                        if "item_list" in req_url or "/api/post" in req_url or "/api/user/post" in req_url or "preload/item_list" in req_url:
-                            if response.status == 200:
-                                data = await response.json()
-                                item_list = data.get("itemList", []) or data.get("items", []) or []
-                                for item in item_list:
-                                    if self._is_valid_creator_post(item, username):
-                                        item_id = item.get("id") or item.get("itemId") or item.get("vid")
-                                        if item_id and re.match(r"^\d{15,22}$", str(item_id)):
-                                            is_photo = bool(item.get("imagePost") or item.get("images") or item.get("imageList"))
-                                            t = "photo" if is_photo else "video"
-                                            intercepted_urls.add(f"https://www.tiktok.com/@{username}/{t}/{item_id}")
-                    except Exception:
-                        pass
-
-                page.on("response", _on_response)
-
-                logger.info(f"{TAG_CRAWL} Membuka profil TikTok di browser stealth: {canonical_url}")
-                await page.goto(canonical_url, wait_until="domcontentloaded", timeout=45000)
-                await asyncio.sleep(2.5)
-
-                # Cek login wall & Captcha verification challenge
-                current_url = page.url.lower()
-                page_content = await page.content()
-                if "captcha" in current_url or "verify" in current_url or "secsdk" in page_content or "SlardarWAF" in page_content:
-                    browser_captcha_hit = True
-                    challenge_hit = True
-                    logger.warning(f"{TAG_WARN} TikTok Desktop menyajikan Captcha challenge untuk @{username}.")
-                else:
-                    try:
-                        close_btn = await page.query_selector(
-                            '[data-e2e="modal-close-inner-button"], [aria-label="Close"], button[class*="close"]'
-                        )
-                        if close_btn:
-                            await close_btn.click()
-                            await asyncio.sleep(1.0)
-                    except Exception:
-                        pass
-
-                    for _ in range(6):
-                        await page.evaluate("window.scrollBy(0, 1500)")
-                        await asyncio.sleep(2.0)
-                        if expected_video_count > 0 and len(intercepted_urls) >= expected_video_count:
-                            break
-
-                    dom_links = await page.locator(
-                        '[data-e2e="user-post-item"] a, '
-                        '[data-e2e="user-post-item-list"] [data-e2e="user-post-item"] a, '
-                        '#main-content-others_homepage [data-e2e="user-post-item"] a'
-                    ).all()
-
-                    if not dom_links:
-                        dom_links = await page.locator('a[href*="/video/"], a[href*="/photo/"]').all()
-
-                    target_user_tag = f"@{username.lower()}"
-                    for a_link in dom_links:
-                        try:
-                            href = await a_link.get_attribute("href")
-                            if href and target_user_tag in href.lower():
-                                match = re.search(r"/(?:video|photo|v)/(\d{15,22})", href)
-                                if match:
-                                    is_photo = "/photo/" in href.lower()
-                                    t = "photo" if is_photo else "video"
-                                    clean_href = f"https://www.tiktok.com/@{username}/{t}/{match.group(1)}"
-                                    if clean_href not in seen_urls:
-                                        collected_urls.append(clean_href)
-                                        seen_urls.add(clean_href)
-                        except Exception:
-                            pass
-
-                for i_url in intercepted_urls:
-                    if i_url not in seen_urls:
-                        collected_urls.append(i_url)
-                        seen_urls.add(i_url)
-
-                await page.close()
-            except Exception as e:
-                logger.error(f"{TAG_ERROR} Desktop Browser automation error untuk @{username}: {e}")
-            finally:
-                await self.close()
-
-        # ─────────────────────────────────────────────────────────────────────
-        # PASS 5: Playwright Mobile Device Emulation Fallback (iPhone/Safari)
-        # ─────────────────────────────────────────────────────────────────────
-        if (not collected_urls and browser_captcha_hit) or (not collected_urls and challenge_hit):
-            logger.info(f"{TAG_CRAWL} [PASS 5] Menjalankan Playwright Mobile Device Emulation (iPhone/Safari) untuk @{username}...")
-            m_intercepted: set[str] = set()
-            try:
-                from playwright.async_api import async_playwright
-                self._playwright = await async_playwright().start()
-                iphone_device = self._playwright.devices.get("iPhone 14 Pro Max") or self._playwright.devices.get("iPhone 13")
-                
-                launch_kwargs = BaseScraper.get_browser_launch_kwargs()
-                self._browser = await self._playwright.chromium.launch(
-                    headless=not self.headed,
-                    **launch_kwargs,
-                )
-                if iphone_device:
-                    self._context = await self._browser.new_context(
-                        **iphone_device,
-                        locale="id-ID",
-                    )
-                else:
-                    self._context = await self._browser.new_context(
-                        user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-                        viewport={"width": 430, "height": 932},
-                        is_mobile=True,
-                        has_touch=True,
-                        locale="id-ID",
-                    )
-
-                m_page = await self._context.new_page()
-
-                async def _on_mobile_resp(response):
-                    try:
-                        req_url = response.url.lower()
-                        if "item_list" in req_url or "/api/post" in req_url or "/api/user/post" in req_url or "preload/item_list" in req_url:
-                            if response.status == 200:
-                                data = await response.json()
-                                item_list = data.get("itemList", []) or data.get("items", []) or []
-                                for item in item_list:
-                                    if self._is_valid_creator_post(item, username):
-                                        item_id = item.get("id") or item.get("itemId") or item.get("vid")
-                                        if item_id and re.match(r"^\d{15,22}$", str(item_id)):
-                                            is_photo = bool(item.get("imagePost") or item.get("images") or item.get("imageList"))
-                                            t = "photo" if is_photo else "video"
-                                            m_intercepted.add(f"https://www.tiktok.com/@{username}/{t}/{item_id}")
-                    except Exception:
-                        pass
-
-                m_page.on("response", _on_mobile_resp)
-
-                await m_page.goto(canonical_url, wait_until="domcontentloaded", timeout=35000)
-                await asyncio.sleep(3.0)
-
-                for _ in range(4):
-                    await m_page.evaluate("window.scrollBy(0, 1000)")
-                    await asyncio.sleep(1.5)
-
-                m_links = await m_page.locator('a[href*="/video/"], a[href*="/photo/"]').all()
-                target_user_tag = f"@{username.lower()}"
-                for a_link in m_links:
-                    try:
-                        href = await a_link.get_attribute("href")
-                        if href and target_user_tag in href.lower():
-                            match = re.search(r"/(?:video|photo|v)/(\d{15,22})", href)
-                            if match:
-                                is_photo = "/photo/" in href.lower()
-                                t = "photo" if is_photo else "video"
-                                clean_href = f"https://www.tiktok.com/@{username}/{t}/{match.group(1)}"
-                                if clean_href not in seen_urls:
-                                    collected_urls.append(clean_href)
-                                    seen_urls.add(clean_href)
-                    except Exception:
-                        pass
-
-                for i_url in m_intercepted:
-                    if i_url not in seen_urls:
-                        collected_urls.append(i_url)
-                        seen_urls.add(i_url)
-
-                await m_page.close()
-            except Exception as m_err:
-                logger.debug(f"Mobile emulation note: {m_err}")
-            finally:
-                await self.close()
-
-        # ─────────────────────────────────────────────────────────────────────
-        # SAFETY CHECK: Deteksi Captcha Block jika URL masih 0
-        # ─────────────────────────────────────────────────────────────────────
-        if not collected_urls and (challenge_hit or browser_captcha_hit):
+        if not collected_urls:
             self.blocked_by_challenge = True
             logger.warning(
-                f"[🚨 BLOCKED] TikTok menyajikan Captcha/WAF Challenge untuk @{username} — membatalkan crawl agar tidak ditandai selesai palsu."
+                f"[🚨 BLOCKED] TikTok WAF / API rate-limit aktif untuk @{username} (0 post) — membatalkan crawl bersih tanpa membuka Playwright."
             )
             return
 
@@ -563,7 +392,7 @@ class TikTokScraper(BaseScraper):
         )
 
         # ─────────────────────────────────────────────────────────────────────
-        # STEP 6: DSU Sorting & SQLite Stop Condition
+        # STEP 3: DSU Sorting & SQLite Stop Condition
         # Urutan Evaluasi: Post PALING BARU ke PALING LAMA untuk stop-condition DB
         # Urutan Yield ke Downstream: KRONOLOGIS (PALING LAMA ke PALING BARU)
         # ─────────────────────────────────────────────────────────────────────
@@ -684,17 +513,5 @@ class TikTokScraper(BaseScraper):
         }
 
     async def close(self) -> None:
-        """Cleanup browser context and instances."""
-        try:
-            if self._context:
-                await self._context.close()
-            if self._browser:
-                await self._browser.close()
-            if self._playwright:
-                await self._playwright.stop()
-        except Exception as e:
-            logger.debug(f"TikTokScraper close error: {e}")
-        finally:
-            self._context = None
-            self._browser = None
-            self._playwright = None
+        """Cleanup handler (no-op karena zero browser mode)."""
+        pass
