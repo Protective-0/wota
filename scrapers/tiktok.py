@@ -21,7 +21,9 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
+import time
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Any
 import httpx
@@ -125,17 +127,35 @@ class TikTokScraper(BaseScraper):
                 locale="id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
                 timezone_id="Asia/Jakarta",
             )
+
+            # Muat session cookies jika tersedia di direktori sessions/
+            try:
+                cookies = await self.load_cookies_as_list(self.PLATFORM)
+                if cookies:
+                    logger.info(f"{TAG_CRAWL} Memuat {len(cookies)} session cookies untuk TikTok...")
+                    await self._context.add_cookies(cookies)
+            except Exception as c_err:
+                logger.debug(f"Cookie load note: {c_err}")
+
             page = await self._context.new_page()
             logger.info(f"{TAG_CRAWL} Membuka profil TikTok di browser stealth: {canonical_url}")
 
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=45000)
-            # Beri jeda 3.5 detik untuk eksekusi script SlardarWAF dan rendering DOM
-            await asyncio.sleep(3.5)
+
+            # Tunggu elemen profil atau feed postingan selesai dirender oleh SlardarWAF
+            try:
+                await page.wait_for_selector(
+                    'a[href*="/video/"], a[href*="/photo/"], [data-e2e="user-post-item"], [data-e2e="user-post-item-list"], h1, [data-e2e="user-title"]',
+                    timeout=15000
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(2.0)
 
             # Dismiss modal popup / cookie dialog jika ada
             try:
                 dismiss_btn = await page.query_selector(
-                    'button:has-text("Lanjutkan sebagai tamu"), button:has-text("Continue as guest"), [data-e2e="modal-close-inner-button"]'
+                    'button:has-text("Lanjutkan sebagai tamu"), button:has-text("Continue as guest"), button:has-text("Not now"), [data-e2e="modal-close-inner-button"]'
                 )
                 if dismiss_btn:
                     await dismiss_btn.click()
@@ -143,11 +163,14 @@ class TikTokScraper(BaseScraper):
             except Exception:
                 pass
 
-            # Scrolling pagination loop
-            max_scroll_rounds = 15
+            # Scrolling pagination loop dengan early-exit
+            max_scroll_rounds = 6
+            no_new_rounds = 0
             for scroll_idx in range(max_scroll_rounds):
-                # 1. Ekstrak links dari DOM
-                dom_links = await page.locator('a[href*="/video/"], a[href*="/photo/"]').all()
+                prev_count = len(collected_urls)
+
+                # 1. Ekstrak links dari DOM selectors
+                dom_links = await page.locator('a[href*="/video/"], a[href*="/photo/"], a[href*="/v/"], [data-e2e="user-post-item"] a, [data-e2e="user-post-item-list"] a').all()
                 for link_el in dom_links:
                     try:
                         href = await link_el.get_attribute("href")
@@ -175,6 +198,20 @@ class TikTokScraper(BaseScraper):
                 except Exception:
                     pass
 
+                # 3. Fallback regex dari full HTML DOM
+                if not collected_urls:
+                    try:
+                        page_content = await page.content()
+                        u_clean = username.lower().replace("@", "").strip()
+                        matched_ids = set(re.findall(rf'(?:tiktok\.com/@{u_clean}/(?:video|photo|v)/|/(?:video|photo|v)/)(\d{{15,22}})', page_content.lower()))
+                        for mid in matched_ids:
+                            cand_url = f"https://www.tiktok.com/@{username}/video/{mid}"
+                            if self._is_valid_author_post_url(cand_url, username) and cand_url not in seen_urls:
+                                collected_urls.append(cand_url)
+                                seen_urls.add(cand_url)
+                    except Exception:
+                        pass
+
                 # Cek stop-condition di database jika tidak forced
                 if not forced and collected_urls:
                     newest_id = self._extract_post_id(collected_urls[0])
@@ -182,14 +219,28 @@ class TikTokScraper(BaseScraper):
                         logger.info(f"{TAG_CRAWL} Stop-condition tercapai pada post {newest_id} di DB.")
                         break
 
+                if len(collected_urls) == prev_count and len(collected_urls) > 0:
+                    no_new_rounds += 1
+                    if no_new_rounds >= 2:
+                        break
+                else:
+                    no_new_rounds = 0
+
                 await page.evaluate("window.scrollBy(0, 1600)")
-                await asyncio.sleep(random.uniform(1.5, 2.5))
+                await asyncio.sleep(random.uniform(1.0, 1.5))
+
+            if not collected_urls:
+                page_title = await page.title()
+                logger.warning(
+                    f"{TAG_WARN} [PASS 0] Playwright Browser selesai tanpa link. "
+                    f"Page Title: '{page_title}', URL: '{page.url}'"
+                )
 
             await page.close()
             if collected_urls:
                 logger.info(f"{TAG_CRAWL} [PASS 0] Playwright Stealth Browser berhasil mengekstrak {len(collected_urls)} post.")
         except Exception as e:
-            logger.debug(f"[PASS 0] Playwright Stealth Browser note: {e}")
+            logger.warning(f"{TAG_WARN} [PASS 0] Playwright Stealth Browser exception: {e}")
         finally:
             await self.close()
 
