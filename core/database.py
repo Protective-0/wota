@@ -297,14 +297,6 @@ class DatabaseManager:
         """
         Catat post_id ke scraped_posts dan downloaded_posts setelah sukses dikirim ke Discord.
         """
-        await self.db.execute(
-            """
-            INSERT OR IGNORE INTO scraped_posts (post_id, username, platform)
-            VALUES (?, ?, ?)
-            """,
-            (post_id, username.lower(), platform.lower()),
-        )
-        # Build correct profile URL per platform
         plat = platform.lower()
         uname = username.lower()
         if plat == "tiktok":
@@ -313,14 +305,23 @@ class DatabaseManager:
             profile_url_built = f"https://x.com/{uname}"
         else:
             profile_url_built = f"https://www.instagram.com/{uname}/"
-        await self.db.execute(
-            """
-            INSERT OR IGNORE INTO downloaded_posts (post_id, platform, profile_url, media_count, status)
-            VALUES (?, ?, ?, 1, 'done')
-            """,
-            (post_id, plat, profile_url_built),
-        )
-        await self.db.commit()
+
+        async with self.db:
+            await self.db.execute(
+                """
+                INSERT OR IGNORE INTO scraped_posts (post_id, username, platform)
+                VALUES (?, ?, ?)
+                """,
+                (post_id, uname, plat),
+            )
+            await self.db.execute(
+                """
+                INSERT OR IGNORE INTO downloaded_posts (post_id, platform, profile_url, media_count, status)
+                VALUES (?, ?, ?, 1, 'done')
+                """,
+                (post_id, plat, profile_url_built),
+            )
+            await self.db.commit()
 
     async def mark_post_downloaded(
         self,
@@ -334,27 +335,27 @@ class DatabaseManager:
         Catat postingan yang sudah berhasil diunduh dan dikirim ke Discord.
         Gunakan INSERT OR IGNORE untuk mencegah error duplikat.
         """
-        await self.db.execute(
-            """
-            INSERT OR IGNORE INTO downloaded_posts
-                (post_id, platform, profile_url, media_count, status)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (post_id, platform, profile_url, media_count, status),
-        )
-        # Refactored: replace naive profile_url.split('/')[-1] parsing with extract_username_and_platform
-        # to prevent extracting post IDs when profile_url contains /status/ or /reel/ paths
         username, _ = extract_username_and_platform(profile_url)
         if not username:
             username = profile_url.split("?")[0].rstrip("/").split("/")[-1].replace("@", "")
-        await self.db.execute(
-            """
-            INSERT OR IGNORE INTO scraped_posts (post_id, username, platform)
-            VALUES (?, ?, ?)
-            """,
-            (post_id, username, platform),
-        )
-        await self.db.commit()
+
+        async with self.db:
+            await self.db.execute(
+                """
+                INSERT OR IGNORE INTO downloaded_posts
+                    (post_id, platform, profile_url, media_count, status)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (post_id, platform, profile_url, media_count, status),
+            )
+            await self.db.execute(
+                """
+                INSERT OR IGNORE INTO scraped_posts (post_id, username, platform)
+                VALUES (?, ?, ?)
+                """,
+                (post_id, username, platform),
+            )
+            await self.db.commit()
 
     async def mark_post_failed(self, post_id: str, platform: str, profile_url: str) -> None:
         """Tandai postingan yang gagal diproses (untuk tracking error)."""
@@ -471,9 +472,9 @@ class DatabaseManager:
             return dict(row) if row else None
 
     async def get_all_monitored_accounts(self) -> list[dict]:
-        """Ambil seluruh daftar akun yang dipantau."""
+        """Ambil seluruh daftar akun yang dipantau (terurut kronologis penambahan)."""
         async with self.db.execute(
-            "SELECT username, platform, channel_id, last_scraped_id, initial_scan_completed FROM monitored_accounts"
+            "SELECT username, platform, channel_id, last_scraped_id, initial_scan_completed FROM monitored_accounts ORDER BY created_at ASC"
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]

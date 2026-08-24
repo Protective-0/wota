@@ -886,33 +886,29 @@ class MediaScraperBot(commands.Bot):
             logger.info(f"{TAG_PATROL} Patrol di-pause. Skip siklus ini.")
             return
 
-        if self.is_scanning or self.queue.is_busy or not self._job_queue.empty():
-            q_size = self._job_queue.qsize()
-            # FIX: downgraded to WARNING so operators see skipped cycles in production logs.
-            # Structured log includes current lock holder URL so it's actionable.
-            lock_info = (
-                f" — lock held by: {self.queue.current_task.profile_url}"
-                if self.queue.current_task else ""
-            )
-            logger.warning(
-                f"{TAG_PATROL} Siklus patroli DILEWATI — antrean/task masih aktif "
-                f"(queue_busy={self.queue.is_busy}, job_queue={q_size}, "
-                f"is_scanning={self.is_scanning}){lock_info}."
-            )
-            return
-
-        # Hanya ambil akun yang siap dipatroli (historical dump selesai)
-        accounts = await self.db.get_patrol_ready_accounts()
-        if not accounts:
-            logger.info(f"{TAG_PATROL} Tidak ada akun siap dipatroli.")
-            return
-
-        logger.info(f"{TAG_PATROL} Memulai patroli {len(accounts)} akun...")
         async with self.scan_lock:
             if self.is_scanning or self.queue.is_busy or not self._job_queue.empty():
-                logger.info(f"{TAG_PATROL} Scan baru terdeteksi saat acquire lock. Skip.")
+                q_size = self._job_queue.qsize()
+                lock_info = (
+                    f" — lock held by: {self.queue.current_task.profile_url}"
+                    if self.queue.current_task else ""
+                )
+                logger.warning(
+                    f"{TAG_PATROL} Siklus patroli DILEWATI — antrean/task masih aktif "
+                    f"(queue_busy={self.queue.is_busy}, job_queue={q_size}, "
+                    f"is_scanning={self.is_scanning}){lock_info}."
+                )
                 return
+
+            # Hanya ambil akun yang siap dipatroli (historical dump selesai)
+            accounts = await self.db.get_patrol_ready_accounts()
+            if not accounts:
+                logger.info(f"{TAG_PATROL} Tidak ada akun siap dipatroli.")
+                return
+
             self.is_scanning = True
+
+        logger.info(f"{TAG_PATROL} Memulai patroli {len(accounts)} akun...")
         try:
             await self._run_batch_scan(accounts, forced=False)
         finally:
@@ -1489,15 +1485,18 @@ class MediaScraperBot(commands.Bot):
                 f"[📥 DOWN  ] Mengunduh direct media ({len(post.media_urls)} file) untuk {post.post_id}..."
             )
 
+            dl_sem = asyncio.Semaphore(3)
+
             async def download_one(i, url):
-                ext = url.split("?")[0].split(".")[-1].lower()
-                if ext not in {"jpg", "jpeg", "png", "webp", "mp4", "mov"}:
-                    if post.media_type == MediaType.VIDEO or "/v/" in url or ".mp4" in url or "video" in url:
-                        ext = "mp4"
-                    else:
-                        ext = "jpg"
-                filename = f"{post.post_id}_{i+1:03d}.{ext}"
-                return await self.downloader.download_direct_url(url, filename)
+                async with dl_sem:
+                    ext = url.split("?")[0].split(".")[-1].lower()
+                    if ext not in {"jpg", "jpeg", "png", "webp", "mp4", "mov"}:
+                        if post.media_type == MediaType.VIDEO or "/v/" in url or ".mp4" in url or "video" in url:
+                            ext = "mp4"
+                        else:
+                            ext = "jpg"
+                    filename = f"{post.post_id}_{i+1:03d}.{ext}"
+                    return await self.downloader.download_direct_url(url, filename)
 
             tasks = [download_one(i, url) for i, url in enumerate(post.media_urls)]
             results = await asyncio.gather(*tasks)
@@ -1590,6 +1589,8 @@ class MediaScraperBot(commands.Bot):
                 session_dir=SESSION_DIR,
                 headed=BROWSER_HEADED,
             )
+        else:
+            raise ValueError(f"Unknown platform: {platform}")
 
     async def close(self) -> None:
         """Graceful shutdown hook terpadu untuk membersihkan worker task, loop patrol, browser, dan DB."""

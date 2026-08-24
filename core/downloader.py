@@ -1562,19 +1562,29 @@ class MediaDownloader:
                             if play_url and not any(bad in play_url.lower() for bad in BAD_VIDEO_PATTERNS):
                                 out_video_path = target_dir / f"{post_id}_video.mp4"
                                 logger.info(f"{TAG_DOWN} TikWM API ({ep_url.split('/')[2]}): Mengunduh stream video asli kreator...")
-                                async with client.stream("GET", play_url) as stream_resp:
-                                    if stream_resp.status_code in (200, 206):
-                                        async with aiofiles.open(out_video_path, "wb") as f:
-                                            async for chunk in stream_resp.aiter_bytes(8192):
-                                                await f.write(chunk)
+                                try:
+                                    async with client.stream("GET", play_url) as stream_resp:
+                                        if stream_resp.status_code in (200, 206):
+                                            async with aiofiles.open(out_video_path, "wb") as f:
+                                                async for chunk in stream_resp.aiter_bytes(8192):
+                                                    await f.write(chunk)
+                                except asyncio.CancelledError:
+                                    logger.warning(f"{TAG_WARN} TikTok stream download dibatalkan untuk {post_id}")
+                                    try:
+                                        out_video_path.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                                    raise
 
                                 if await self._is_valid_tiktok_video(out_video_path):
                                     logger.info(f"{TAG_DOWN} TikWM Video terunduh: {out_video_path.name} ({fmt_size(out_video_path.stat().st_size)})")
                                     return [out_video_path], title, timestamp_str
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.debug(f"TikWM endpoint {ep_url} error: {e}")
 
-            # Jeda 1.0 detik antar endpoint untuk mencegah rate limit saat batch download
+            # Jeda 1.0 detik hanya jika endpoint ini gagal/tidak menghasilkan file valid (retry backoff)
             await asyncio.sleep(1.0)
 
         return None
@@ -2389,6 +2399,7 @@ class MediaDownloader:
 
         logger.info(f"ffmpeg kompresi: target {target_kbps}kbps → {output_path.name}")
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -2399,14 +2410,15 @@ class MediaDownloader:
                 _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=90.0)
             except asyncio.TimeoutError:
                 logger.error("ffmpeg timeout setelah 90 detik — membunuh proses...")
-                proc.kill()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
+                if proc is not None:
+                    proc.kill()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pass
                 return False
 
-            if proc.returncode != 0:
+            if proc is not None and proc.returncode != 0:
                 stderr_text = (stderr_bytes or b"").decode("utf-8", errors="replace")[-500:]
                 logger.error(f"ffmpeg error: {stderr_text}")
                 return False

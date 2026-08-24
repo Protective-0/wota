@@ -67,3 +67,7 @@ Thumbs.db
 skills-lock.json
 .skills/
 
+# Internal Audit Documents
+*_audit.md
+linux_server_audit.md
+

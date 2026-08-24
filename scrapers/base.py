@@ -39,7 +39,6 @@ DOCKER_CHROMIUM_FLAGS = [
     "--disable-gpu",                 # Nonaktifkan GPU init pada server headless
     "--disable-software-rasterizer", # Hemat memori CPU
     "--disable-blink-features=AutomationControlled", # Anti-detection layer
-    "--disable-web-security",        # Mencegah CORS blocking saat scraping resource CDN
     "--ignore-certificate-errors",
     "--disable-infobars",
     "--window-position=0,0",
@@ -277,13 +276,14 @@ class BaseScraper(ABC):
         playwright: Playwright,
         headed: bool = False,
         proxy: Optional[str] = None,
-        viewport: dict = {"width": 1280, "height": 800},
+        viewport: Optional[dict] = None,
         locale: str = "en-US,en;q=0.9",
         timezone_id: str = "Asia/Jakarta",
     ) -> Tuple[Browser, BrowserContext]:
         """
         Inisialisasi Browser + BrowserContext Playwright dengan stealth injection penuh.
         """
+        viewport = viewport or {"width": 1280, "height": 800}
         launch_kwargs = BaseScraper.get_browser_launch_kwargs(proxy=proxy)
         launch_kwargs["headless"] = not headed
 

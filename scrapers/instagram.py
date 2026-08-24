@@ -27,6 +27,7 @@ import logging
 import os
 import random
 import re
+import time
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Any
 from datetime import datetime, timezone
@@ -230,7 +231,7 @@ class InstagramScraper(BaseScraper):
                                 profile_url=canonical_url,
                                 platform=self.PLATFORM,
                                 media_type=media_type,
-                                media_urls=media_urls,
+                                media_urls=[u for u in media_urls if u],
                                 caption=caption,
                                 timestamp=ts_str,
                                 cookies_file=None,
@@ -523,13 +524,19 @@ class InstagramScraper(BaseScraper):
                 f"https://www.instagram.com/{username}/reels/",
             ]
 
+            start_time = time.monotonic()
+            MAX_CRAWL_DURATION = 300.0
+
             for target_tab in targets:
+                if time.monotonic() - start_time > MAX_CRAWL_DURATION:
+                    logger.warning(f"{TAG_WARN} Batas waktu crawl browser Instagram 300s tercapai untuk @{username} — stop.")
+                    break
                 try:
                     await page.goto(target_tab, wait_until="domcontentloaded", timeout=30000)
                     await asyncio.sleep(2.0)
 
-                    if "accounts/login" in page.url.lower() or "challenge" in page.url.lower():
-                        logger.warning(f"{TAG_WARN} Instagram mengalihkan {target_tab} ke login wall.")
+                    if "accounts/login" in page.url.lower() or bool(re.search(r"/challenge/?$|/challenge/\w+", page.url.lower())):
+                        logger.warning(f"{TAG_WARN} Instagram mengalihkan {target_tab} ke login wall / challenge.")
                         continue
 
                     # Dismiss modal dialog popup jika ada
@@ -545,6 +552,9 @@ class InstagramScraper(BaseScraper):
 
                     # Scrolling pagination loop
                     for _ in range(8):
+                        if time.monotonic() - start_time > MAX_CRAWL_DURATION:
+                            logger.warning(f"{TAG_WARN} Batas waktu scroll browser Instagram tercapai untuk @{username}.")
+                            break
                         links = await page.locator('a[href*="/p/"], a[href*="/reel/"]').all()
                         for link in links:
                             try:

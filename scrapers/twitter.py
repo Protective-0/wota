@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import re
+import time
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -125,12 +126,11 @@ class TwitterScraper(BaseScraper):
             MAX_NO_NEW = 4
             scroll_round = 0
 
-            import time as _t
-            scroll_start = _t.monotonic()
+            scroll_start = time.monotonic()
             MAX_SCROLL_SECONDS = 180.0
 
             while no_new_count < MAX_NO_NEW:
-                if _t.monotonic() - scroll_start > MAX_SCROLL_SECONDS:
+                if time.monotonic() - scroll_start > MAX_SCROLL_SECONDS:
                     logger.warning(f"{TAG_WARN} Batas waktu scroll Twitter 180s tercapai untuk @{username} — stop.")
                     break
 
@@ -262,6 +262,15 @@ class TwitterScraper(BaseScraper):
             await self.close()
 
         logger.info(f"{TAG_CRAWL} Selesai: {len(collected_posts)} tweet media terkumpul dari @{username}.")
+
+        # Re-sort ke kronologis tertib (oldest-to-newest) untuk pengiriman teratur ke Discord
+        collected_posts.sort(
+            key=lambda p: (
+                str(p.timestamp) if p.timestamp else "1970-01-01T00:00:00Z",
+                int(p.post_id) if str(p.post_id).isdigit() else str(p.post_id),
+            ),
+            reverse=False,
+        )
 
         for post in collected_posts:
             yield post

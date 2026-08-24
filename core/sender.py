@@ -26,6 +26,7 @@ Discord Upload Limits:
 
 import asyncio
 import logging
+import os
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -38,8 +39,6 @@ from .downloader import MediaDownloader
 from .utils import TAG_DISCORD, TAG_WARN, TAG_ERROR, TAG_SUCCESS, fmt_size
 
 logger = logging.getLogger(__name__)
-
-import os
 
 # Jeda aman antar pengiriman pesan
 SEND_DELAY_SECONDS = 3
@@ -222,12 +221,13 @@ class MediaSender:
         uploadable: list[Path] = []
         skipped = 0
         for path in file_paths:
-            if path.stat().st_size <= self.max_file_bytes:
+            file_size = path.stat().st_size
+            if file_size <= self.max_file_bytes:
                 uploadable.append(path)
             else:
                 skipped += 1
                 logger.warning(
-                    f"{TAG_WARN} Skip {path.name}: {fmt_size(path.stat().st_size)} "
+                    f"{TAG_WARN} Skip {path.name}: {fmt_size(file_size)} "
                     f"> {self.max_file_size_mb}MB limit"
                 )
 
