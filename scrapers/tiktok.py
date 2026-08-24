@@ -4,9 +4,10 @@ Engine Scraper Profil TikTok 100% Guest Mode (Zero-Login) dengan Multi-Layer API
 
 Fitur & Keamanan:
 1. Multi-Tier Zero-Login Architecture:
-   - Pass 1: Scrapling / curl_cffi Fast SSR Rehydration (Desktop & Mobile).
-   - Pass 2: Direct TikTok Web / Mobile API query dengan TLS Impersonation (chrome124).
-   - Pass 3: yt-dlp Flat-Playlist (Guest Mode tanpa cookie).
+   - Pass 0: External API Profile Extractor (TikWM / Mirror Public Endpoint tanpa browser).
+   - Pass 1: Scrapling / curl_cffi Fast SSR Rehydration (Desktop & Mobile) dengan TLS & Sec-Ch-Ua Impersonation.
+   - Pass 2: Direct TikTok Web / Mobile API query (item_list) dengan TLS Impersonation (chrome124).
+   - Pass 3: yt-dlp Flat-Playlist dengan mobile extractor args.
    - Pass 4: Playwright Desktop Stealth Browser dengan Network Response Interceptor.
    - Pass 5: Playwright Mobile Device Emulation (iPhone / Mobile Safari) jika desktop terhalang Captcha.
 2. Anti-False-Completion (Captcha Safety Guard):
@@ -145,83 +146,135 @@ class TikTokScraper(BaseScraper):
         challenge_hit = False
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 1 (PRIMARY): Scrapling / curl_cffi Fast SSR Rehydration Parser
-        # Dual-Endpoint: Desktop & Mobile (Guest Mode murni tanpa cookie)
+        # PASS 0 (API-FIRST): External User Posts API (TikWM & Mirror Extractor)
+        # Menghindari overhead browser jika feed profil publik tersedia via API
         # ─────────────────────────────────────────────────────────────────────
-        logger.info(f"{TAG_CRAWL} [PASS 1] Menjalankan Scrapling Fast SSR Rehydration untuk @{username} (Zero-Login)...")
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.tiktok.com/",
-        }
+        logger.info(f"{TAG_CRAWL} [PASS 0] Mencoba API-first profile feed extractor untuk @{username}...")
+        try:
+            tw_api_urls = [
+                f"https://www.tikwm.com/api/user/posts?unique_id={username}&count=35",
+                f"https://tikwm.com/api/user/posts?unique_id={username}&count=35",
+            ]
+            tw_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Referer": "https://www.tikwm.com/",
+                "Accept": "application/json, text/plain, */*",
+            }
+            for tw_url in tw_api_urls:
+                if collected_urls:
+                    break
+                try:
+                    async with httpx.AsyncClient(timeout=12.0, headers=tw_headers, follow_redirects=True) as tw_client:
+                        tw_resp = await tw_client.get(tw_url)
+                        if tw_resp.status_code == 200:
+                            tw_json = tw_resp.json()
+                            if tw_json.get("code") == 0 and tw_json.get("data"):
+                                data_obj = tw_json["data"]
+                                video_list = data_obj.get("videos", []) or data_obj.get("itemList", []) or []
+                                for vid_item in video_list:
+                                    if self._is_valid_creator_post(vid_item, username):
+                                        vid_id = vid_item.get("video_id") or vid_item.get("id") or vid_item.get("itemId")
+                                        if vid_id and re.match(r"^\d{15,22}$", str(vid_id)):
+                                            is_photo = bool(vid_item.get("images") or vid_item.get("imagePost"))
+                                            t = "photo" if is_photo else "video"
+                                            c_url = f"https://www.tiktok.com/@{username}/{t}/{vid_id}"
+                                            if c_url not in seen_urls:
+                                                collected_urls.append(c_url)
+                                                seen_urls.add(c_url)
+                                if collected_urls:
+                                    logger.info(f"{TAG_CRAWL} [PASS 0] API Extractor berhasil menemukan {len(collected_urls)} post asli @{username}.")
+                except Exception as tw_err:
+                    logger.debug(f"Pass 0 TikWM query note: {tw_err}")
+        except Exception as p0_err:
+            logger.debug(f"Pass 0 outer note: {p0_err}")
 
-        target_endpoints = [canonical_url, mobile_url]
+        # ─────────────────────────────────────────────────────────────────────
+        # PASS 1 (PRIMARY): Scrapling / curl_cffi Fast SSR Rehydration Parser
+        # Dual-Endpoint: Desktop & Mobile dengan TLS & Sec-Ch-Ua Impersonation
+        # ─────────────────────────────────────────────────────────────────────
+        if not collected_urls:
+            logger.info(f"{TAG_CRAWL} [PASS 1] Menjalankan Scrapling Fast SSR Rehydration untuk @{username} (Zero-Login)...")
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+                "Referer": "https://www.tiktok.com/",
+                "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
+            }
 
-        for target_url in target_endpoints:
-            if collected_urls:
-                break
-            try:
-                html_text = ""
-                if HAS_CURL_CFFI:
-                    try:
-                        async with curl_requests.AsyncSession(impersonate="chrome124") as session:
-                            resp = await session.get(target_url, headers=headers, timeout=12)
-                            if resp.status_code == 200:
-                                html_text = resp.text
+            target_endpoints = [canonical_url, mobile_url]
+
+            for target_url in target_endpoints:
+                if collected_urls:
+                    break
+                try:
+                    html_text = ""
+                    if HAS_CURL_CFFI:
+                        try:
+                            async with curl_requests.AsyncSession(impersonate="chrome124") as session:
+                                resp = await session.get(target_url, headers=headers, timeout=12)
+                                if resp.status_code == 200:
+                                    html_text = resp.text
+                                    if "Something went wrong" in html_text or "verify-center" in html_text or "SlardarWAF" in html_text or "secsdk" in html_text:
+                                        challenge_hit = True
+                                        html_text = ""
+                        except Exception as c_err:
+                            logger.debug(f"curl_cffi SSR note ({target_url}): {c_err}")
+
+                    if not html_text and HAS_SCRAPLING:
+                        try:
+                            response = await AsyncFetcher.get(
+                                target_url,
+                                headers=headers,
+                                timeout=12,
+                                impersonate="chrome124",
+                            )
+                            if response.status == 200:
+                                html_text = response.text
                                 if "Something went wrong" in html_text or "verify-center" in html_text or "SlardarWAF" in html_text or "secsdk" in html_text:
                                     challenge_hit = True
                                     html_text = ""
-                    except Exception as c_err:
-                        logger.debug(f"curl_cffi SSR note ({target_url}): {c_err}")
+                        except Exception as sc_err:
+                            logger.debug(f"Scrapling AsyncFetcher note ({target_url}): {sc_err}")
 
-                if not html_text and HAS_SCRAPLING:
-                    try:
-                        response = await AsyncFetcher.get(
-                            target_url,
+                    if not html_text:
+                        async with httpx.AsyncClient(
                             headers=headers,
-                            timeout=12,
-                            impersonate="chrome124",
-                        )
-                        if response.status == 200:
-                            html_text = response.text
-                            if "Something went wrong" in html_text or "verify-center" in html_text or "SlardarWAF" in html_text or "secsdk" in html_text:
-                                challenge_hit = True
-                                html_text = ""
-                    except Exception as sc_err:
-                        logger.debug(f"Scrapling AsyncFetcher note ({target_url}): {sc_err}")
+                            follow_redirects=True,
+                            timeout=12.0,
+                        ) as client:
+                            resp = await client.get(target_url)
+                            if resp.status_code == 200:
+                                html_text = resp.text
+                                if "Something went wrong" in html_text or "verify-center" in html_text or "SlardarWAF" in html_text:
+                                    challenge_hit = True
+                                    html_text = ""
 
-                if not html_text:
-                    async with httpx.AsyncClient(
-                        headers=headers,
-                        follow_redirects=True,
-                        timeout=12.0,
-                    ) as client:
-                        resp = await client.get(target_url)
-                        if resp.status_code == 200:
-                            html_text = resp.text
-                            if "Something went wrong" in html_text or "verify-center" in html_text or "SlardarWAF" in html_text:
-                                challenge_hit = True
-                                html_text = ""
+                    if html_text:
+                        rehydration_data = self._parse_rehydration_from_html(html_text, username)
+                        rehydration_urls = rehydration_data.get("urls", [])
+                        expected_video_count = rehydration_data.get("videoCount", 0)
+                        sec_uid = rehydration_data.get("secUid", "")
 
-                if html_text:
-                    rehydration_data = self._parse_rehydration_from_html(html_text, username)
-                    rehydration_urls = rehydration_data.get("urls", [])
-                    expected_video_count = rehydration_data.get("videoCount", 0)
-                    sec_uid = rehydration_data.get("secUid", "")
+                        if expected_video_count > 0:
+                            logger.info(f"{TAG_CRAWL} Profil @{username}: {expected_video_count} postingan terdeteksi pada metadata.")
 
-                    if expected_video_count > 0:
-                        logger.info(f"{TAG_CRAWL} Profil @{username}: {expected_video_count} postingan terdeteksi pada metadata.")
+                        for r_url in rehydration_urls:
+                            if r_url not in seen_urls:
+                                collected_urls.append(r_url)
+                                seen_urls.add(r_url)
 
-                    for r_url in rehydration_urls:
-                        if r_url not in seen_urls:
-                            collected_urls.append(r_url)
-                            seen_urls.add(r_url)
-
-                    if collected_urls:
-                        logger.info(f"{TAG_CRAWL} [PASS 1] Fast Pass ({target_url}) berhasil menemukan {len(collected_urls)} post asli @{username}.")
-            except Exception as e:
-                logger.debug(f"Fast HTTP Rehydration info ({target_url}): {e}")
+                        if collected_urls:
+                            logger.info(f"{TAG_CRAWL} [PASS 1] Fast Pass ({target_url}) berhasil menemukan {len(collected_urls)} post asli @{username}.")
+                except Exception as e:
+                    logger.debug(f"Fast HTTP Rehydration info ({target_url}): {e}")
 
         # ─────────────────────────────────────────────────────────────────────
         # PASS 2: TikTok Direct Web / Mobile API item_list via curl_cffi
@@ -258,7 +311,7 @@ class TikTokScraper(BaseScraper):
                 logger.debug(f"TikTok Direct API note: {api_err}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 3: yt-dlp Flat-Playlist Extractor (Guest Mode tanpa cookie)
+        # PASS 3: yt-dlp Flat-Playlist Extractor (Mobile API Mode)
         # ─────────────────────────────────────────────────────────────────────
         if not collected_urls:
             logger.info(f"{TAG_CRAWL} [PASS 3] Mencoba ekstraksi postingan @{username} via yt-dlp flat-playlist (Zero-Login)...")
@@ -268,6 +321,7 @@ class TikTokScraper(BaseScraper):
                     "--flat-playlist",
                     "--dump-json",
                     "--no-warnings",
+                    "--extractor-args", "tiktok:api_hostname=api16-normal-c-useast1a.tiktokv.com",
                     canonical_url,
                 ]
 
