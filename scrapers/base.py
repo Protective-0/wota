@@ -516,6 +516,12 @@ class BaseScraper(ABC):
 
         return None
 
+    async def export_session_cookies_for_ytdlp(self, platform: str) -> Optional[Path]:
+        """
+        Ekspor cookie session platform ke format Netscape cookies.txt untuk digunakan yt-dlp.
+        """
+        return await self.load_and_inject_cookies(None, platform)
+
     async def __aenter__(self):
         return self
 
