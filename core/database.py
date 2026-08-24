@@ -186,40 +186,34 @@ class DatabaseManager:
 
     async def _rebuild_monitored_accounts_safely(self) -> None:
         """Replace legacy schema only after copied rows are safely staged."""
-        # FIX: use `async with self.db` instead of manual BEGIN/commit/rollback.
-        # aiosqlite in WAL mode raises "cannot start a transaction within a transaction"
-        # when BEGIN is issued manually while autocommit is active. The context manager
-        # handles commit on success and rollback on any exception atomically.
-        #
-        # Additional FIX: call commit() BEFORE entering the context manager to ensure
-        # any implicit transaction from prior executescript() is closed. This prevents
-        # OperationalError: cannot start a transaction within a transaction.
         try:
-            await self.db.commit()  # Flush any pending implicit transaction first
-            async with self.db:
-                await self.db.execute("""
-                    CREATE TABLE monitored_accounts_new (
-                        username TEXT NOT NULL,
-                        platform TEXT NOT NULL,
-                        channel_id INTEGER NOT NULL,
-                        last_scraped_id TEXT,
-                        initial_scan_completed INTEGER NOT NULL DEFAULT 0,
-                        created_at DATETIME DEFAULT (datetime('now', 'localtime')),
-                        PRIMARY KEY (username, platform)
-                    )
-                """)
-                await self.db.execute("""
-                    INSERT OR REPLACE INTO monitored_accounts_new
-                        (username, platform, channel_id, last_scraped_id, initial_scan_completed, created_at)
-                    SELECT username, COALESCE(platform, 'instagram'), channel_id,
-                           COALESCE(last_scraped_id, ''), 0,
-                           COALESCE(created_at, datetime('now', 'localtime'))
-                    FROM monitored_accounts
-                """)
-                await self.db.execute("DROP TABLE monitored_accounts")
-                await self.db.execute("ALTER TABLE monitored_accounts_new RENAME TO monitored_accounts")
+            await self.db.execute("""
+                CREATE TABLE monitored_accounts_new (
+                    username TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    last_scraped_id TEXT,
+                    initial_scan_completed INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME DEFAULT (datetime('now', 'localtime')),
+                    PRIMARY KEY (username, platform)
+                )
+            """)
+            await self.db.execute("""
+                INSERT OR REPLACE INTO monitored_accounts_new
+                    (username, platform, channel_id, last_scraped_id, initial_scan_completed, created_at)
+                SELECT username, COALESCE(platform, 'instagram'), channel_id,
+                       COALESCE(last_scraped_id, ''), 0,
+                       COALESCE(created_at, datetime('now', 'localtime'))
+                FROM monitored_accounts
+            """)
+            await self.db.execute("DROP TABLE monitored_accounts")
+            await self.db.execute("ALTER TABLE monitored_accounts_new RENAME TO monitored_accounts")
+            await self.db.commit()
         except Exception as rebuild_err:
-            # rollback is handled automatically by `async with self.db` on exception.
+            try:
+                await self.db.rollback()
+            except Exception:
+                pass
             logger.error(f"Monitored-account migration failed: {rebuild_err}", exc_info=True)
             raise
 
@@ -229,69 +223,76 @@ class DatabaseManager:
             columns = [row async for row in cursor]
         if [row["name"] for row in columns if row["pk"]] == ["post_id", "platform"]:
             return
-        # FIX: same pattern — replace manual BEGIN/rollback with context manager.
         try:
-            async with self.db:
-                await self.db.execute("""
-                    CREATE TABLE scraped_posts_new (
-                        post_id TEXT NOT NULL,
-                        username TEXT,
-                        platform TEXT NOT NULL,
-                        uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        PRIMARY KEY (post_id, platform)
-                    )
-                """)
-                await self.db.execute("""
-                    INSERT OR IGNORE INTO scraped_posts_new (post_id, username, platform, uploaded_at)
-                    SELECT post_id, username, COALESCE(NULLIF(platform, ''), 'unknown'), uploaded_at
-                    FROM scraped_posts
-                """)
-                await self.db.execute("DROP TABLE scraped_posts")
-                await self.db.execute("ALTER TABLE scraped_posts_new RENAME TO scraped_posts")
+            await self.db.execute("""
+                CREATE TABLE scraped_posts_new (
+                    post_id TEXT NOT NULL,
+                    username TEXT,
+                    platform TEXT NOT NULL,
+                    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (post_id, platform)
+                )
+            """)
+            await self.db.execute("""
+                INSERT OR IGNORE INTO scraped_posts_new (post_id, username, platform, uploaded_at)
+                SELECT post_id, username, COALESCE(NULLIF(platform, ''), 'unknown'), uploaded_at
+                FROM scraped_posts
+            """)
+            await self.db.execute("DROP TABLE scraped_posts")
+            await self.db.execute("ALTER TABLE scraped_posts_new RENAME TO scraped_posts")
+            await self.db.commit()
         except Exception:
-            # rollback handled automatically by context manager.
+            try:
+                await self.db.rollback()
+            except Exception:
+                pass
             raise
 
     async def close(self) -> None:
-        """Tutup koneksi database dengan aman."""
+        """Tutup koneksi database SQLite."""
         if self._db:
             await self._db.close()
             self._db = None
+            logger.info("[⚙️ SYSTEM] Database connection closed.")
 
     # ──────────────────────────────────────────────
-    # Operasi Anti-Duplikasi
+    # Operasi Riwayat Postingan
     # ──────────────────────────────────────────────
 
     async def check_post_exists(self, post_id: str, platform: str) -> bool:
         """
-        Cek apakah sebuah postingan sudah pernah diunduh/dikirim sebelumnya.
-        Memeriksa kedua tabel (downloaded_posts & scraped_posts) untuk konsistensi anti-duplikasi.
+        Cek apakah post_id dari platform tertentu sudah pernah di-scrape.
         """
         async with self.db.execute(
             """
-            SELECT 1 FROM downloaded_posts WHERE post_id = ? AND platform = ? AND status = 'done'
-            UNION
-            SELECT 1 FROM scraped_posts WHERE post_id = ? AND (platform = ? OR platform IS NULL OR platform = '')
+            SELECT 1 FROM scraped_posts
+            WHERE post_id = ? AND platform = ?
+            LIMIT 1
             """,
-            (post_id, platform, post_id, platform),
+            (post_id, platform.lower()),
         ) as cursor:
-            return await cursor.fetchone() is not None
+            row = await cursor.fetchone()
+            return row is not None
 
-    async def is_post_scraped(self, post_id: str, platform: str = "") -> bool:
+    async def check_posts_exist_bulk(
+        self, post_ids: list[str], platform: str
+    ) -> set[str]:
         """
-        Cek apakah sebuah post_id sudah tercatat di database (sudah dikirim ke Discord).
+        Cek keberadaan banyak post_id sekaligus dalam 1 query.
         """
-        if platform:
-            return await self.check_post_exists(post_id, platform)
-        async with self.db.execute(
-            """
-            SELECT 1 FROM scraped_posts WHERE post_id = ?
-            UNION
-            SELECT 1 FROM downloaded_posts WHERE post_id = ? AND status = 'done'
-            """,
-            (post_id, post_id),
-        ) as cursor:
-            return await cursor.fetchone() is not None
+        if not post_ids:
+            return set()
+
+        placeholders = ",".join("?" for _ in post_ids)
+        query = f"""
+            SELECT post_id FROM scraped_posts
+            WHERE platform = ? AND post_id IN ({placeholders})
+        """
+        params = [platform.lower()] + post_ids
+
+        async with self.db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return {row["post_id"] for row in rows}
 
     async def mark_post_scraped(self, post_id: str, username: str, platform: str) -> None:
         """
@@ -306,22 +307,21 @@ class DatabaseManager:
         else:
             profile_url_built = f"https://www.instagram.com/{uname}/"
 
-        async with self.db:
-            await self.db.execute(
-                """
-                INSERT OR IGNORE INTO scraped_posts (post_id, username, platform)
-                VALUES (?, ?, ?)
-                """,
-                (post_id, uname, plat),
-            )
-            await self.db.execute(
-                """
-                INSERT OR IGNORE INTO downloaded_posts (post_id, platform, profile_url, media_count, status)
-                VALUES (?, ?, ?, 1, 'done')
-                """,
-                (post_id, plat, profile_url_built),
-            )
-            await self.db.commit()
+        await self.db.execute(
+            """
+            INSERT OR IGNORE INTO scraped_posts (post_id, username, platform)
+            VALUES (?, ?, ?)
+            """,
+            (post_id, uname, plat),
+        )
+        await self.db.execute(
+            """
+            INSERT OR IGNORE INTO downloaded_posts (post_id, platform, profile_url, media_count, status)
+            VALUES (?, ?, ?, 1, 'done')
+            """,
+            (post_id, plat, profile_url_built),
+        )
+        await self.db.commit()
 
     async def mark_post_downloaded(
         self,
@@ -339,23 +339,22 @@ class DatabaseManager:
         if not username:
             username = profile_url.split("?")[0].rstrip("/").split("/")[-1].replace("@", "")
 
-        async with self.db:
-            await self.db.execute(
-                """
-                INSERT OR IGNORE INTO downloaded_posts
-                    (post_id, platform, profile_url, media_count, status)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (post_id, platform, profile_url, media_count, status),
-            )
-            await self.db.execute(
-                """
-                INSERT OR IGNORE INTO scraped_posts (post_id, username, platform)
-                VALUES (?, ?, ?)
-                """,
-                (post_id, username, platform),
-            )
-            await self.db.commit()
+        await self.db.execute(
+            """
+            INSERT OR IGNORE INTO downloaded_posts
+                (post_id, platform, profile_url, media_count, status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (post_id, platform, profile_url, media_count, status),
+        )
+        await self.db.execute(
+            """
+            INSERT OR IGNORE INTO scraped_posts (post_id, username, platform)
+            VALUES (?, ?, ?)
+            """,
+            (post_id, username, platform),
+        )
+        await self.db.commit()
 
     async def mark_post_failed(self, post_id: str, platform: str, profile_url: str) -> None:
         """Tandai postingan yang gagal diproses (untuk tracking error)."""
