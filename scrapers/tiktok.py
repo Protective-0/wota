@@ -415,7 +415,7 @@ class TikTokScraper(BaseScraper):
                         except Exception:
                             pass
                         continue
-                    if proc.returncode == 0 and stdout:
+                    if stdout:
                         for line in stdout.decode("utf-8", errors="ignore").splitlines():
                             line = line.strip()
                             if not line:
@@ -423,8 +423,8 @@ class TikTokScraper(BaseScraper):
                             try:
                                 entry = json.loads(line)
                                 p_id = entry.get("id")
-                                uploader = str(entry.get("uploader") or entry.get("uploader_id") or "").lower().replace("@", "").strip()
-                                if uploader and uploader != username:
+                                uploader = str(entry.get("uploader") or "").lower().replace("@", "").strip()
+                                if uploader and uploader != username and not uploader.isdigit():
                                     continue
                                 if p_id and re.match(r"^\d{15,22}$", str(p_id)):
                                     p_url = f"https://www.tiktok.com/@{username}/video/{p_id}"
