@@ -377,6 +377,7 @@ class TikTokScraper(BaseScraper):
             try:
                 cookie_file = await self.export_session_cookies_for_ytdlp(self.PLATFORM)
                 cmd_variants = [
+                    # 1. Clean Mobile API US-East (Zero-Login, No-Cookie)
                     [
                         sys.executable,
                         "-m", "yt_dlp",
@@ -384,22 +385,52 @@ class TikTokScraper(BaseScraper):
                         "--dump-json",
                         "--no-warnings",
                         "--extractor-args", "tiktok:api_hostname=api16-normal-c-useast1a.tiktokv.com",
+                        canonical_url,
                     ],
+                    # 2. Clean Mobile API VA (Zero-Login, No-Cookie)
                     [
                         sys.executable,
                         "-m", "yt_dlp",
                         "--flat-playlist",
                         "--dump-json",
                         "--no-warnings",
-                    ]
+                        "--extractor-args", "tiktok:api_hostname=api22-va.tiktokv.com",
+                        canonical_url,
+                    ],
                 ]
 
-                for base_cmd in cmd_variants:
-                    cmd = list(base_cmd)
-                    if cookie_file and cookie_file.exists():
-                        cmd.extend(["--cookies", str(cookie_file)])
-                    cmd.append(canonical_url)
+                if cookie_file and cookie_file.exists():
+                    cmd_variants.append([
+                        sys.executable,
+                        "-m", "yt_dlp",
+                        "--flat-playlist",
+                        "--dump-json",
+                        "--no-warnings",
+                        "--cookies", str(cookie_file),
+                        "--extractor-args", "tiktok:api_hostname=api16-normal-c-useast1a.tiktokv.com",
+                        canonical_url,
+                    ])
+                    cmd_variants.append([
+                        sys.executable,
+                        "-m", "yt_dlp",
+                        "--flat-playlist",
+                        "--dump-json",
+                        "--no-warnings",
+                        "--cookies", str(cookie_file),
+                        canonical_url,
+                    ])
 
+                # 3. Standard Fallback
+                cmd_variants.append([
+                    sys.executable,
+                    "-m", "yt_dlp",
+                    "--flat-playlist",
+                    "--dump-json",
+                    "--no-warnings",
+                    canonical_url,
+                ])
+
+                for cmd in cmd_variants:
                     proc = await asyncio.create_subprocess_exec(
                         *cmd,
                         stdout=asyncio.subprocess.PIPE,

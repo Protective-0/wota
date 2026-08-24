@@ -304,12 +304,21 @@ class BaseScraper(ABC):
                 // 1. Clear Webdriver flag
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
-                // 2. Mock Chrome runtime structure
-                window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {} };
+                // 2. Mock Platform & UserAgentData to match Windows User-Agent on Linux servers
+                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+                if (navigator.userAgentData) {
+                    Object.defineProperty(navigator.userAgentData, 'platform', { get: () => 'Windows' });
+                }
 
-                // 3. Fake Languages & Plugins
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'id'] });
+                // 3. Mock Chrome runtime structure
+                window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+
+                // 4. Fake Languages, Plugins, Hardware
+                Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
             }
         """)
 
@@ -347,10 +356,24 @@ class BaseScraper(ABC):
         # Deep Stealth Script Injection
         await context.add_init_script("""
             () => {
+                // 1. Clear Webdriver flag
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {} };
+
+                // 2. Mock Platform & UserAgentData to match Windows User-Agent on Linux servers
+                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+                if (navigator.userAgentData) {
+                    Object.defineProperty(navigator.userAgentData, 'platform', { get: () => 'Windows' });
+                }
+
+                // 3. Mock Chrome runtime structure
+                window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+
+                // 4. Fake Languages, Plugins, Hardware
                 Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
             }
         """)
 
