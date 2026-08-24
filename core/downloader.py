@@ -427,27 +427,27 @@ class MediaDownloader:
                 elif not downloaded_files and "tiktok.com" in post_url:
                     if "/video/" in post_url or "/v/" in post_url:
                         # ── Jalur Khusus Video TikTok ────────────────────────────
-                        logger.warning(f"{TAG_WARN} yt-dlp kosong untuk TikTok Video — mencoba Browser & TikWM Video Fallback...")
+                        logger.warning(f"{TAG_WARN} yt-dlp kosong untuk TikTok Video — mencoba TikWM & Browser Fallback...")
                         
-                        # Step A: Playwright Video Extractor + In-flight Network Stream Capture
-                        captured_file, video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, post_id, cookies_file)
-                        if captured_file and captured_file.exists() and captured_file.stat().st_size > 300_000:
-                            downloaded_files = [captured_file]
-                            real_caption = browser_caption
-                        elif video_url:
-                            out_path = await self._download_tiktok_cdn_video(video_url, post_id, browser_cookies, cookies_file)
-                            if out_path:
-                                downloaded_files = [out_path]
-                                real_caption = browser_caption
+                        # Step A: TikWM Clean API Video Fallback (API-First, no browser overhead)
+                        tw_file, tw_caption = await self._download_via_tikwm(post_url, post_id)
+                        if tw_file and tw_file.exists() and tw_file.stat().st_size > 300_000:
+                            downloaded_files = [tw_file]
+                            if tw_caption:
+                                real_caption = tw_caption
 
-                        # Step B: TikWM Clean API Video Fallback
+                        # Step B: Playwright Video Extractor + In-flight Stream Capture (Fallback jika API gagal)
                         if not downloaded_files:
-                            logger.info(f"{TAG_DOWN} Mencoba TikWM Clean API fallback untuk video {post_id}...")
-                            tw_file, tw_caption = await self._download_via_tikwm(post_url, post_id)
-                            if tw_file:
-                                downloaded_files = [tw_file]
-                                if tw_caption:
-                                    real_caption = tw_caption
+                            logger.info(f"{TAG_DOWN} TikWM API kosong, menjalankan Browser Stream Fallback untuk {post_id}...")
+                            captured_file, video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, post_id, cookies_file)
+                            if captured_file and captured_file.exists() and captured_file.stat().st_size > 300_000:
+                                downloaded_files = [captured_file]
+                                real_caption = browser_caption
+                            elif video_url:
+                                out_path = await self._download_tiktok_cdn_video(video_url, post_id, browser_cookies, cookies_file)
+                                if out_path:
+                                    downloaded_files = [out_path]
+                                    real_caption = browser_caption
                     else:
                         # ── Jalur Khusus Foto / Carousel TikTok ──────────────────
                         logger.warning(f"{TAG_WARN} yt-dlp kosong untuk TikTok Photo — mencoba Carousel Extractor...")
@@ -494,23 +494,25 @@ class MediaDownloader:
                     download_failed = True
                 elif "tiktok.com" in post_url:
                     if "/video/" in post_url or "/v/" in post_url:
-                        logger.warning(f"{TAG_WARN} yt-dlp gagal untuk TikTok Video ({yt_error}) — menjalankan Video Fallback...")
-                        captured_file, video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, post_id, cookies_file)
-                        if captured_file and captured_file.exists() and captured_file.stat().st_size > 300_000:
-                            downloaded_files = [captured_file]
-                            real_caption = browser_caption
-                        elif video_url:
-                            out_path = await self._download_tiktok_cdn_video(video_url, post_id, browser_cookies, cookies_file)
-                            if out_path:
-                                downloaded_files = [out_path]
-                                real_caption = browser_caption
+                        logger.warning(f"{TAG_WARN} yt-dlp gagal untuk TikTok Video ({yt_error}) — menjalankan TikWM & Video Fallback...")
+                        # Step A: TikWM Clean API Video Fallback
+                        tw_file, tw_caption = await self._download_via_tikwm(post_url, post_id)
+                        if tw_file and tw_file.exists() and tw_file.stat().st_size > 300_000:
+                            downloaded_files = [tw_file]
+                            if tw_caption:
+                                real_caption = tw_caption
 
+                        # Step B: Playwright Video Extractor + In-flight Stream Capture
                         if not downloaded_files:
-                            tw_file, tw_caption = await self._download_via_tikwm(post_url, post_id)
-                            if tw_file:
-                                downloaded_files = [tw_file]
-                                if tw_caption:
-                                    real_caption = tw_caption
+                            captured_file, video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, post_id, cookies_file)
+                            if captured_file and captured_file.exists() and captured_file.stat().st_size > 300_000:
+                                downloaded_files = [captured_file]
+                                real_caption = browser_caption
+                            elif video_url:
+                                out_path = await self._download_tiktok_cdn_video(video_url, post_id, browser_cookies, cookies_file)
+                                if out_path:
+                                    downloaded_files = [out_path]
+                                    real_caption = browser_caption
                     else:
                         logger.warning(f"{TAG_WARN} yt-dlp gagal untuk TikTok Photo — coba Carousel Fallback: {yt_error}")
                         try:
