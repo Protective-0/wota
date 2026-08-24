@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 class TikTokScraper(BaseScraper):
-    """Scraper profil TikTok Zero-Login dengan pendekatan API-First (Zero-Browser)."""
+    """
+    Scraper profil TikTok Zero-Login dengan pendekatan API-First (Zero-Browser).
+    Dilengkapi Strict Author URL Validation untuk mencegah kebocoran link rekomendasi/sidebar akun lain.
+    """
 
     PLATFORM = "tiktok"
 
@@ -45,6 +48,23 @@ class TikTokScraper(BaseScraper):
     def _extract_post_id(self, url: str) -> Optional[str]:
         match = re.search(r"/(?:video|photo|v)/(\d{15,22})", url)
         return match.group(1) if match else None
+
+    def _is_valid_author_post_url(self, post_url: str, target_username: str) -> bool:
+        """
+        [STRICT AUTHOR URL SANITIZER]
+        Hanya terima URL jika path URL diawali persis dengan @{target_username}/(video|photo|v)/{numeric_id}.
+        Menolak 100% URL video rekomendasi atau sidebar dari akun lain.
+        """
+        if not post_url or not isinstance(post_url, str):
+            return False
+        clean_url = post_url.lower().split("?")[0].rstrip("/")
+        u = target_username.lower().replace("@", "").strip()
+        expected_patterns = (
+            f"tiktok.com/@{u}/video/",
+            f"tiktok.com/@{u}/photo/",
+            f"tiktok.com/@{u}/v/",
+        )
+        return any(pat in clean_url for pat in expected_patterns)
 
     async def scrape_profile(
         self,
@@ -74,7 +94,6 @@ class TikTokScraper(BaseScraper):
                 "Accept": "application/json, text/plain, */*",
                 "Referer": "https://www.tikwm.com/",
             }
-            # Coba curl_cffi dulu jika tersedia
             resp_data = None
             try:
                 from curl_cffi import requests as curl_requests
@@ -99,7 +118,7 @@ class TikTokScraper(BaseScraper):
                     author_data = v.get("author", {})
                     author_uid = str(author_data.get("unique_id") or author_data.get("uniqueId") or "").lower().strip()
 
-                    # Strict Author Match
+                    # Strict Author Verification
                     if author_uid and author_uid != username:
                         continue
 
@@ -107,12 +126,12 @@ class TikTokScraper(BaseScraper):
                         is_photo = bool(v.get("images") or v.get("imagePost"))
                         t = "photo" if is_photo else "video"
                         p_url = f"https://www.tiktok.com/@{username}/{t}/{video_id}"
-                        if p_url not in seen_urls:
+                        if self._is_valid_author_post_url(p_url, username) and p_url not in seen_urls:
                             collected_urls.append(p_url)
                             seen_urls.add(p_url)
 
                 if collected_urls:
-                    logger.info(f"{TAG_CRAWL} [PASS 0] Berhasil menemukan {len(collected_urls)} postingan via TikWM API.")
+                    logger.info(f"{TAG_CRAWL} [PASS 0] Berhasil menemukan {len(collected_urls)} postingan asli via TikWM API.")
         except Exception as e:
             logger.debug(f"[PASS 0] TikWM API info: {e}")
 
@@ -142,10 +161,15 @@ class TikTokScraper(BaseScraper):
                         if resp.status_code == 200:
                             html_text = resp.text
 
+                # Hard Abort jika halaman menyajikan Captcha / WAF Challenge
+                if html_text and any(block in html_text for block in ("verify-center", "SlardarWAF", "secsdk", "captcha")):
+                    logger.warning(f"{TAG_WARN} TikTok SSR terhalang WAF Challenge — membatalkan parsing HTML.")
+                    html_text = ""
+
                 if html_text:
                     parsed_urls = self._parse_rehydration_from_html(html_text, username)
                     for r_url in parsed_urls:
-                        if r_url not in seen_urls:
+                        if self._is_valid_author_post_url(r_url, username) and r_url not in seen_urls:
                             collected_urls.append(r_url)
                             seen_urls.add(r_url)
                     if collected_urls:
@@ -179,12 +203,12 @@ class TikTokScraper(BaseScraper):
                         try:
                             entry = json.loads(line)
                             p_id = entry.get("id")
-                            uploader = str(entry.get("uploader") or entry.get("uploader_id") or "").lower().replace("@", "")
+                            uploader = str(entry.get("uploader") or entry.get("uploader_id") or "").lower().replace("@", "").strip()
                             if uploader and uploader != username:
                                 continue
                             if p_id and re.match(r"^\d{15,22}$", str(p_id)):
                                 p_url = f"https://www.tiktok.com/@{username}/video/{p_id}"
-                                if p_url not in seen_urls:
+                                if self._is_valid_author_post_url(p_url, username) and p_url not in seen_urls:
                                     collected_urls.append(p_url)
                                     seen_urls.add(p_url)
                         except Exception:
@@ -240,6 +264,10 @@ class TikTokScraper(BaseScraper):
             if not obj or not isinstance(obj, (dict, list)):
                 return
             if isinstance(obj, dict):
+                # Filter out Repost flag
+                if obj.get("isRepost") or obj.get("repost") or obj.get("is_repost"):
+                    return
+
                 item_module = obj.get("ItemModule")
                 if isinstance(item_module, dict):
                     for p_id, item in item_module.items():
@@ -250,7 +278,9 @@ class TikTokScraper(BaseScraper):
                             if str(author).lower().replace("@", "").strip() == u and re.match(r"^\d{15,22}$", str(p_id)):
                                 is_photo = bool(item.get("imagePost") or item.get("images") or item.get("imageList"))
                                 t = "photo" if is_photo else "video"
-                                found_urls.add(f"https://www.tiktok.com/@{u}/{t}/{p_id}")
+                                p_url = f"https://www.tiktok.com/@{u}/{t}/{p_id}"
+                                if self._is_valid_author_post_url(p_url, u):
+                                    found_urls.add(p_url)
 
                 user_detail = obj.get("webapp.user-detail") or obj.get("user-detail") or obj.get("userPage")
                 if isinstance(user_detail, dict):
@@ -258,7 +288,9 @@ class TikTokScraper(BaseScraper):
                     if isinstance(u_items, list):
                         for it in u_items:
                             if isinstance(it, str) and re.match(r"^\d{15,22}$", it):
-                                found_urls.add(f"https://www.tiktok.com/@{u}/video/{it}")
+                                p_url = f"https://www.tiktok.com/@{u}/video/{it}"
+                                if self._is_valid_author_post_url(p_url, u):
+                                    found_urls.add(p_url)
                             elif isinstance(it, dict):
                                 a_info = it.get("author") or {}
                                 a_uid = a_info.get("uniqueId") or a_info.get("unique_id") if isinstance(a_info, dict) else str(a_info)
@@ -267,7 +299,9 @@ class TikTokScraper(BaseScraper):
                                     if p_id and re.match(r"^\d{15,22}$", str(p_id)):
                                         is_photo = bool(it.get("imagePost") or it.get("images"))
                                         t = "photo" if is_photo else "video"
-                                        found_urls.add(f"https://www.tiktok.com/@{u}/{t}/{p_id}")
+                                        p_url = f"https://www.tiktok.com/@{u}/{t}/{p_id}"
+                                        if self._is_valid_author_post_url(p_url, u):
+                                            found_urls.add(p_url)
 
                 for val in obj.values():
                     search_json(val)
