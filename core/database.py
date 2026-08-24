@@ -261,15 +261,35 @@ class DatabaseManager:
 
     async def check_post_exists(self, post_id: str, platform: str) -> bool:
         """
-        Cek apakah post_id dari platform tertentu sudah pernah di-scrape.
+        Cek apakah post_id dari platform tertentu sudah pernah di-scrape/dikirim ke Discord.
         """
+        plat = platform.lower()
         async with self.db.execute(
             """
-            SELECT 1 FROM scraped_posts
-            WHERE post_id = ? AND platform = ?
+            SELECT 1 FROM scraped_posts WHERE post_id = ? AND platform = ?
+            UNION
+            SELECT 1 FROM downloaded_posts WHERE post_id = ? AND platform = ? AND status = 'done'
             LIMIT 1
             """,
-            (post_id, platform.lower()),
+            (post_id, plat, post_id, plat),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row is not None
+
+    async def is_post_scraped(self, post_id: str, platform: str = "") -> bool:
+        """
+        Cek apakah sebuah post_id sudah tercatat di database (sudah dikirim ke Discord).
+        """
+        if platform:
+            return await self.check_post_exists(post_id, platform)
+        async with self.db.execute(
+            """
+            SELECT 1 FROM scraped_posts WHERE post_id = ?
+            UNION
+            SELECT 1 FROM downloaded_posts WHERE post_id = ? AND status = 'done'
+            LIMIT 1
+            """,
+            (post_id, post_id),
         ) as cursor:
             row = await cursor.fetchone()
             return row is not None
