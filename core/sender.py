@@ -90,9 +90,14 @@ class MediaSender:
         caption: str = "",
     ) -> bool:
         """
-        Kirim file video ke Discord channel menggunakan discord.File stream.
+        Kirim file video ke Discord channel menggunakan async file stream.
         """
-        file_size = file_path.stat().st_size
+        try:
+            file_size = file_path.stat().st_size
+        except Exception as e:
+            logger.error(f"{TAG_ERROR} Gagal membaca ukuran file video {file_path.name}: {e}")
+            return False
+
         size_mb = file_size / (1024 * 1024)
 
         if file_size > self.max_file_bytes:
@@ -106,23 +111,23 @@ class MediaSender:
             await self.downloader.cleanup_files_async([file_path])
             return False
 
-        discord_file = discord.File(file_path)
-        # FIX: removed duplicate file_size = file_path.stat().st_size call here.
-        # file_size was already captured at L96 before the early-return guards above.
-        # Re-reading stat() here was redundant (and a syscall per send).
         try:
-            await self.channel.send(
-                file=discord_file,
-            )
-            logger.info(f"{TAG_DISCORD} Video terkirim: {file_path.name} ({fmt_size(file_size)})")
+            # Baca file secara non-blocking via aiofiles
+            async with aiofiles.open(file_path, "rb") as f:
+                file_bytes = await f.read()
+
+            discord_file = discord.File(BytesIO(file_bytes), filename=file_path.name)
+            try:
+                await self.channel.send(file=discord_file)
+                logger.info(f"{TAG_DISCORD} Video terkirim: {file_path.name} ({fmt_size(file_size)})")
+            finally:
+                discord_file.close()
         except discord.HTTPException as e:
             logger.error(f"{TAG_ERROR} Discord HTTP error kirim video {file_path.name}: {e}")
             return False
         except Exception as e:
             logger.error(f"{TAG_ERROR} Error tak terduga kirim video {file_path.name}: {e}")
             return False
-        finally:
-            discord_file.close()
 
         await asyncio.sleep(1.5)
         await self.downloader.cleanup_files_async([file_path])
@@ -142,7 +147,11 @@ class MediaSender:
         if file_type == "video":
             return await self.send_video(file_path, caption)
 
-        file_size = file_path.stat().st_size
+        try:
+            file_size = file_path.stat().st_size
+        except Exception as e:
+            logger.error(f"{TAG_ERROR} Gagal membaca ukuran file {file_path.name}: {e}")
+            return False
 
         # Cek apakah file melebihi limit upload Discord
         if file_size > self.max_file_bytes:
@@ -151,31 +160,29 @@ class MediaSender:
                 f"{TAG_WARN} {file_path.name} ({size_mb:.1f}MB) melebihi "
                 f"limit Discord ({self.max_file_size_mb}MB) — skip."
             )
-            # Kirim notifikasi teks bahwa file terlalu besar
             await self.send_text(
                 f"⚠️ File `{file_path.name}` ({size_mb:.1f}MB) melebihi limit upload Discord ({self.max_file_size_mb}MB).\n"
                 f"File tetap tersedia di server lokal."
             )
-            # Cleanup file yang tidak bisa dikirim
             await self.downloader.cleanup_files_async([file_path])
             return False
 
-        discord_file = discord.File(file_path)
-        # FIX: removed duplicate file_size = file_path.stat().st_size call here.
-        # file_size was already captured at L144 before the early-return guards above.
         try:
-            await self.channel.send(
-                file=discord_file,
-            )
-            logger.info(f"{TAG_DISCORD} Media terkirim: {file_path.name} ({fmt_size(file_size)})")
+            async with aiofiles.open(file_path, "rb") as f:
+                file_bytes = await f.read()
+
+            discord_file = discord.File(BytesIO(file_bytes), filename=file_path.name)
+            try:
+                await self.channel.send(file=discord_file)
+                logger.info(f"{TAG_DISCORD} Media terkirim: {file_path.name} ({fmt_size(file_size)})")
+            finally:
+                discord_file.close()
         except discord.HTTPException as e:
             logger.error(f"{TAG_ERROR} Discord HTTP error kirim {file_path.name}: {e}")
             return False
         except Exception as e:
             logger.error(f"{TAG_ERROR} Error tak terduga kirim {file_path.name}: {e}")
             return False
-        finally:
-            discord_file.close()
 
         # Jeda sebelum cleanup agar tidak race condition dengan Discord upload buffer
         await asyncio.sleep(1.5)
@@ -193,10 +200,6 @@ class MediaSender:
     ) -> list[list[Path]]:
         """
         Pecah list file menjadi chunks (max 10 per message).
-
-        Contoh:
-            18 files → [[file1..file10], [file11..file18]]
-            → 2x channel.send() calls
         """
         return [
             file_list[i : i + chunk_size] for i in range(0, len(file_list), chunk_size)
@@ -214,22 +217,21 @@ class MediaSender:
         if not file_paths:
             return False
 
-        # Filter file yang terlalu besar sebelum proses
-        # FIX: use self.max_file_bytes (dynamic property) instead of module-level DISCORD_MAX_FILE_BYTES
-        # constant (computed once at import). If MAX_FILE_SIZE_MB env changes at runtime,
-        # the old constant stays stale and wrong files get skipped.
         uploadable: list[Path] = []
         skipped = 0
         for path in file_paths:
-            file_size = path.stat().st_size
-            if file_size <= self.max_file_bytes:
-                uploadable.append(path)
-            else:
-                skipped += 1
-                logger.warning(
-                    f"{TAG_WARN} Skip {path.name}: {fmt_size(file_size)} "
-                    f"> {self.max_file_size_mb}MB limit"
-                )
+            try:
+                file_size = path.stat().st_size
+                if file_size <= self.max_file_bytes:
+                    uploadable.append(path)
+                else:
+                    skipped += 1
+                    logger.warning(
+                        f"{TAG_WARN} Skip {path.name}: {fmt_size(file_size)} "
+                        f"> {self.max_file_size_mb}MB limit"
+                    )
+            except Exception as e:
+                logger.warning(f"Gagal stat file carousel {path.name}: {e}")
 
         if skipped > 0:
             await self.send_text(
@@ -237,7 +239,6 @@ class MediaSender:
             )
 
         if not uploadable:
-            # Semua file terlalu besar
             await self.downloader.cleanup_files_async(file_paths)
             return False
 
@@ -248,9 +249,20 @@ class MediaSender:
         sent_messages = []
 
         for idx, chunk in enumerate(chunks):
-            # Bangun list discord.File langsung dari path
-            discord_files = [discord.File(p) for p in chunk]
-            chunk_total_bytes = sum(p.stat().st_size for p in chunk)
+            discord_files = []
+            chunk_total_bytes = 0
+
+            for p in chunk:
+                try:
+                    async with aiofiles.open(p, "rb") as f:
+                        file_bytes = await f.read()
+                    discord_files.append(discord.File(BytesIO(file_bytes), filename=p.name))
+                    chunk_total_bytes += len(file_bytes)
+                except Exception as read_err:
+                    logger.error(f"{TAG_ERROR} Gagal membaca file chunk {p.name}: {read_err}")
+
+            if not discord_files:
+                continue
 
             logger.info(
                 f"{TAG_DISCORD} Upload carousel [{idx + 1}/{total_chunks}] "
@@ -258,17 +270,16 @@ class MediaSender:
             )
 
             try:
-                # Kirim ke channel tanpa caption karena sudah ada di visual divider embed
-                sent_message = await self.channel.send(
-                    files=discord_files,
-                )
+                sent_message = await self.channel.send(files=discord_files)
                 sent_messages.append(sent_message)
                 logger.info(f"{TAG_DISCORD} Carousel [{idx + 1}/{total_chunks}] terkirim.")
             except discord.HTTPException as e:
                 logger.error(f"{TAG_ERROR} Discord error carousel chunk {idx + 1}: {e}")
                 all_success = False
+            except Exception as e:
+                logger.error(f"{TAG_ERROR} Error upload carousel chunk {idx + 1}: {e}")
+                all_success = False
             finally:
-                # Tutup fp dari file discord agar tidak lock di Windows
                 for f in discord_files:
                     f.close()
 
@@ -276,23 +287,19 @@ class MediaSender:
             if idx < total_chunks - 1:
                 await asyncio.sleep(SEND_DELAY_SECONDS)
 
-        # Keep files after partial delivery. Caller can retry instead of losing failed chunks.
         if all_success:
             await asyncio.sleep(1.5)
             await self.downloader.cleanup_files_async(file_paths)
         else:
-            # Restore all-or-nothing behavior: a retry must not duplicate earlier chunks.
             for message in sent_messages:
                 try:
                     await message.delete()
                 except discord.HTTPException as e:
                     logger.error(f"{TAG_ERROR} Gagal rollback carousel message: {e}")
-            logger.warning(f"{TAG_WARN} Carousel partial delivery — file dipertahankan untuk recovery.")
-            # FIX: cleanup temp files even on failure to prevent disk leak accumulation.
-            # Rollback deletes the Discord messages, so retaining local files serves no purpose
-            # (caller has no retry mechanism that would use them). Cleanup immediately.
+            logger.warning(f"{TAG_WARN} Carousel partial delivery — membersihkan file temporer.")
             await asyncio.sleep(1.5)
             await self.downloader.cleanup_files_async(file_paths)
+
         return all_success
 
     # ──────────────────────────────────────────────

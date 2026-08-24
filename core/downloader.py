@@ -1321,11 +1321,11 @@ class MediaDownloader:
                         if "video/mp4" in c_type or ".mp4" in r_url or "mime_type=video_mp4" in r_url or ("video/" in c_type and "image" not in c_type):
                             try:
                                 body = await response.body()
-                                # Filter ukuran buffer: video postingan asli selalu > 500 KB (splash/logo rata-rata 100-250 KB)
-                                if len(body) >= 500_000:
+                                # Filter ukuran buffer: video postingan asli >= 150 KB (splash/logo rata-rata ~100 KB)
+                                if len(body) >= 150_000:
                                     async with aiofiles.open(output_path, "wb") as f:
                                         await f.write(body)
-                                    # Validasi durasi video asli (durasi > 1.5s)
+                                    # Validasi durasi video asli (durasi > 1.0s)
                                     if await self._is_valid_tiktok_video(output_path):
                                         captured_file = output_path
                                         logger.info(f"{TAG_DOWN} Playwright Stream Intercept: Video asli kreator berhasil dicapture ({fmt_size(len(body))})")
@@ -1355,7 +1355,7 @@ class MediaDownloader:
             # Tunggu elemen video aktif selesai dirender oleh player browser (bukan splash)
             try:
                 await page.wait_for_function(
-                    "() => { const v = document.querySelector('video'); return v && (v.duration > 1.5 || isNaN(v.duration)) && !v.src.includes('logo') && !v.src.includes('splash'); }",
+                    "() => { const v = document.querySelector('video'); return v && (v.duration > 1.0 || isNaN(v.duration)) && !v.src.includes('logo') && !v.src.includes('splash'); }",
                     timeout=10000
                 )
             except Exception:
@@ -1459,17 +1459,17 @@ class MediaDownloader:
         """
         [FILTER VALIDASI VIDEO ASLI TIKTOK]
         Memverifikasi bahwa file video yang diunduh adalah konten postingan asli kreator,
-        bukan animasi logo splash / placeholder TikTok (<500KB atau durasi <= 1.5 detik).
+        bukan animasi logo splash / placeholder TikTok (<150KB atau durasi <= 1.0 detik).
         """
         if not file_path or not file_path.exists():
             return False
 
-        # 1. Cek ukuran file: tolak jika di bawah 500 KB (animasi logo placeholder biasanya ~100-250KB)
+        # 1. Cek ukuran file: tolak jika di bawah 150 KB (animasi logo placeholder biasanya ~100KB)
         file_size = file_path.stat().st_size
-        if file_size < 500_000:
+        if file_size < 150_000:
             logger.warning(
-                f"{TAG_WARN} File {file_path.name} ditolak: Ukuran ({fmt_size(file_size)}) < 500KB "
-                f"(indikasi kuat logo splash / placeholder TikTok ~193KB)"
+                f"{TAG_WARN} File {file_path.name} ditolak: Ukuran ({fmt_size(file_size)}) < 150KB "
+                f"(indikasi logo splash / placeholder TikTok)"
             )
             try:
                 file_path.unlink(missing_ok=True)
@@ -1477,12 +1477,12 @@ class MediaDownloader:
                 pass
             return False
 
-        # 2. Cek durasi video via ffprobe/ffmpeg: tolak jika <= 1.5 detik (video splash/placeholder)
+        # 2. Cek durasi video via ffprobe/ffmpeg: tolak jika <= 1.0 detik (video splash/placeholder)
         try:
             duration = await self._get_video_duration(file_path)
-            if duration is not None and duration <= 1.5:
+            if duration is not None and duration <= 1.0:
                 logger.warning(
-                    f"{TAG_WARN} File {file_path.name} ditolak: Durasi {duration:.2f}s <= 1.5s "
+                    f"{TAG_WARN} File {file_path.name} ditolak: Durasi {duration:.2f}s <= 1.0s "
                     f"(terdeteksi sebagai animasi splash/logo TikTok)"
                 )
                 try:
