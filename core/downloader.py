@@ -431,7 +431,7 @@ class MediaDownloader:
                         
                         # Step A: Playwright Video Extractor + In-flight Network Stream Capture
                         captured_file, video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, post_id, cookies_file)
-                        if captured_file and captured_file.exists() and captured_file.stat().st_size > 100_000:
+                        if captured_file and captured_file.exists() and captured_file.stat().st_size > 300_000:
                             downloaded_files = [captured_file]
                             real_caption = browser_caption
                         elif video_url:
@@ -496,7 +496,7 @@ class MediaDownloader:
                     if "/video/" in post_url or "/v/" in post_url:
                         logger.warning(f"{TAG_WARN} yt-dlp gagal untuk TikTok Video ({yt_error}) — menjalankan Video Fallback...")
                         captured_file, video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, post_id, cookies_file)
-                        if captured_file and captured_file.exists() and captured_file.stat().st_size > 100_000:
+                        if captured_file and captured_file.exists() and captured_file.stat().st_size > 300_000:
                             downloaded_files = [captured_file]
                             real_caption = browser_caption
                         elif video_url:
@@ -1265,8 +1265,8 @@ class MediaDownloader:
     ) -> tuple[Optional[Path], Optional[str], str, list[dict]]:
         """
         Stealth Browser Fallback Extractor khusus TikTok Video.
-        Menangkap binary video langsung dari in-flight network stream Playwright (bypass HTTP 403),
-        atau mengekstrak direct CDN URL serta caption dari rehydration JSON / DOM tag.
+        Menangkap binary video postingan asli langsung dari in-flight network stream Playwright (bypass HTTP 403),
+        dengan filter ketat untuk membuang aset animasi splash, watermark, atau logo TikTok.
         """
         captured_file: Optional[Path] = None
         video_url: Optional[str] = None
@@ -1274,6 +1274,15 @@ class MediaDownloader:
         browser_cookies: list[dict] = []
         output_path = self.temp_dir / f"{post_id}_video.mp4"
         output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        BAD_VIDEO_PATTERNS = (
+            "logo", "splash", "watermark", "static", "placeholder",
+            "intro", "effect", "tiktok_anim", "default_video", "avatar", "icon", "thumb"
+        )
+        VALID_CDN_DOMAINS = (
+            "tiktokcdn.com", "tiktokcdn-us.com", "byteoversea.com",
+            "ibyteimg.com", "muscdn.com", "tiktokv.com"
+        )
 
         tiktok_session_id = os.getenv("TIKTOK_SESSION_ID")
         cookies_to_add: list[dict] = []
@@ -1303,23 +1312,31 @@ class MediaDownloader:
         async def _video_page_action(page):
             nonlocal video_url, caption, browser_cookies, captured_file
 
-            # Network Interceptor: Tangkap binary video stream & payload item/detail internal TikTok
+            # Network Interceptor: Tangkap binary video stream asli kreator & payload item/detail
             async def _on_v_resp(response):
                 nonlocal video_url, caption, captured_file
                 try:
                     r_url = response.url.lower()
                     c_type = response.headers.get("content-type", "").lower()
-                    
-                    # 1. In-flight Binary Stream Capture (Bypass HTTP 403)
+
+                    # 1. In-flight Binary Stream Capture (Bypass HTTP 403 & filter logo/splash)
                     if response.status in (200, 206) and not captured_file:
-                        if "video/mp4" in c_type or ".mp4" in r_url or "mime_type=video_mp4" in r_url or ("video/" in c_type and not "image" in c_type):
+                        # Abaikan jika mengandung URL aset logo/splash/placeholder statis
+                        if any(bad in r_url for bad in BAD_VIDEO_PATTERNS):
+                            return
+                        # Pastikan berasal dari domain CDN media TikTok resmi
+                        if not any(domain in r_url for domain in VALID_CDN_DOMAINS):
+                            return
+
+                        if "video/mp4" in c_type or ".mp4" in r_url or "mime_type=video_mp4" in r_url or ("video/" in c_type and "image" not in c_type):
                             try:
                                 body = await response.body()
-                                if len(body) > 100_000:
+                                # Filter ukuran: video postingan asli selalu > 300KB (splash/logo umumnya < 150KB)
+                                if len(body) > 300_000:
                                     async with aiofiles.open(output_path, "wb") as f:
                                         await f.write(body)
                                     captured_file = output_path
-                                    logger.info(f"{TAG_DOWN} Playwright Stream Intercept: Video berhasil dicapture ({fmt_size(len(body))})")
+                                    logger.info(f"{TAG_DOWN} Playwright Stream Intercept: Video asli kreator berhasil dicapture ({fmt_size(len(body))})")
                             except Exception as b_err:
                                 logger.debug(f"Direct stream capture body note: {b_err}")
 
@@ -1330,8 +1347,9 @@ class MediaDownloader:
                         if v_detail:
                             v_info = v_detail.get("video", {})
                             cand_url = v_info.get("playAddr") or v_info.get("downloadAddr")
-                            if cand_url and not video_url:
-                                video_url = cand_url
+                            if cand_url and isinstance(cand_url, str) and not any(bad in cand_url.lower() for bad in BAD_VIDEO_PATTERNS):
+                                if not video_url:
+                                    video_url = cand_url
                             if not caption:
                                 caption = v_detail.get("desc") or ""
                 except Exception:
@@ -1340,8 +1358,12 @@ class MediaDownloader:
             page.on("response", _on_v_resp)
             await asyncio.sleep(2.0)
 
+            # Tunggu elemen video aktif selesai dirender oleh player browser (bukan splash)
             try:
-                await page.wait_for_selector("video, #__UNIVERSAL_DATA_FOR_REHYDRATION__, #SIGI_STATE", timeout=12000)
+                await page.wait_for_function(
+                    "() => { const v = document.querySelector('video'); return v && (v.duration > 1 || isNaN(v.duration)) && !v.src.includes('logo') && !v.src.includes('splash'); }",
+                    timeout=10000
+                )
             except Exception:
                 pass
 
@@ -1371,38 +1393,35 @@ class MediaDownloader:
                             video_detail = webapp.get("video-detail", {}) or webapp.get("videoDetail", {})
                         item_struct = video_detail.get("itemInfo", {}).get("itemStruct", {})
                         video_info = item_struct.get("video", {})
-                        video_url = video_info.get("playAddr") or video_info.get("downloadAddr")
+                        cand_url = video_info.get("playAddr") or video_info.get("downloadAddr")
+                        if cand_url and isinstance(cand_url, str) and not any(bad in cand_url.lower() for bad in BAD_VIDEO_PATTERNS):
+                            video_url = cand_url
                         if not caption:
                             caption = item_struct.get("desc") or ""
                         if video_url:
-                            logger.info("Berhasil mengekstrak direct video CDN URL dari rehydration JSON")
+                            logger.info("Berhasil mengekstrak direct video CDN URL postingan asli dari rehydration JSON")
                     except Exception as parse_err:
                         logger.warning(f"Gagal memparsing detail video dari JSON: {parse_err}")
                 except Exception as json_err:
                     logger.warning(f"Gagal memparsing rehydration JSON untuk video TikTok: {json_err}")
 
-            # Fallback ke elemen DOM <video>
+            # Fallback ke elemen DOM <video> (Pastikan durasi > 1s dan tidak mengandung logo/splash)
             if not video_url:
-                try:
-                    await page.wait_for_selector("video", timeout=8000)
-                except Exception:
-                    pass
-
                 video_url = await page.evaluate("""() => {
-                    const video = document.querySelector('video');
-                    if (video) {
-                        if (video.src && !video.src.startsWith('blob:')) {
-                            return video.src;
-                        }
-                        const source = video.querySelector('source');
-                        if (source && source.src && !source.src.startsWith('blob:')) {
-                            return source.src;
+                    const bad = ["logo", "splash", "watermark", "static", "placeholder", "intro", "effect"];
+                    const videos = Array.from(document.querySelectorAll('video'));
+                    for (const v of videos) {
+                        const src = v.src || (v.querySelector('source') ? v.querySelector('source').src : '');
+                        if (src && !src.startsWith('blob:') && !bad.some(b => src.toLowerCase().includes(b))) {
+                            if (v.duration > 1 || isNaN(v.duration)) {
+                                return src;
+                            }
                         }
                     }
                     return null;
                 }""")
                 if video_url:
-                    logger.info("Berhasil mengekstrak video URL dari tag video (DOM)")
+                    logger.info("Berhasil mengekstrak video URL postingan asli dari tag video (DOM)")
 
             if not caption:
                 try:
@@ -1466,9 +1485,9 @@ class MediaDownloader:
                         # Prioritaskan play (no watermark), lalu hdplay, lalu wmplay
                         play_url = d.get("play") or d.get("hdplay") or d.get("wmplay")
                         if play_url:
-                            logger.info(f"{TAG_DOWN} TikWM API: Mengunduh stream video...")
+                            logger.info(f"{TAG_DOWN} TikWM API: Mengunduh stream video asli...")
                             v_res = await client.get(play_url)
-                            if v_res.status_code in (200, 206) and len(v_res.content) > 100_000:
+                            if v_res.status_code in (200, 206) and len(v_res.content) > 300_000:
                                 async with aiofiles.open(output_path, "wb") as f:
                                     await f.write(v_res.content)
                                 logger.info(f"{TAG_DOWN} TikWM Video terunduh: {output_path.name} ({fmt_size(output_path.stat().st_size)})")
@@ -1491,6 +1510,14 @@ class MediaDownloader:
 
         output_path = self.temp_dir / f"{post_id}_video.mp4"
         output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        BAD_VIDEO_PATTERNS = (
+            "logo", "splash", "watermark", "static", "placeholder",
+            "intro", "effect", "tiktok_anim", "default_video", "avatar", "icon", "thumb"
+        )
+        if any(bad in video_url.lower() for bad in BAD_VIDEO_PATTERNS):
+            logger.warning(f"TikTok CDN: Skip download karena URL terdeteksi sebagai asset statis/logo: {video_url}")
+            return None
 
         cookies_dict: dict = {}
         netscape_path = Path("sessions/tiktok_cookies.txt")
@@ -1530,14 +1557,13 @@ class MediaDownloader:
                     timeout=120,
                     allow_redirects=True,
                 )
-                if resp.status_code in (200, 206) and resp.content:
+                if resp.status_code in (200, 206) and resp.content and len(resp.content) > 300_000:
                     async with aiofiles.open(output_path, "wb") as f:
                         await f.write(resp.content)
-                    if output_path.exists() and output_path.stat().st_size > 1000:
-                        logger.info(f"TikTok CDN: Download sukses via curl_cffi ({output_path.stat().st_size // 1024} KB)")
-                        return output_path
+                    logger.info(f"TikTok CDN: Download sukses via curl_cffi ({output_path.stat().st_size // 1024} KB)")
+                    return output_path
                 else:
-                    logger.warning(f"TikTok CDN curl_cffi: HTTP {resp.status_code} — fallback ke httpx")
+                    logger.warning(f"TikTok CDN curl_cffi: HTTP {resp.status_code} (size={len(resp.content) if resp.content else 0}) — fallback ke httpx")
         except (ImportError, ModuleNotFoundError):
             logger.debug("curl_cffi tidak tersedia, menggunakan httpx")
         except Exception as ce:
@@ -1560,9 +1586,14 @@ class MediaDownloader:
                         async with aiofiles.open(output_path, "wb") as f:
                             async for chunk in resp.aiter_bytes(8192):
                                 await f.write(chunk)
-                        if output_path.exists() and output_path.stat().st_size > 1000:
+                        if output_path.exists() and output_path.stat().st_size > 300_000:
                             logger.info(f"TikTok CDN: Download sukses via httpx ({output_path.stat().st_size // 1024} KB)")
                             return output_path
+                        else:
+                            logger.warning(f"TikTok CDN httpx: Ukuran video terlalu kecil ({output_path.stat().st_size if output_path.exists() else 0} B) — file splash/placeholder")
+                            if output_path.exists():
+                                output_path.unlink(missing_ok=True)
+                            return None
                     else:
                         logger.error(f"TikTok CDN httpx: HTTP {resp.status_code} — cookies tidak valid atau URL expired")
                         return None
