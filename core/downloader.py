@@ -363,11 +363,15 @@ class MediaDownloader:
                 valid_files = []
                 for p in tk_files:
                     if p.name.lower().endswith((".mp4", ".mov", ".webm")):
-                        comp_p = await self.compress_video_if_needed(p)
-                        valid_files.append(comp_p)
+                        if await self._is_valid_tiktok_video(p):
+                            comp_p, _ = await self.compress_if_needed(p)
+                            valid_files.append(comp_p)
+                        else:
+                            logger.warning(f"{TAG_WARN} File {p.name} gagal validasi video asli (splash/placeholder terdeteksi).")
                     else:
                         valid_files.append(p)
-                return valid_files, tk_caption, tk_timestamp
+                if valid_files:
+                    return valid_files, tk_caption, tk_timestamp
 
             # Jika TikWM Clean API tidak menghasilkan file, fallback ke yt-dlp / browser
             logger.warning(f"{TAG_WARN} TikWM API kosong untuk {post_url} — fallback ke yt-dlp / browser...")
@@ -414,14 +418,32 @@ class MediaDownloader:
 
                 if not downloaded_files:
                     captured_file, video_url, browser_caption, browser_cookies = await self._extract_tiktok_video_via_browser(post_url, post_id, cookies_file)
-                    if captured_file and captured_file.exists() and captured_file.stat().st_size > 300_000:
+                    if captured_file and captured_file.exists() and await self._is_valid_tiktok_video(captured_file):
                         downloaded_files = [captured_file]
                         real_caption = browser_caption
                     elif video_url:
                         out_path = await self._download_tiktok_cdn_video(video_url, post_id, browser_cookies, cookies_file)
-                        if out_path:
+                        if out_path and await self._is_valid_tiktok_video(out_path):
                             downloaded_files = [out_path]
                             real_caption = browser_caption
+
+            # Filter validasi akhir dan kompresi untuk seluruh media TikTok yang diunduh
+            if downloaded_files:
+                final_tk_files = []
+                for p in downloaded_files:
+                    if p.name.lower().endswith((".mp4", ".mov", ".webm")):
+                        if await self._is_valid_tiktok_video(p):
+                            comp_p, _ = await self.compress_if_needed(p)
+                            final_tk_files.append(comp_p)
+                        else:
+                            logger.warning(f"{TAG_WARN} TikTok file {p.name} ditolak (video splash/placeholder terdeteksi).")
+                    else:
+                        final_tk_files.append(p)
+                if final_tk_files:
+                    return final_tk_files, real_caption, ytdl_timestamp
+
+            logger.error(f"{TAG_ERROR} Semua extractor TikTok gagal mendapatkan media asli untuk {post_url} — return kosong.")
+            return [], "", None
 
         elif is_twitter_photo:
             download_failed = True
@@ -1429,12 +1451,52 @@ class MediaDownloader:
 
         return captured_file, video_url, caption, cast(list[dict], browser_cookies)
 
+    async def _is_valid_tiktok_video(self, file_path: Path) -> bool:
+        """
+        [FILTER VALIDASI VIDEO ASLI TIKTOK]
+        Memverifikasi bahwa file video yang diunduh adalah konten postingan asli kreator,
+        bukan animasi logo splash / placeholder TikTok (<200KB atau durasi <= 1.0 detik).
+        """
+        if not file_path or not file_path.exists():
+            return False
+
+        # 1. Cek ukuran file: tolak jika di bawah 200 KB (animasi logo placeholder biasanya ~50-150KB)
+        file_size = file_path.stat().st_size
+        if file_size < 200_000:
+            logger.warning(
+                f"{TAG_WARN} File {file_path.name} ditolak: Ukuran ({fmt_size(file_size)}) < 200KB "
+                f"(indikasi kuat logo splash / corrupt video)"
+            )
+            try:
+                file_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+
+        # 2. Cek durasi video via ffprobe/ffmpeg: tolak jika <= 1.0 detik (video splash/placeholder)
+        try:
+            duration = await self._get_video_duration(file_path)
+            if duration is not None and duration <= 1.0:
+                logger.warning(
+                    f"{TAG_WARN} File {file_path.name} ditolak: Durasi {duration:.2f}s <= 1.0s "
+                    f"(terdeteksi sebagai animasi splash/logo TikTok)"
+                )
+                try:
+                    file_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return False
+        except Exception as e:
+            logger.debug(f"Pemeriksaan durasi video TikTok note: {e}")
+
+        return True
+
     async def _download_tiktok_video_clean(
         self, post_url: str, post_id: str, temp_dir: Optional[Path] = None
     ) -> Optional[tuple[list[Path], str, Optional[str]]]:
         """
         Download media TikTok (video / photo carousel) langsung dari public TikWM Clean API.
-        Bypass watermark, DRM CDN, dan Captcha dengan 0 overhead browser.
+        Mendukung Multi-Endpoint fallback dan jeda rate-limit.
         Mengembalikan tuple: (downloaded_files, caption, timestamp_str)
         """
         import httpx
@@ -1442,68 +1504,74 @@ class MediaDownloader:
         target_dir.mkdir(parents=True, exist_ok=True)
 
         BAD_VIDEO_PATTERNS = (
-            "logo", "splash", "watermark", "static", "placeholder",
-            "intro", "effect", "tiktok_anim", "default_video", "avatar", "icon", "thumb"
+            "logo", "splash", "watermark_cover", "static_asset", "static",
+            "placeholder", "intro", "effect", "tiktok_anim", "default_video",
+            "avatar", "icon", "thumb"
         )
-        api_url = f"https://www.tikwm.com/api/?url={post_url}"
+
+        endpoints = [
+            f"https://www.tikwm.com/api/?url={post_url}",
+            f"https://api.tikwm.com/api/?url={post_url}",
+        ]
+
         headers = {
             "User-Agent": SHARED_USER_AGENT,
             "Referer": "https://www.tikwm.com/",
             "Accept": "application/json, text/plain, */*",
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=20.0, headers=headers, follow_redirects=True) as client:
-                res = await client.get(api_url)
-                if res.status_code == 200:
-                    data = res.json()
-                    if data.get("code") == 0 and data.get("data"):
-                        d = data["data"]
-                        title = d.get("title") or ""
-                        create_time = d.get("create_time")
-                        timestamp_str = None
-                        if create_time:
-                            try:
-                                timestamp_str = datetime.fromtimestamp(int(create_time), tz=timezone.utc).isoformat()
-                            except Exception:
-                                timestamp_str = str(create_time)
+        for ep_url in endpoints:
+            try:
+                async with httpx.AsyncClient(timeout=20.0, headers=headers, follow_redirects=True) as client:
+                    res = await client.get(ep_url)
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("code") == 0 and data.get("data"):
+                            d = data["data"]
+                            title = d.get("title") or ""
+                            create_time = d.get("create_time")
+                            timestamp_str = None
+                            if create_time:
+                                try:
+                                    timestamp_str = datetime.fromtimestamp(int(create_time), tz=timezone.utc).isoformat()
+                                except Exception:
+                                    timestamp_str = str(create_time)
 
-                        # 1. Kasus Photo Carousel (data.images)
-                        images = d.get("images")
-                        if images and isinstance(images, list) and len(images) > 0:
-                            logger.info(f"{TAG_DOWN} TikWM API: Mendeteksi Photo Carousel ({len(images)} gambar)...")
-                            downloaded_photos: list[Path] = []
-                            for idx, img_url in enumerate(images):
-                                img_path = target_dir / f"{post_id}_{idx+1:03d}.jpg"
-                                img_res = await client.get(img_url)
-                                if img_res.status_code == 200 and len(img_res.content) > 1000:
-                                    async with aiofiles.open(img_path, "wb") as f:
-                                        await f.write(img_res.content)
-                                    downloaded_photos.append(img_path)
-                            if downloaded_photos:
-                                logger.info(f"{TAG_DOWN} TikWM Photo Carousel terunduh: {len(downloaded_photos)} gambar")
-                                return downloaded_photos, title, timestamp_str
+                            # 1. Kasus Photo Carousel (data.images)
+                            images = d.get("images")
+                            if images and isinstance(images, list) and len(images) > 0:
+                                logger.info(f"{TAG_DOWN} TikWM API ({ep_url.split('/')[2]}): Mendeteksi Photo Carousel ({len(images)} gambar)...")
+                                downloaded_photos: list[Path] = []
+                                for idx, img_url in enumerate(images):
+                                    img_path = target_dir / f"{post_id}_{idx+1:03d}.jpg"
+                                    img_res = await client.get(img_url)
+                                    if img_res.status_code == 200 and len(img_res.content) > 1000:
+                                        async with aiofiles.open(img_path, "wb") as f:
+                                            await f.write(img_res.content)
+                                        downloaded_photos.append(img_path)
+                                if downloaded_photos:
+                                    logger.info(f"{TAG_DOWN} TikWM Photo Carousel terunduh: {len(downloaded_photos)} gambar")
+                                    return downloaded_photos, title, timestamp_str
 
-                        # 2. Kasus Video (data.play, data.hdplay, data.wmplay)
-                        play_url = d.get("play") or d.get("hdplay") or d.get("wmplay")
-                        if play_url and not any(bad in play_url.lower() for bad in BAD_VIDEO_PATTERNS):
-                            out_video_path = target_dir / f"{post_id}_video.mp4"
-                            logger.info(f"{TAG_DOWN} TikWM API: Mengunduh stream video asli kreator...")
-                            async with client.stream("GET", play_url) as stream_resp:
-                                if stream_resp.status_code in (200, 206):
-                                    async with aiofiles.open(out_video_path, "wb") as f:
-                                        async for chunk in stream_resp.aiter_bytes(8192):
-                                            await f.write(chunk)
+                            # 2. Kasus Video (data.play, data.hdplay, data.wmplay)
+                            play_url = d.get("play") or d.get("hdplay") or d.get("wmplay")
+                            if play_url and not any(bad in play_url.lower() for bad in BAD_VIDEO_PATTERNS):
+                                out_video_path = target_dir / f"{post_id}_video.mp4"
+                                logger.info(f"{TAG_DOWN} TikWM API ({ep_url.split('/')[2]}): Mengunduh stream video asli kreator...")
+                                async with client.stream("GET", play_url) as stream_resp:
+                                    if stream_resp.status_code in (200, 206):
+                                        async with aiofiles.open(out_video_path, "wb") as f:
+                                            async for chunk in stream_resp.aiter_bytes(8192):
+                                                await f.write(chunk)
 
-                            if out_video_path.exists() and out_video_path.stat().st_size > 300_000:
-                                logger.info(f"{TAG_DOWN} TikWM Video terunduh: {out_video_path.name} ({fmt_size(out_video_path.stat().st_size)})")
-                                return [out_video_path], title, timestamp_str
-                            else:
-                                logger.warning(f"{TAG_WARN} TikWM Video payload terlalu kecil (<300KB) — splash/corrupt")
-                                if out_video_path.exists():
-                                    out_video_path.unlink(missing_ok=True)
-        except Exception as e:
-            logger.debug(f"TikWM video clean downloader note: {e}")
+                                if await self._is_valid_tiktok_video(out_video_path):
+                                    logger.info(f"{TAG_DOWN} TikWM Video terunduh: {out_video_path.name} ({fmt_size(out_video_path.stat().st_size)})")
+                                    return [out_video_path], title, timestamp_str
+            except Exception as e:
+                logger.debug(f"TikWM endpoint {ep_url} error: {e}")
+
+            # Jeda 1.0 detik antar endpoint untuk mencegah rate limit saat batch download
+            await asyncio.sleep(1.0)
 
         return None
 
