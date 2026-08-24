@@ -242,9 +242,9 @@ class TikTokScraper(BaseScraper):
 
                 # Cek stop-condition di database jika tidak forced
                 if not forced and collected_urls:
-                    newest_id = self._extract_post_id(collected_urls[0])
-                    if newest_id and await self.db.check_post_exists(newest_id, self.PLATFORM):
-                        logger.info(f"{TAG_CRAWL} Stop-condition tercapai pada post {newest_id} di DB.")
+                    max_id = str(max((int(self._extract_post_id(u) or 0) for u in collected_urls), default=0))
+                    if max_id != "0" and await self.db.check_post_exists(max_id, self.PLATFORM):
+                        logger.info(f"{TAG_CRAWL} Stop-condition tercapai pada post {max_id} di DB.")
                         break
 
                 if len(collected_urls) == prev_count and len(collected_urls) > 0:
@@ -396,7 +396,16 @@ class TikTokScraper(BaseScraper):
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    stdout, stderr = await proc.communicate()
+                    try:
+                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"{TAG_WARN} [PASS 3] yt-dlp flat-playlist timeout 60s — membunuh subprocess...")
+                        proc.kill()
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=5.0)
+                        except Exception:
+                            pass
+                        continue
                     if proc.returncode == 0 and stdout:
                         for line in stdout.decode("utf-8", errors="ignore").splitlines():
                             line = line.strip()

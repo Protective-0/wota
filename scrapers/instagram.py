@@ -27,6 +27,7 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Any
@@ -456,7 +457,10 @@ class InstagramScraper(BaseScraper):
                             pass
             except asyncio.TimeoutError:
                 proc.kill()
-                await proc.wait()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except Exception:
+                    pass
                 logger.warning(f"{TAG_WARN} gallery-dl subprocess timeout dibatalkan.")
         except Exception as e:
             logger.debug(f"gallery-dl guest extractor info: {e}")
@@ -466,7 +470,14 @@ class InstagramScraper(BaseScraper):
         """Fallback ekstraksi URL postingan via yt-dlp flat playlist dalam Guest Mode."""
         results: list[PostMedia] = []
         try:
-            cmd = ["yt-dlp", "--flat-playlist", "--dump-json", "--no-warnings", url]
+            cmd = [
+                sys.executable,
+                "-m", "yt_dlp",
+                "--flat-playlist",
+                "--dump-json",
+                "--no-warnings",
+                url,
+            ]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -498,7 +509,10 @@ class InstagramScraper(BaseScraper):
                             pass
             except asyncio.TimeoutError:
                 proc.kill()
-                await proc.wait()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except Exception:
+                    pass
                 logger.warning(f"{TAG_WARN} yt-dlp flat-playlist timeout dibatalkan.")
         except Exception as e:
             logger.debug(f"yt-dlp flat-playlist guest info: {e}")

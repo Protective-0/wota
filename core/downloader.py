@@ -17,6 +17,7 @@ import re
 import os
 import random
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional, cast, Any
 
@@ -2022,10 +2023,12 @@ class MediaDownloader:
             # FIX: scope to flat glob instead of recursive rglob to avoid O(N) scan
             # of the entire temp_dir on every gallery-dl call (expensive on busy servers
             # with thousands of leftover files). gallery-dl writes flat into --dest dir.
-            before = set(self.temp_dir.glob("*.*"))
+            before = set(f for f in self.temp_dir.glob("*") if f.is_file())
 
             proc = await asyncio.create_subprocess_exec(
-                "gallery-dl",
+                sys.executable,
+                "-m",
+                "gallery_dl",
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -2050,7 +2053,7 @@ class MediaDownloader:
                 )
                 return []
 
-            after = set(self.temp_dir.rglob("*.*"))
+            after = set(f for f in self.temp_dir.glob("*") if f.is_file())
             new_files = after - before
             downloaded = [f for f in new_files if f.is_file()]
 

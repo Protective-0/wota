@@ -80,7 +80,8 @@ class TwitterScraper(BaseScraper):
             locale="id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
         )
         await self.load_and_inject_cookies(self._context, "twitter")
-        return await self._context.new_page()
+        page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+        return page
 
     async def scrape_profile(
         self,
@@ -96,10 +97,10 @@ class TwitterScraper(BaseScraper):
             return
 
         timeline_url = f"https://x.com/{username}"
-        logger.info(f"Mulai crawl timeline Twitter/X: {timeline_url}")
+        logger.info(f"{TAG_CRAWL} Mulai crawl timeline Twitter/X: {timeline_url}")
 
         # Siapkan cookies
-        netscape_path = await self.load_and_inject_cookies(None, "twitter")
+        netscape_path = await self.export_session_cookies_for_ytdlp("twitter")
         if netscape_path:
             self.netscape_cookie_path = netscape_path
 
