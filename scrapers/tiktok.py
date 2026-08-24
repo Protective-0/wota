@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 class TikTokScraper(BaseScraper):
     """
-    Scraper profil TikTok Zero-Login murni berbasis API-First tanpa browser Playwright.
+    Scraper profil TikTok Zero-Login berbasis Playwright Stealth DOM Extractor & Multi-Tier Fallback.
     """
 
     PLATFORM = "tiktok"
@@ -53,6 +53,9 @@ class TikTokScraper(BaseScraper):
         self.netscape_cookie_path = self.session_dir / "tiktok_cookies.txt"
         self.failed = False
         self.blocked_by_challenge = False
+        self._playwright = None
+        self._browser = None
+        self._context = None
 
     def _extract_username(self, url: str) -> Optional[str]:
         """Ekstrak clean username dari berbagai variasi format URL TikTok."""
@@ -73,7 +76,7 @@ class TikTokScraper(BaseScraper):
         """
         [STRICT AUTHOR URL SANITIZER]
         Hanya terima URL jika path URL diawali persis dengan @{target_username}/(video|photo|v)/{numeric_id}.
-        Menolak 100% URL video rekomendasi atau sidebar dari akun lain.
+        Menolak 100% URL video rekomendasi, sidebar, atau repost dari akun lain.
         """
         if not post_url or not isinstance(post_url, str):
             return False
@@ -92,7 +95,7 @@ class TikTokScraper(BaseScraper):
         forced: bool = False,
     ) -> AsyncGenerator[PostMedia, None]:
         """
-        Crawl profil TikTok secara 100% Guest Mode (Zero-Login & Zero-Browser) berbasis API-First.
+        Crawl profil TikTok secara 100% Guest Mode (Zero-Login) dengan Playwright Stealth & Multi-Tier Fallback.
         """
         self.failed = False
         self.blocked_by_challenge = False
@@ -103,68 +106,150 @@ class TikTokScraper(BaseScraper):
             return
 
         canonical_url = f"https://www.tiktok.com/@{username}"
-        logger.info(f"{TAG_CRAWL} Memulai scraping profil @{username} (tiktok, Zero-Login API-First Mode): {canonical_url}")
+        logger.info(f"{TAG_CRAWL} Memulai scraping profil @{username} (tiktok, Zero-Login Mode): {canonical_url}")
 
         collected_urls: list[str] = []
         seen_urls: set[str] = set()
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 0 (PRIMARY): TikWM User Posts API (No Browser Overhead)
+        # PASS 0 (PRIMARY): Playwright Deep-Stealth Browser (Bypass SlardarWAF)
         # ─────────────────────────────────────────────────────────────────────
-        logger.info(f"{TAG_CRAWL} [PASS 0] Menjalankan TikWM User Posts API untuk @{username}...")
+        logger.info(f"{TAG_CRAWL} [PASS 0] Mengaktifkan Playwright Stealth Browser untuk @{username}...")
         try:
-            api_url = f"https://www.tikwm.com/api/user/posts?unique_id={username}&count=50"
-            headers = {
-                "User-Agent": USER_AGENT,
-                "Accept": "application/json, text/plain, */*",
-                "Referer": "https://www.tikwm.com/",
-            }
-            resp_data = None
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+            self._browser, self._context = await BaseScraper.create_stealth_browser(
+                self._playwright,
+                headed=self.headed,
+                viewport={"width": 1280, "height": 800},
+                locale="id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+                timezone_id="Asia/Jakarta",
+            )
+            page = await self._context.new_page()
+            logger.info(f"{TAG_CRAWL} Membuka profil TikTok di browser stealth: {canonical_url}")
+
+            await page.goto(canonical_url, wait_until="domcontentloaded", timeout=45000)
+            # Beri jeda 3.5 detik untuk eksekusi script SlardarWAF dan rendering DOM
+            await asyncio.sleep(3.5)
+
+            # Dismiss modal popup / cookie dialog jika ada
             try:
-                from curl_cffi import requests as curl_requests
-                async with curl_requests.AsyncSession(impersonate="chrome124") as session:
-                    c_resp = await session.get(api_url, headers=headers, timeout=15)
-                    if c_resp.status_code == 200:
-                        resp_data = c_resp.json()
+                dismiss_btn = await page.query_selector(
+                    'button:has-text("Lanjutkan sebagai tamu"), button:has-text("Continue as guest"), [data-e2e="modal-close-inner-button"]'
+                )
+                if dismiss_btn:
+                    await dismiss_btn.click()
+                    await asyncio.sleep(1.0)
             except Exception:
                 pass
 
-            if not resp_data:
-                async with httpx.AsyncClient(headers=headers, timeout=20.0, follow_redirects=True) as client:
-                    resp = await client.get(api_url)
-                    if resp.status_code == 200:
-                        resp_data = resp.json()
+            # Scrolling pagination loop
+            max_scroll_rounds = 15
+            for scroll_idx in range(max_scroll_rounds):
+                # 1. Ekstrak links dari DOM
+                dom_links = await page.locator('a[href*="/video/"], a[href*="/photo/"]').all()
+                for link_el in dom_links:
+                    try:
+                        href = await link_el.get_attribute("href")
+                        if href:
+                            p_url = f"https://www.tiktok.com{href}" if href.startswith("/") else href
+                            p_url_clean = p_url.split("?")[0].rstrip("/")
+                            if self._is_valid_author_post_url(p_url_clean, username) and p_url_clean not in seen_urls:
+                                collected_urls.append(p_url_clean)
+                                seen_urls.add(p_url_clean)
+                    except Exception:
+                        pass
 
-            if resp_data and resp_data.get("code") == 0 and "data" in resp_data:
-                d_obj = resp_data["data"]
-                v_list = d_obj.get("videos", []) or d_obj.get("itemList", []) or []
-                for v in v_list:
-                    video_id = str(v.get("video_id") or v.get("id") or "")
-                    author_data = v.get("author", {})
-                    author_uid = str(author_data.get("unique_id") or author_data.get("uniqueId") or "").lower().strip()
+                # 2. Ekstrak dari rehydration script jika tersedia di DOM
+                try:
+                    rehydration_text = await page.evaluate("""() => {
+                        const s = document.querySelector('#__UNIVERSAL_DATA_FOR_REHYDRATION__, #SIGI_STATE');
+                        return s ? s.textContent : null;
+                    }""")
+                    if rehydration_text:
+                        parsed_urls = self._parse_rehydration_from_html(rehydration_text, username)
+                        for r_url in parsed_urls:
+                            if self._is_valid_author_post_url(r_url, username) and r_url not in seen_urls:
+                                collected_urls.append(r_url)
+                                seen_urls.add(r_url)
+                except Exception:
+                    pass
 
-                    # Strict Author Verification
-                    if author_uid and author_uid != username:
-                        continue
+                # Cek stop-condition di database jika tidak forced
+                if not forced and collected_urls:
+                    newest_id = self._extract_post_id(collected_urls[0])
+                    if newest_id and await self.db.check_post_exists(newest_id, self.PLATFORM):
+                        logger.info(f"{TAG_CRAWL} Stop-condition tercapai pada post {newest_id} di DB.")
+                        break
 
-                    if video_id and re.match(r"^\d{15,22}$", video_id):
-                        is_photo = bool(v.get("images") or v.get("imagePost"))
-                        t = "photo" if is_photo else "video"
-                        p_url = f"https://www.tiktok.com/@{username}/{t}/{video_id}"
-                        if self._is_valid_author_post_url(p_url, username) and p_url not in seen_urls:
-                            collected_urls.append(p_url)
-                            seen_urls.add(p_url)
+                await page.evaluate("window.scrollBy(0, 1600)")
+                await asyncio.sleep(random.uniform(1.5, 2.5))
 
-                if collected_urls:
-                    logger.info(f"{TAG_CRAWL} [PASS 0] Berhasil menemukan {len(collected_urls)} postingan asli via TikWM API.")
+            await page.close()
+            if collected_urls:
+                logger.info(f"{TAG_CRAWL} [PASS 0] Playwright Stealth Browser berhasil mengekstrak {len(collected_urls)} post.")
         except Exception as e:
-            logger.debug(f"[PASS 0] TikWM API info: {e}")
+            logger.debug(f"[PASS 0] Playwright Stealth Browser note: {e}")
+        finally:
+            await self.close()
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 1: Scrapling / curl_cffi Fast SSR Rehydration
+        # PASS 1: TikWM User Posts API Fallback
         # ─────────────────────────────────────────────────────────────────────
         if not collected_urls:
-            logger.info(f"{TAG_CRAWL} [PASS 1] Menjalankan Scrapling Fast SSR Rehydration untuk @{username}...")
+            logger.info(f"{TAG_CRAWL} [PASS 1] Mencoba TikWM User Posts API untuk @{username}...")
+            try:
+                api_url = f"https://www.tikwm.com/api/user/posts?unique_id={username}&count=50"
+                headers = {
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/json, text/plain, */*",
+                    "Referer": "https://www.tikwm.com/",
+                }
+                resp_data = None
+                try:
+                    from curl_cffi import requests as curl_requests
+                    async with curl_requests.AsyncSession(impersonate="chrome124") as session:
+                        c_resp = await session.get(api_url, headers=headers, timeout=15)
+                        if c_resp.status_code == 200:
+                            resp_data = c_resp.json()
+                except Exception:
+                    pass
+
+                if not resp_data:
+                    async with httpx.AsyncClient(headers=headers, timeout=15.0, follow_redirects=True) as client:
+                        resp = await client.get(api_url)
+                        if resp.status_code == 200:
+                            resp_data = resp.json()
+
+                if resp_data and resp_data.get("code") == 0 and "data" in resp_data:
+                    d_obj = resp_data["data"]
+                    v_list = d_obj.get("videos", []) or d_obj.get("itemList", []) or []
+                    for v in v_list:
+                        video_id = str(v.get("video_id") or v.get("id") or "")
+                        author_data = v.get("author", {})
+                        author_uid = str(author_data.get("unique_id") or author_data.get("uniqueId") or "").lower().strip()
+
+                        if author_uid and author_uid != username:
+                            continue
+
+                        if video_id and re.match(r"^\d{15,22}$", video_id):
+                            is_photo = bool(v.get("images") or v.get("imagePost"))
+                            t = "photo" if is_photo else "video"
+                            p_url = f"https://www.tiktok.com/@{username}/{t}/{video_id}"
+                            if self._is_valid_author_post_url(p_url, username) and p_url not in seen_urls:
+                                collected_urls.append(p_url)
+                                seen_urls.add(p_url)
+
+                    if collected_urls:
+                        logger.info(f"{TAG_CRAWL} [PASS 1] TikWM API berhasil menemukan {len(collected_urls)} post.")
+            except Exception as e:
+                logger.debug(f"[PASS 1] TikWM API info: {e}")
+
+        # ─────────────────────────────────────────────────────────────────────
+        # PASS 2: Scrapling / curl_cffi Fast SSR Rehydration Fallback
+        # ─────────────────────────────────────────────────────────────────────
+        if not collected_urls:
+            logger.info(f"{TAG_CRAWL} [PASS 2] Menjalankan Fast SSR Rehydration untuk @{username}...")
             try:
                 html_text = ""
                 ssr_headers = {
@@ -172,9 +257,6 @@ class TikTokScraper(BaseScraper):
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                     "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
                     "Referer": "https://www.tiktok.com/",
-                    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-                    "Sec-Ch-Ua-Mobile": "?0",
-                    "Sec-Ch-Ua-Platform": '"Windows"',
                 }
                 try:
                     from curl_cffi import requests as curl_requests
@@ -188,27 +270,22 @@ class TikTokScraper(BaseScraper):
                         if resp.status_code == 200:
                             html_text = resp.text
 
-                # Hard Abort jika halaman menyajikan Captcha / WAF Challenge
-                if html_text and any(block in html_text for block in ("verify-center", "SlardarWAF", "secsdk", "captcha")):
-                    logger.warning(f"{TAG_WARN} TikTok SSR terhalang WAF Challenge — membatalkan parsing HTML.")
-                    html_text = ""
-
-                if html_text:
+                if html_text and not any(block in html_text for block in ("verify-center", "SlardarWAF", "secsdk")):
                     parsed_urls = self._parse_rehydration_from_html(html_text, username)
                     for r_url in parsed_urls:
                         if self._is_valid_author_post_url(r_url, username) and r_url not in seen_urls:
                             collected_urls.append(r_url)
                             seen_urls.add(r_url)
                     if collected_urls:
-                        logger.info(f"{TAG_CRAWL} [PASS 1] Fast SSR berhasil menemukan {len(collected_urls)} post.")
+                        logger.info(f"{TAG_CRAWL} [PASS 2] Fast SSR berhasil menemukan {len(collected_urls)} post.")
             except Exception as e:
-                logger.debug(f"[PASS 1] SSR error: {e}")
+                logger.debug(f"[PASS 2] SSR error: {e}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 2: yt-dlp Flat-Playlist (Mobile API Mode)
+        # PASS 3: yt-dlp Flat-Playlist (Mobile API Mode) Fallback
         # ─────────────────────────────────────────────────────────────────────
         if not collected_urls:
-            logger.info(f"{TAG_CRAWL} [PASS 2] Mencoba ekstraksi postingan @{username} via yt-dlp flat-playlist...")
+            logger.info(f"{TAG_CRAWL} [PASS 3] Mencoba ekstraksi postingan @{username} via yt-dlp flat-playlist...")
             try:
                 cmd = [
                     "yt-dlp",
@@ -243,16 +320,16 @@ class TikTokScraper(BaseScraper):
                         except Exception:
                             pass
                     if collected_urls:
-                        logger.info(f"{TAG_CRAWL} [PASS 2] yt-dlp flat-playlist berhasil menemukan {len(collected_urls)} post.")
+                        logger.info(f"{TAG_CRAWL} [PASS 3] yt-dlp flat-playlist berhasil menemukan {len(collected_urls)} post.")
             except Exception as e:
-                logger.debug(f"[PASS 2] yt-dlp error: {e}")
+                logger.debug(f"[PASS 3] yt-dlp error: {e}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # ABORT GUARD: Jika Semua Layer API Gagal
+        # ABORT GUARD: Jika Semua Layer Gagal
         # ─────────────────────────────────────────────────────────────────────
         if not collected_urls:
             logger.warning(
-                f"{TAG_WARN} @{username} (tiktok) scraping tidak berhasil (semua pass API/HTTP kosong) — "
+                f"{TAG_WARN} @{username} (tiktok) scraping tidak berhasil (semua pass kosong) — "
                 f"membatalkan status selesai untuk dicoba ulang di siklus berikutnya."
             )
             self.failed = True
@@ -301,7 +378,6 @@ class TikTokScraper(BaseScraper):
             if not obj or not isinstance(obj, (dict, list)):
                 return
             if isinstance(obj, dict):
-                # Filter out Repost flag
                 if obj.get("isRepost") or obj.get("repost") or obj.get("is_repost"):
                     return
 
@@ -361,5 +437,17 @@ class TikTokScraper(BaseScraper):
         return list(found_urls)
 
     async def close(self) -> None:
-        """Cleanup handler (no-op karena zero-browser architecture)."""
-        pass
+        """Cleanup Playwright browser resources."""
+        try:
+            if self._context:
+                await self._context.close()
+            if self._browser:
+                await self._browser.close()
+            if self._playwright:
+                await self._playwright.stop()
+        except Exception as e:
+            logger.debug(f"TikTokScraper close error: {e}")
+        finally:
+            self._context = None
+            self._browser = None
+            self._playwright = None
