@@ -315,6 +315,47 @@ class BaseScraper(ABC):
 
         return browser, context
 
+    @staticmethod
+    async def create_persistent_stealth_context(
+        playwright: Playwright,
+        user_data_dir: Path,
+        headed: bool = False,
+        proxy: Optional[str] = None,
+        viewport: Optional[dict] = None,
+        locale: str = "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        timezone_id: str = "Asia/Jakarta",
+    ) -> BrowserContext:
+        """
+        Inisialisasi Persistent BrowserContext Playwright dengan stealth injection penuh.
+        Mempertahankan session storage, cache, dan security token (ttwid, msToken, s_v_web_id)
+        untuk melewati challenge puzzle slider bot.
+        """
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        viewport = viewport or {"width": 1280, "height": 800}
+        launch_kwargs = BaseScraper.get_browser_launch_kwargs(proxy=proxy)
+        launch_kwargs["headless"] = not headed
+
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            user_agent=USER_AGENT,
+            viewport=viewport,
+            locale=locale,
+            timezone_id=timezone_id,
+            **launch_kwargs
+        )
+
+        # Deep Stealth Script Injection
+        await context.add_init_script("""
+            () => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {} };
+                Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            }
+        """)
+
+        return context
+
     # ──────────────────────────────────────────────
     # Cookie Management
     # ──────────────────────────────────────────────

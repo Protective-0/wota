@@ -23,6 +23,7 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Any
@@ -114,19 +115,22 @@ class TikTokScraper(BaseScraper):
         seen_urls: set[str] = set()
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 0 (PRIMARY): Playwright Deep-Stealth Browser (Bypass SlardarWAF)
+        # PASS 0 (PRIMARY): Playwright Persistent Stealth Browser (Bypass WAF & Captcha)
         # ─────────────────────────────────────────────────────────────────────
-        logger.info(f"{TAG_CRAWL} [PASS 0] Mengaktifkan Playwright Stealth Browser untuk @{username}...")
+        logger.info(f"{TAG_CRAWL} [PASS 0] Mengaktifkan Playwright Persistent Stealth Browser untuk @{username}...")
         try:
             from playwright.async_api import async_playwright
             self._playwright = await async_playwright().start()
-            self._browser, self._context = await BaseScraper.create_stealth_browser(
+            user_data_dir = Path(self.session_dir) / "tiktok_browser_profile"
+            self._context = await BaseScraper.create_persistent_stealth_context(
                 self._playwright,
+                user_data_dir=user_data_dir,
                 headed=self.headed,
                 viewport={"width": 1280, "height": 800},
                 locale="id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
                 timezone_id="Asia/Jakarta",
             )
+            self._browser = None  # Persistent context mengelola browser instance secara terintegrasi
 
             # Muat session cookies jika tersedia di direktori sessions/
             try:
@@ -137,20 +141,44 @@ class TikTokScraper(BaseScraper):
             except Exception as c_err:
                 logger.debug(f"Cookie load note: {c_err}")
 
-            page = await self._context.new_page()
-            logger.info(f"{TAG_CRAWL} Membuka profil TikTok di browser stealth: {canonical_url}")
+            # Gunakan tab aktif default (Tab 0) dari persistent context agar tidak membuat background tab
+            page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+
+            # Network Interceptor: Tangkap payload internal TikTok saat dimuat
+            async def _on_page_response(resp):
+                r_url = resp.url
+                if any(k in r_url for k in ("item_list", "/api/post", "aweme/v1", "user/detail", "item/detail")) and resp.status == 200:
+                    try:
+                        data = await resp.json()
+                        if isinstance(data, dict):
+                            items = data.get("itemList", []) or data.get("items", []) or data.get("aweme_list", []) or []
+                            for item in items:
+                                if isinstance(item, dict):
+                                    v_id = str(item.get("id") or item.get("aweme_id") or item.get("itemId") or "")
+                                    if v_id and re.match(r"^\d{15,22}$", v_id):
+                                        is_photo = bool(item.get("imagePost") or item.get("images"))
+                                        t = "photo" if is_photo else "video"
+                                        p_url = f"https://www.tiktok.com/@{username}/{t}/{v_id}"
+                                        if self._is_valid_author_post_url(p_url, username) and p_url not in seen_urls:
+                                            collected_urls.append(p_url)
+                                            seen_urls.add(p_url)
+                    except Exception:
+                        pass
+
+            page.on("response", _on_page_response)
+            logger.info(f"{TAG_CRAWL} Membuka profil TikTok di persistent browser: {canonical_url}")
 
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(4.0)
 
             # Tunggu elemen profil atau feed postingan selesai dirender oleh SlardarWAF
             try:
                 await page.wait_for_selector(
                     'a[href*="/video/"], a[href*="/photo/"], [data-e2e="user-post-item"], [data-e2e="user-post-item-list"], h1, [data-e2e="user-title"]',
-                    timeout=15000
+                    timeout=10000
                 )
             except Exception:
                 pass
-            await asyncio.sleep(2.0)
 
             # Dismiss modal popup / cookie dialog jika ada
             try:
@@ -164,7 +192,7 @@ class TikTokScraper(BaseScraper):
                 pass
 
             # Scrolling pagination loop dengan early-exit
-            max_scroll_rounds = 6
+            max_scroll_rounds = 8
             no_new_rounds = 0
             for scroll_idx in range(max_scroll_rounds):
                 prev_count = len(collected_urls)
@@ -232,13 +260,13 @@ class TikTokScraper(BaseScraper):
             if not collected_urls:
                 page_title = await page.title()
                 logger.warning(
-                    f"{TAG_WARN} [PASS 0] Playwright Browser selesai tanpa link. "
+                    f"{TAG_WARN} [PASS 0] Playwright Persistent Browser selesai tanpa link. "
                     f"Page Title: '{page_title}', URL: '{page.url}'"
                 )
 
             await page.close()
             if collected_urls:
-                logger.info(f"{TAG_CRAWL} [PASS 0] Playwright Stealth Browser berhasil mengekstrak {len(collected_urls)} post.")
+                logger.info(f"{TAG_CRAWL} [PASS 0] Playwright Persistent Stealth Browser berhasil mengekstrak {len(collected_urls)} post.")
         except Exception as e:
             logger.warning(f"{TAG_WARN} [PASS 0] Playwright Stealth Browser exception: {e}")
         finally:
@@ -333,47 +361,69 @@ class TikTokScraper(BaseScraper):
                 logger.debug(f"[PASS 2] SSR error: {e}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 3: yt-dlp Flat-Playlist (Mobile API Mode) Fallback
+        # PASS 3: yt-dlp Flat-Playlist (Mobile API & Netscape Cookie) Fallback
         # ─────────────────────────────────────────────────────────────────────
         if not collected_urls:
             logger.info(f"{TAG_CRAWL} [PASS 3] Mencoba ekstraksi postingan @{username} via yt-dlp flat-playlist...")
             try:
-                cmd = [
-                    "yt-dlp",
-                    "--flat-playlist",
-                    "--dump-json",
-                    "--no-warnings",
-                    "--extractor-args", "tiktok:api_hostname=api16-normal-c-useast1a.tiktokv.com",
-                    canonical_url,
+                cookie_file = await self.export_session_cookies_for_ytdlp(self.PLATFORM)
+                cmd_variants = [
+                    [
+                        sys.executable,
+                        "-m", "yt_dlp",
+                        "--flat-playlist",
+                        "--dump-json",
+                        "--no-warnings",
+                        "--extractor-args", "tiktok:api_hostname=api16-normal-c-useast1a.tiktokv.com",
+                    ],
+                    [
+                        sys.executable,
+                        "-m", "yt_dlp",
+                        "--flat-playlist",
+                        "--dump-json",
+                        "--no-warnings",
+                    ]
                 ]
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await proc.communicate()
-                if proc.returncode == 0 and stdout:
-                    for line in stdout.decode("utf-8", errors="ignore").splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                            p_id = entry.get("id")
-                            uploader = str(entry.get("uploader") or entry.get("uploader_id") or "").lower().replace("@", "").strip()
-                            if uploader and uploader != username:
+
+                for base_cmd in cmd_variants:
+                    cmd = list(base_cmd)
+                    if cookie_file and cookie_file.exists():
+                        cmd.extend(["--cookies", str(cookie_file)])
+                    cmd.append(canonical_url)
+
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, stderr = await proc.communicate()
+                    if proc.returncode == 0 and stdout:
+                        for line in stdout.decode("utf-8", errors="ignore").splitlines():
+                            line = line.strip()
+                            if not line:
                                 continue
-                            if p_id and re.match(r"^\d{15,22}$", str(p_id)):
-                                p_url = f"https://www.tiktok.com/@{username}/video/{p_id}"
-                                if self._is_valid_author_post_url(p_url, username) and p_url not in seen_urls:
-                                    collected_urls.append(p_url)
-                                    seen_urls.add(p_url)
-                        except Exception:
-                            pass
-                    if collected_urls:
-                        logger.info(f"{TAG_CRAWL} [PASS 3] yt-dlp flat-playlist berhasil menemukan {len(collected_urls)} post.")
+                            try:
+                                entry = json.loads(line)
+                                p_id = entry.get("id")
+                                uploader = str(entry.get("uploader") or entry.get("uploader_id") or "").lower().replace("@", "").strip()
+                                if uploader and uploader != username:
+                                    continue
+                                if p_id and re.match(r"^\d{15,22}$", str(p_id)):
+                                    p_url = f"https://www.tiktok.com/@{username}/video/{p_id}"
+                                    if self._is_valid_author_post_url(p_url, username) and p_url not in seen_urls:
+                                        collected_urls.append(p_url)
+                                        seen_urls.add(p_url)
+                            except Exception:
+                                pass
+                        if collected_urls:
+                            logger.info(f"{TAG_CRAWL} [PASS 3] yt-dlp flat-playlist berhasil menemukan {len(collected_urls)} post.")
+                            break
+                    else:
+                        err_msg = stderr.decode("utf-8", errors="ignore").strip()
+                        if err_msg:
+                            logger.debug(f"[PASS 3] yt-dlp variant note: {err_msg[:120]}")
             except Exception as e:
-                logger.debug(f"[PASS 3] yt-dlp error: {e}")
+                logger.warning(f"{TAG_WARN} [PASS 3] yt-dlp exception: {e}")
 
         # ─────────────────────────────────────────────────────────────────────
         # ABORT GUARD: Jika Semua Layer Gagal
