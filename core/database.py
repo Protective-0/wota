@@ -524,27 +524,57 @@ class DatabaseManager:
         )
         await self.db.commit()
 
-    async def delete_monitored_account(self, username: str, platform: str) -> None:
-        """Hapus akun dari daftar pantau."""
-        # FIX: assert stripped by python -O; use explicit guard
+    async def delete_monitored_account(
+        self, username: str, platform: Optional[str] = None
+    ) -> int:
+        """
+        Hapus akun dari daftar pantau.
+        Jika platform tidak dispesifikasi, hapus dari semua platform.
+        Mengembalikan jumlah entri yang berhasil dihapus.
+        """
         if self._db is None:
             raise RuntimeError("Database is not initialized. Call initialize() first.")
-        await self.db.execute(
-            "DELETE FROM monitored_accounts WHERE username = ? AND platform = ?",
-            (username.lower(), platform.lower()),
-        )
+        u = username.lower().replace("@", "").strip()
+        if platform:
+            plat = platform.lower().strip()
+            cursor = await self.db.execute(
+                "DELETE FROM monitored_accounts WHERE username = ? AND platform = ?",
+                (u, plat),
+            )
+        else:
+            cursor = await self.db.execute(
+                "DELETE FROM monitored_accounts WHERE username = ?",
+                (u,),
+            )
+        rowcount = cursor.rowcount
         await self.db.commit()
+        return rowcount
 
-    async def reset_account_history(self, username: str, platform: str) -> None:
-        """Reset history scraping akun tertentu agar mendownload ulang dari awal."""
-        # FIX: assert stripped by python -O; use explicit guard
+    async def reset_account_history(
+        self, username: str, platform: Optional[str] = None
+    ) -> int:
+        """
+        Reset history scraping akun tertentu agar mendownload ulang dari awal.
+        Jika platform tidak dispesifikasi, reset di semua platform.
+        Mengembalikan jumlah entri yang berhasil di-reset.
+        """
         if self._db is None:
             raise RuntimeError("Database is not initialized. Call initialize() first.")
-        await self.db.execute(
-            "UPDATE monitored_accounts SET last_scraped_id = '', initial_scan_completed = 0 WHERE username = ? AND platform = ?",
-            (username.lower(), platform.lower()),
-        )
+        u = username.lower().replace("@", "").strip()
+        if platform:
+            plat = platform.lower().strip()
+            cursor = await self.db.execute(
+                "UPDATE monitored_accounts SET last_scraped_id = '', initial_scan_completed = 0 WHERE username = ? AND platform = ?",
+                (u, plat),
+            )
+        else:
+            cursor = await self.db.execute(
+                "UPDATE monitored_accounts SET last_scraped_id = '', initial_scan_completed = 0 WHERE username = ?",
+                (u,),
+            )
+        rowcount = cursor.rowcount
         await self.db.commit()
+        return rowcount
 
     async def mark_initial_scan_completed(self, username: str, platform: str) -> None:
         # FIX: assert stripped by python -O; use explicit guard

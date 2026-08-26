@@ -217,7 +217,7 @@ def extract_username_and_platform(input_str: str) -> tuple[str, str]:
         return "", ""
 
     input_str = input_str.strip()
-    platform = "instagram"  # default fallback
+    platform = ""  # Jangan default ke instagram jika input bukan URL
     username = input_str
 
     if "tiktok.com" in input_str:
@@ -239,7 +239,7 @@ def extract_username_and_platform(input_str: str) -> tuple[str, str]:
     if username.startswith("@"):
         username = username[1:]
 
-    return username.lower(), platform
+    return username.lower().strip(), platform
 
 
 def fmt_size(size_bytes: int) -> str:

@@ -441,44 +441,107 @@ class MediaScraperBot(commands.Bot):
         # Registrasi Slash Command /delete
         @self.tree.command(
             name="delete",
-            description="Permanently remove a profile record from monitored list",
+            description="Hapus akun dari daftar monitoring bot",
         )
-        @app_commands.describe(username="Username atau URL profil yang ingin dihapus")
-        async def delete_cmd(interaction: discord.Interaction, username: str):
+        @app_commands.describe(
+            username="Username (misal: @wojiaocheenci) atau URL profil lengkap",
+            platform="Platform akun (opsional jika menggunakan URL profil)",
+        )
+        @app_commands.choices(
+            platform=[
+                app_commands.Choice(name="TikTok", value="tiktok"),
+                app_commands.Choice(name="Instagram", value="instagram"),
+                app_commands.Choice(name="Twitter/X", value="twitter"),
+            ]
+        )
+        async def delete_cmd(
+            interaction: discord.Interaction,
+            username: str,
+            platform: Optional[str] = None,
+        ):
             if interaction.user.id != ALLOWED_USER_ID:
                 await safe_reply(
                     interaction, "⛔ Akses Ditolak.", ephemeral=True
                 )
                 return
+
+            await safe_defer(interaction)
+
             try:
-                clean_username, platform = extract_username_and_platform(username)
-                await self.db.delete_monitored_account(clean_username, platform)
-                await safe_reply(
-                    interaction, f"🗑️ Akun **@{clean_username}** telah dihapus dari daftar monitoring."
+                clean_username, detected_platform = extract_username_and_platform(username)
+                target_platform = platform or detected_platform or None
+
+                deleted_count = await self.db.delete_monitored_account(
+                    clean_username, target_platform
                 )
+
+                if deleted_count > 0:
+                    plat_str = f" ({target_platform})" if target_platform else ""
+                    await safe_reply(
+                        interaction,
+                        f"🗑️ Berhasil menghapus **@{clean_username}**{plat_str} dari daftar monitoring."
+                    )
+                else:
+                    plat_str = f" pada platform {target_platform}" if target_platform else ""
+                    await safe_reply(
+                        interaction,
+                        f"⚠️ Akun **@{clean_username}**{plat_str} tidak ditemukan di daftar monitoring database."
+                    )
             except Exception as e:
+                logger.error(f"[❌ ERROR  ] Gagal menghapus akun: {e}", exc_info=True)
                 await safe_reply(interaction, f"❌ Gagal menghapus akun: {e}")
 
         # Registrasi Slash Command /reset_account
         @self.tree.command(
             name="reset_account",
-            description="Clear last_scraped_id for a monitored account to force full re-scrape",
+            description="Reset riwayat scrape akun agar diunduh ulang dari awal",
         )
-        @app_commands.describe(username="Username atau URL profil yang ingin di-reset")
-        async def reset_account(interaction: discord.Interaction, username: str):
+        @app_commands.describe(
+            username="Username (misal: @wojiaocheenci) atau URL profil lengkap",
+            platform="Platform akun (opsional jika menggunakan URL profil)",
+        )
+        @app_commands.choices(
+            platform=[
+                app_commands.Choice(name="TikTok", value="tiktok"),
+                app_commands.Choice(name="Instagram", value="instagram"),
+                app_commands.Choice(name="Twitter/X", value="twitter"),
+            ]
+        )
+        async def reset_account(
+            interaction: discord.Interaction,
+            username: str,
+            platform: Optional[str] = None,
+        ):
             if interaction.user.id != ALLOWED_USER_ID:
                 await safe_reply(
                     interaction, "⛔ Akses Ditolak.", ephemeral=True
                 )
                 return
+
+            await safe_defer(interaction)
+
             try:
-                clean_username, platform = extract_username_and_platform(username)
-                await self.db.reset_account_history(clean_username, platform)
-                await safe_reply(
-                    interaction,
-                    f"🔄 Riwayat scrape untuk **@{clean_username}** telah di-reset. Scrape berikutnya akan mengunduh ulang."
+                clean_username, detected_platform = extract_username_and_platform(username)
+                target_platform = platform or detected_platform or None
+
+                reset_count = await self.db.reset_account_history(
+                    clean_username, target_platform
                 )
+
+                if reset_count > 0:
+                    plat_str = f" ({target_platform})" if target_platform else ""
+                    await safe_reply(
+                        interaction,
+                        f"🔄 Riwayat scrape untuk **@{clean_username}**{plat_str} telah di-reset. Scrape berikutnya akan mengunduh ulang seluruh postingan."
+                    )
+                else:
+                    plat_str = f" pada platform {target_platform}" if target_platform else ""
+                    await safe_reply(
+                        interaction,
+                        f"⚠️ Akun **@{clean_username}**{plat_str} tidak ditemukan di daftar monitoring database."
+                    )
             except Exception as e:
+                logger.error(f"[❌ ERROR  ] Gagal reset akun: {e}", exc_info=True)
                 await safe_reply(
                     interaction, f"❌ Gagal mereset riwayat: {e}"
                 )
