@@ -36,7 +36,14 @@ import aiofiles  # Async file I/O — tidak blokir event loop saat baca file bes
 import discord
 
 from .downloader import MediaDownloader
-from .utils import TAG_DISCORD, TAG_WARN, TAG_ERROR, TAG_SUCCESS, fmt_size
+from .utils import (
+    TAG_DISCORD,
+    TAG_WARN,
+    TAG_ERROR,
+    TAG_SUCCESS,
+    fmt_size,
+    format_wib_date,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -335,16 +342,6 @@ class MediaSender:
         if files_over_limit is None:
             files_over_limit = [False] * len(file_paths)
 
-        # GUARANTEED TIMESTAMP SAFE GUARD
-        formatted_date = "Baru Saja (Patrol)"
-        if post_date and str(post_date).lower() != "none":
-            try:
-                clean_date_str = str(post_date).split('.')[0].replace('T', ' ').replace('Z', '')
-                dt = datetime.strptime(clean_date_str, "%Y-%m-%d %H:%M:%S")
-                formatted_date = (dt + timedelta(hours=7)).strftime("%d-%m-%Y %H:%M:%S")
-            except Exception:
-                formatted_date = str(post_date)
-
         # FORCE EMBED RENDERING REGARDLESS OF THE METADATA SOURCE
         clean_user = username.lstrip('@') if username else "Unknown User"
         display_caption = caption if caption else "Tidak ada deskripsi/caption."
@@ -386,7 +383,11 @@ class MediaSender:
             description=description_text,
             color=discord.Color.dark_teal()
         )
-        divider_embed.add_field(name="📅 Tanggal Post (WIB)", value=f"`{formatted_date}`", inline=True)
+        divider_embed.add_field(
+            name="📅 Tanggal Post (WIB)",
+            value=format_wib_date(post_date),
+            inline=False
+        )
 
         # Send header embed BEFORE media attachments so caption metadata renders above attachments in Discord channel
         try:

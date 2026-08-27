@@ -8,7 +8,8 @@ import logging
 import re
 import os
 import sys
-from typing import Optional
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Any
 
 # ──────────────────────────────────────────────
 # ANSI Color Codes (Linux/Docker terminal support)
@@ -256,3 +257,104 @@ def fmt_duration(seconds: float) -> str:
     mins = int(seconds // 60)
     secs = seconds % 60
     return f"{mins}m {secs:.0f}s"
+
+
+# ──────────────────────────────────────────────
+# Datetime & Discord Timestamp Formatting (WIB)
+# ──────────────────────────────────────────────
+
+INDONESIAN_MONTHS = [
+    "", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+    "Juli", "Agustus", "September", "Oktober", "November", "Desember"
+]
+WIB_TZ = timezone(timedelta(hours=7))
+
+
+def format_wib_date(raw_timestamp: Any) -> str:
+    """
+    Format raw timestamp (ISO string, unix int/float, atau datetime)
+    menjadi format tanggal Bahasa Indonesia (WIB) dan Discord Dynamic Timestamp:
+    
+    **DD Bulan YYYY, HH:MM WIB**
+    <t:{unix_timestamp}:f> (<t:{unix_timestamp}:R>)
+
+    Fallback: Jika timestamp None/kosong/tidak valid, mengembalikan 'Baru Saja (Patrol)'.
+    """
+    if raw_timestamp is None:
+        return "Baru Saja (Patrol)"
+
+    if isinstance(raw_timestamp, str):
+        val_str = raw_timestamp.strip()
+        if not val_str or val_str.lower() in ("none", "null", ""):
+            return "Baru Saja (Patrol)"
+
+    dt_utc: Optional[datetime] = None
+
+    # 1. datetime instance
+    if isinstance(raw_timestamp, datetime):
+        if raw_timestamp.tzinfo is None:
+            dt_utc = raw_timestamp.replace(tzinfo=timezone.utc)
+        else:
+            dt_utc = raw_timestamp.astimezone(timezone.utc)
+
+    # 2. int / float (Unix timestamp)
+    elif isinstance(raw_timestamp, (int, float)):
+        try:
+            dt_utc = datetime.fromtimestamp(raw_timestamp, tz=timezone.utc)
+        except Exception:
+            return "Baru Saja (Patrol)"
+
+    # 3. string parsing
+    elif isinstance(raw_timestamp, str):
+        val_str = raw_timestamp.strip()
+
+        # Cek apakah string berupa unix timestamp numeric
+        try:
+            if val_str.replace(".", "", 1).isdigit():
+                num = float(val_str)
+                dt_utc = datetime.fromtimestamp(num, tz=timezone.utc)
+        except Exception:
+            pass
+
+        # Cek ISO-8601 string
+        if dt_utc is None:
+            clean_str = val_str.replace("Z", "+00:00")
+            try:
+                dt_parsed = datetime.fromisoformat(clean_str)
+                if dt_parsed.tzinfo is None:
+                    dt_utc = dt_parsed.replace(tzinfo=timezone.utc)
+                else:
+                    dt_utc = dt_parsed.astimezone(timezone.utc)
+            except Exception:
+                pass
+
+        # Cek standard datetime string formats
+        if dt_utc is None:
+            formats = [
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y-%m-%d",
+                "%Y%m%d",
+                "%d-%m-%Y %H:%M:%S",
+                "%d/%m/%Y %H:%M:%S",
+            ]
+            for fmt in formats:
+                try:
+                    dt_parsed = datetime.strptime(val_str.split(".")[0], fmt)
+                    dt_utc = dt_parsed.replace(tzinfo=timezone.utc)
+                    break
+                except Exception:
+                    pass
+
+    if dt_utc is None:
+        return "Baru Saja (Patrol)"
+
+    # Konversi ke WIB (UTC+7)
+    dt_wib = dt_utc.astimezone(WIB_TZ)
+    unix_ts = int(dt_utc.timestamp())
+    month_name = INDONESIAN_MONTHS[dt_wib.month]
+    time_str = dt_wib.strftime("%H:%M")
+    wib_str = f"{dt_wib.day:02d} {month_name} {dt_wib.year}, {time_str} WIB"
+
+    return f"**{wib_str}**\n<t:{unix_ts}:f> (<t:{unix_ts}:R>)"
