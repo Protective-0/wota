@@ -186,7 +186,7 @@ TIKTOK_PROFILE_REGEX = re.compile(
 )
 
 INSTAGRAM_PROFILE_REGEX = re.compile(
-    r"https?://(?:www\.)?instagram\.com/(?!p/|reel/|explore/|stories/|accounts/)[\w.]+/?(?:\?[^/\s]*)?",
+    r"https?://(?:www\.)?instagram\.com/(?!p/|reel/|explore/|stories/|accounts/)[\w.]+(?:/reels/?)?(?:\?[^/\s]*)?",
     re.IGNORECASE,
 )
 
@@ -228,9 +228,20 @@ def extract_username_and_platform(input_str: str) -> tuple[str, str]:
             username = match.group(1)
     elif "instagram.com" in input_str:
         platform = "instagram"
-        match = re.search(r"instagram\.com/([^/?&#/\s]+)", input_str)
+        match = re.search(
+            r"instagram\.com/(?!p/|reel/|explore/|stories/|accounts/)([^/?&#/\s]+)",
+            input_str,
+            re.IGNORECASE,
+        )
         if match:
-            username = match.group(1)
+            u_candidate = match.group(1).lower().strip()
+            if u_candidate in ("reels", "reel"):
+                # Handle edge case: instagram.com/reels/username
+                m2 = re.search(r"instagram\.com/reels?/([^/?&#/\s]+)", input_str, re.IGNORECASE)
+                if m2:
+                    username = m2.group(1)
+            else:
+                username = u_candidate
     elif "twitter.com" in input_str or "x.com" in input_str:
         platform = "twitter"
         match = re.search(r"(?:x|twitter)\.com/([^/?&#/\s]+)", input_str)

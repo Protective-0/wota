@@ -1257,13 +1257,22 @@ class MediaScraperBot(commands.Bot):
             # newest_scraped_id updates on each successful upload; partial progress is preserved
             # if the loop exits mid-way (e.g., exception on a later post).
             newest_scraped_id = last_scraped_id
-            for data in downloaded_data_list:
+            total_to_upload = len(downloaded_data_list)
+            upload_success_count = 0
+            if total_to_upload > 0:
+                logger.info(
+                    f"{TAG_DISCORD} Memulai upload {total_to_upload} postingan @{username} ({platform}) ke channel {channel_id}..."
+                )
+            for up_idx, data in enumerate(downloaded_data_list, 1):
                 post = data["post"]
                 files = data["files"]
                 real_cap = data["caption"]
                 ts = data["timestamp"]
 
                 try:
+                    logger.info(
+                        f"{TAG_DISCORD} [{up_idx}/{total_to_upload}] Mengirim media post {post.post_id} ({post.platform})..."
+                    )
                     success = await self._upload_downloaded_media(
                         post=post,
                         downloaded_files=files,
@@ -1272,6 +1281,7 @@ class MediaScraperBot(commands.Bot):
                         timestamp=ts
                     )
                     if success:
+                        upload_success_count += 1
                         newest_scraped_id = post.post_id
                         # Catat ke SQLite riwayat unduhan
                         await self.db.mark_post_downloaded(
@@ -1285,14 +1295,18 @@ class MediaScraperBot(commands.Bot):
                             post.post_id, username, post.platform
                         )
                         logger.info(
-                            f"{TAG_SUCCESS} Post {post.post_id} terkirim ke channel {channel_id}."
+                            f"{TAG_SUCCESS} [{up_idx}/{total_to_upload}] Upload sukses: Post {post.post_id} ({post.platform}) terkirim ke channel. (Total terupload: {upload_success_count}/{total_to_upload})"
+                        )
+                    else:
+                        logger.error(
+                            f"{TAG_ERROR} [{up_idx}/{total_to_upload}] Upload gagal: Post {post.post_id} ({post.platform})."
                         )
                     
                     # Jeda aman antar postingan agar sesuai urutan dan meminimalisir rate limit Discord
                     await asyncio.sleep(SEND_DELAY)
                     
                 except Exception as e:
-                    logger.error(f"[❌ SKIP] Error occurred on uploading post {post.post_id}: {e}")
+                    logger.error(f"[❌ SKIP] [{up_idx}/{total_to_upload}] Error occurred on uploading post {post.post_id}: {e}")
                     await asyncio.sleep(4.0)
                     continue
 
@@ -1453,13 +1467,21 @@ class MediaScraperBot(commands.Bot):
                 await asyncio.sleep(random.uniform(1.0, 3.0))
 
             # Fase 2: Upload Semua ke Discord
-            for data in downloaded_data_list:
+            total_to_upload = len(downloaded_data_list)
+            if total_to_upload > 0:
+                logger.info(
+                    f"{TAG_DISCORD} Memulai upload {total_to_upload} postingan @{username} ({platform}) ke channel Discord..."
+                )
+            for up_idx, data in enumerate(downloaded_data_list, 1):
                 post = data["post"]
                 files = data["files"]
                 real_cap = data["caption"]
                 ts = data["timestamp"]
 
                 try:
+                    logger.info(
+                        f"{TAG_DISCORD} [{up_idx}/{total_to_upload}] Mengirim media post {post.post_id} ({post.platform})..."
+                    )
                     success = await self._upload_downloaded_media(
                         post=post,
                         downloaded_files=files,
@@ -1485,14 +1507,20 @@ class MediaScraperBot(commands.Bot):
                             posts_done=posts_processed,
                             current_post_id=post.post_id,
                         )
+                        logger.info(
+                            f"{TAG_SUCCESS} [{up_idx}/{total_to_upload}] Upload sukses: Post {post.post_id} ({post.platform}) terkirim ke Discord. (Total terupload: {posts_processed}/{total_to_upload})"
+                        )
                     else:
                         posts_failed += 1
                         await self.db.mark_post_failed(
                             post.post_id, post.platform, post.profile_url
                         )
+                        logger.error(
+                            f"{TAG_ERROR} [{up_idx}/{total_to_upload}] Upload gagal: Post {post.post_id} ({post.platform})."
+                        )
                 except Exception as task_err:
                     logger.error(
-                        f"[❌ ERROR  ] Upload error: {task_err}"
+                        f"[❌ ERROR  ] [{up_idx}/{total_to_upload}] Upload error: {task_err}"
                     )
                     posts_failed += 1
                     await self.db.mark_post_failed(

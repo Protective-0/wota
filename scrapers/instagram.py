@@ -80,18 +80,30 @@ class InstagramScraper(BaseScraper):
         self._context = None
 
     def _extract_username(self, url: str) -> str:
-        """Ekstrak username Instagram dari berbagai format URL profil."""
-        match = re.search(r"instagram\.com/([^/?&#/]+)/?", url)
+        """Ekstrak username Instagram dari berbagai format URL profil (termasuk /reels)."""
+        if not url:
+            return ""
+        clean_url = url.split("?")[0].rstrip("/")
+        match = re.search(
+            r"instagram\.com/(?!p/|reel/|explore/|stories/|accounts/)([^/?&#/\s]+)",
+            clean_url,
+            re.IGNORECASE,
+        )
         if match:
-            username = match.group(1)
-            if username not in {"p", "reel", "explore", "stories", "accounts"}:
-                return username.lower().strip()
-        cleaned = url.split("?")[0].rstrip("/").split("/")[-1]
+            username = match.group(1).lower().strip()
+            if username in ("reels", "reel"):
+                m2 = re.search(r"instagram\.com/reels?/([^/?&#/\s]+)", clean_url, re.IGNORECASE)
+                if m2:
+                    return m2.group(1).lower().strip()
+            return username
+        cleaned = clean_url.split("/")[-1]
         return cleaned.lower().strip() if cleaned else ""
 
     def _extract_post_id(self, url: str) -> str:
-        """Ekstrak shortcode postingan dari URL Instagram."""
-        match = re.search(r"/(?:p|reel)/([A-Za-z0-9_-]+)", url)
+        """Ekstrak shortcode postingan dari URL Instagram (/p/, /reel/, /{user}/reel/)."""
+        if not url:
+            return ""
+        match = re.search(r"/(?:p|reel|reels)/([A-Za-z0-9_-]+)", url, re.IGNORECASE)
         return match.group(1) if match else ""
 
     async def scrape_profile(
@@ -355,6 +367,22 @@ class InstagramScraper(BaseScraper):
             logger.debug(f"Tier 1 Public Web API extraction info: {e}")
 
         # ─────────────────────────────────────────────────────────────────────
+        # REELS COMPREHENSIVE SCAN: Tab Reels Crawler
+        # Memastikan video dari tab Reels (yang tidak di-share ke main feed) tetap terambil 100%
+        # ─────────────────────────────────────────────────────────────────────
+        if not stop_condition_met:
+            logger.info(f"{TAG_CRAWL} [REELS] Memeriksa tab Reels secara komprehensif untuk @{username}...")
+            reels_posts = await self._fetch_via_guest_browser(canonical_url, username, only_reels=True)
+            new_reels_count = 0
+            for rp in reels_posts:
+                if rp.post_id not in seen_shortcodes:
+                    seen_shortcodes.add(rp.post_id)
+                    collected_posts.append(rp)
+                    new_reels_count += 1
+            if new_reels_count > 0:
+                logger.info(f"{TAG_CRAWL} [REELS] Berhasil menemukan {new_reels_count} post Reels tambahan.")
+
+        # ─────────────────────────────────────────────────────────────────────
         # TIER 2: gallery-dl Subprocess Extractor (Guest Mode Fallback)
         # ─────────────────────────────────────────────────────────────────────
         if not collected_posts:
@@ -381,13 +409,13 @@ class InstagramScraper(BaseScraper):
         # ─────────────────────────────────────────────────────────────────────
         if not collected_posts:
             logger.info(f"{TAG_CRAWL} [TIER 4] Menjalankan Playwright Guest Browser untuk @{username} (Dual-Tab)...")
-            browser_posts = await self._fetch_via_guest_browser(canonical_url, username)
+            browser_posts = await self._fetch_via_guest_browser(canonical_url, username, only_reels=False)
             for p in browser_posts:
                 if p.post_id not in seen_shortcodes:
                     seen_shortcodes.add(p.post_id)
                     collected_posts.append(p)
 
-        logger.info(f"{TAG_CRAWL} Total {len(collected_posts)} postingan @{username} berhasil dikumpulkan.")
+        logger.info(f"{TAG_CRAWL} Total {len(collected_posts)} postingan (Feed + Reels) @{username} berhasil dikumpulkan.")
 
         # ─────────────────────────────────────────────────────────────────────
         # STEP 5: DSU Sorting & SQLite Checkpoint
@@ -518,7 +546,9 @@ class InstagramScraper(BaseScraper):
             logger.debug(f"yt-dlp flat-playlist guest info: {e}")
         return results
 
-    async def _fetch_via_guest_browser(self, url: str, username: str) -> list[PostMedia]:
+    async def _fetch_via_guest_browser(
+        self, url: str, username: str, only_reels: bool = False
+    ) -> list[PostMedia]:
         """Fallback ekstraksi DOM Dual-Tab (Feed & Reels) via Playwright Guest Browser."""
         results: list[PostMedia] = []
         seen_ids = set()
@@ -533,21 +563,25 @@ class InstagramScraper(BaseScraper):
             )
             page = await self._context.new_page()
 
-            targets = [
-                f"https://www.instagram.com/{username}/",
-                f"https://www.instagram.com/{username}/reels/",
-            ]
+            targets = (
+                [f"https://www.instagram.com/{username}/reels/"]
+                if only_reels
+                else [
+                    f"https://www.instagram.com/{username}/",
+                    f"https://www.instagram.com/{username}/reels/",
+                ]
+            )
 
             start_time = time.monotonic()
-            MAX_CRAWL_DURATION = 300.0
+            MAX_CRAWL_DURATION = 120.0 if only_reels else 300.0
 
             for target_tab in targets:
                 if time.monotonic() - start_time > MAX_CRAWL_DURATION:
-                    logger.warning(f"{TAG_WARN} Batas waktu crawl browser Instagram 300s tercapai untuk @{username} — stop.")
+                    logger.warning(f"{TAG_WARN} Batas waktu crawl browser Instagram tercapai untuk @{username} — stop.")
                     break
                 try:
                     await page.goto(target_tab, wait_until="domcontentloaded", timeout=30000)
-                    await asyncio.sleep(2.0)
+                    await asyncio.sleep(2.5)
 
                     if "accounts/login" in page.url.lower() or bool(re.search(r"/challenge/?$|/challenge/\w+", page.url.lower())):
                         logger.warning(f"{TAG_WARN} Instagram mengalihkan {target_tab} ke login wall / challenge.")
@@ -565,11 +599,11 @@ class InstagramScraper(BaseScraper):
                         pass
 
                     # Scrolling pagination loop
-                    for _ in range(8):
+                    max_scrolls = 6 if only_reels else 8
+                    for _ in range(max_scrolls):
                         if time.monotonic() - start_time > MAX_CRAWL_DURATION:
-                            logger.warning(f"{TAG_WARN} Batas waktu scroll browser Instagram tercapai untuk @{username}.")
                             break
-                        links = await page.locator('a[href*="/p/"], a[href*="/reel/"]').all()
+                        links = await page.locator('a[href*="/p/"], a[href*="/reel/"], a[href*="/reels/"]').all()
                         for link in links:
                             try:
                                 href = await link.get_attribute("href")
@@ -578,11 +612,12 @@ class InstagramScraper(BaseScraper):
                                     p_id = self._extract_post_id(p_url)
                                     if p_id and p_id not in seen_ids:
                                         seen_ids.add(p_id)
-                                        is_reel = "/reel/" in p_url
+                                        is_reel = "/reel" in p_url.lower()
+                                        clean_post_url = f"https://www.instagram.com/reel/{p_id}/" if is_reel else f"https://www.instagram.com/p/{p_id}/"
                                         results.append(
                                             PostMedia(
                                                 post_id=p_id,
-                                                post_url=p_url.split("?")[0],
+                                                post_url=clean_post_url,
                                                 profile_url=url,
                                                 platform=self.PLATFORM,
                                                 media_type=MediaType.VIDEO if is_reel else MediaType.PHOTO,
