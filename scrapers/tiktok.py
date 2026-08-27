@@ -18,6 +18,7 @@ Arsitektur & Keamanan:
 """
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -113,6 +114,7 @@ class TikTokScraper(BaseScraper):
 
         collected_urls: list[str] = []
         seen_urls: set[str] = set()
+        metadata_map: dict[str, dict] = {}
 
         # ─────────────────────────────────────────────────────────────────────
         # PASS 0 (PRIMARY): Playwright Persistent Stealth Browser (Bypass WAF & Captcha)
@@ -147,11 +149,18 @@ class TikTokScraper(BaseScraper):
             # Network Interceptor: Tangkap payload internal TikTok saat dimuat dengan verifikasi author ketat
             async def _on_page_response(resp):
                 r_url = resp.url
-                if any(k in r_url for k in ("item_list", "/api/post", "aweme/v1", "user/detail", "item/detail")) and resp.status == 200:
+                if any(k in r_url for k in ("item_list", "/api/post", "aweme/v1", "user/detail", "item/detail", "/api/story", "story/user", "story/detail")) and resp.status == 200:
                     try:
                         data = await resp.json()
                         if isinstance(data, dict):
-                            items = data.get("itemList", []) or data.get("items", []) or data.get("aweme_list", []) or []
+                            items = (
+                                data.get("itemList", [])
+                                or data.get("items", [])
+                                or data.get("aweme_list", [])
+                                or data.get("story_list", [])
+                                or data.get("user_story", {}).get("stories", [])
+                                or []
+                            )
                             for item in items:
                                 if isinstance(item, dict):
                                     author_info = item.get("author") or {}
@@ -166,8 +175,36 @@ class TikTokScraper(BaseScraper):
                                     v_id = str(item.get("id") or item.get("aweme_id") or item.get("itemId") or "")
                                     if v_id and re.match(r"^\d{15,22}$", v_id):
                                         is_photo = bool(item.get("imagePost") or item.get("images"))
+                                        is_story = bool(
+                                            item.get("is_story")
+                                            or item.get("aweme_type") in (160, 29, 40)
+                                            or "story" in str(r_url)
+                                        )
                                         t = "photo" if is_photo else "video"
                                         p_url = f"https://www.tiktok.com/@{username}/{t}/{v_id}"
+
+                                        # Ekstrak timestamp asli (createTime epoch integer)
+                                        create_time = (
+                                            item.get("createTime")
+                                            or item.get("create_time")
+                                            or (author_info.get("create_time") if isinstance(author_info, dict) else None)
+                                        )
+                                        ts_str = None
+                                        if create_time:
+                                            try:
+                                                ts_str = datetime.fromtimestamp(int(create_time), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                            except Exception:
+                                                pass
+
+                                        caption = item.get("desc") or item.get("description") or ("Story oleh @" + username if is_story else "")
+
+                                        metadata_map[v_id] = {
+                                            "timestamp": ts_str,
+                                            "caption": caption,
+                                            "is_story": is_story,
+                                            "is_photo": is_photo,
+                                        }
+
                                         if self._is_valid_author_post_url(p_url, username) and p_url not in seen_urls:
                                             collected_urls.append(p_url)
                                             seen_urls.add(p_url)
@@ -324,6 +361,21 @@ class TikTokScraper(BaseScraper):
                             is_photo = bool(v.get("images") or v.get("imagePost"))
                             t = "photo" if is_photo else "video"
                             p_url = f"https://www.tiktok.com/@{username}/{t}/{video_id}"
+
+                            create_time = v.get("create_time")
+                            ts_str = None
+                            if create_time:
+                                try:
+                                    ts_str = datetime.fromtimestamp(int(create_time), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                except Exception:
+                                    pass
+
+                            metadata_map[video_id] = {
+                                "timestamp": ts_str,
+                                "caption": v.get("title", ""),
+                                "is_photo": is_photo,
+                            }
+
                             if self._is_valid_author_post_url(p_url, username) and p_url not in seen_urls:
                                 collected_urls.append(p_url)
                                 seen_urls.add(p_url)
@@ -459,6 +511,25 @@ class TikTokScraper(BaseScraper):
                                     continue
                                 if p_id and re.match(r"^\d{15,22}$", str(p_id)):
                                     p_url = f"https://www.tiktok.com/@{username}/video/{p_id}"
+
+                                    ts_str = None
+                                    if entry.get("timestamp"):
+                                        try:
+                                            ts_str = datetime.fromtimestamp(int(entry["timestamp"]), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                        except Exception:
+                                            pass
+                                    elif entry.get("upload_date") and len(str(entry["upload_date"])) == 8:
+                                        try:
+                                            dt = datetime.strptime(str(entry["upload_date"]), "%Y%m%d").replace(tzinfo=timezone.utc)
+                                            ts_str = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                                        except Exception:
+                                            pass
+
+                                    metadata_map[str(p_id)] = {
+                                        "timestamp": ts_str,
+                                        "caption": entry.get("title") or entry.get("description") or "",
+                                    }
+
                                     if self._is_valid_author_post_url(p_url, username) and p_url not in seen_urls:
                                         collected_urls.append(p_url)
                                         seen_urls.add(p_url)
@@ -507,6 +578,9 @@ class TikTokScraper(BaseScraper):
                 continue
 
             media_type = MediaType.PHOTO if "/photo/" in post_url else MediaType.VIDEO
+            meta = metadata_map.get(post_id, {})
+            ts_str = meta.get("timestamp")
+            cap_str = meta.get("caption")
 
             yield PostMedia(
                 post_id=post_id,
@@ -514,6 +588,8 @@ class TikTokScraper(BaseScraper):
                 profile_url=profile_url,
                 platform=self.PLATFORM,
                 media_type=media_type,
+                timestamp=ts_str,
+                caption=cap_str,
                 cookies_file=cookies_file_str,
             )
 

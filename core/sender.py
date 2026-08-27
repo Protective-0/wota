@@ -373,18 +373,29 @@ class MediaSender:
         icon_path = icons_dir / icon_filename
         has_local_icon = icon_path.exists()
 
+        # Deteksi tipe konten (Story vs Postingan Reguler)
+        is_story = bool(
+            "/stories/" in (post_url or "").lower()
+            or "is_story=1" in (post_url or "").lower()
+            or "story oleh @" in (display_caption or "").lower()
+            or "instagram story" in (display_caption or "").lower()
+            or "tiktok story" in (display_caption or "").lower()
+        )
+        content_label = f"{platform_name} Story" if is_story else f"{platform_name} Post"
+        field_date_name = "📅 Tanggal Story (WIB)" if is_story else "📅 Tanggal Post (WIB)"
+
         # Build description
         description_text = (
-            f"🔗 **[{platform_name} Post @{clean_user}]({post_url})**\n\n"
+            f"🔗 **[{content_label} @{clean_user}]({post_url})**\n\n"
             f"{display_caption}\n\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
         )
 
         divider_embed = discord.Embed(
             description=description_text,
-            color=discord.Color.dark_teal()
+            color=discord.Color.gold() if is_story else discord.Color.dark_teal()
         )
         divider_embed.add_field(
-            name="📅 Tanggal Post (WIB)",
+            name=field_date_name,
             value=format_wib_date(post_date),
             inline=False
         )
