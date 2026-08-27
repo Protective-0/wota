@@ -106,6 +106,27 @@ class InstagramScraper(BaseScraper):
         match = re.search(r"/(?:p|reel|reels)/([A-Za-z0-9_-]+)", url, re.IGNORECASE)
         return match.group(1) if match else ""
 
+    @staticmethod
+    def _shortcode_to_timestamp(shortcode: str) -> Optional[str]:
+        """
+        [DETERMINISTIC INSTAGRAM TIMESTAMP RESOLVER]
+        Mendekode Instagram Snowflake ID dari Base64 shortcode ke ISO-8601 UTC timestamp.
+        Menjamin postingan Feed dan Reels tersortir dalam urutan kronologis yang 100% akurat.
+        """
+        if not shortcode or shortcode.startswith("ig_story_"):
+            return None
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        try:
+            media_id = 0
+            for char in shortcode:
+                media_id = media_id * 64 + alphabet.index(char)
+            # Instagram epoch: 1314220021000 ms (24 Agustus 2011)
+            timestamp_ms = (media_id >> 23) + 1314220021000
+            dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            return None
+
     async def scrape_profile(
         self,
         profile_url: str,
@@ -435,9 +456,15 @@ class InstagramScraper(BaseScraper):
         logger.info(f"{TAG_CRAWL} Total {len(collected_posts)} postingan (Feed + Reels + Story) @{username} berhasil dikumpulkan.")
 
         # ─────────────────────────────────────────────────────────────────────
-        # STEP 5: DSU Sorting & SQLite Checkpoint
-        # Urutan: Evaluasi stop-condition dari post terbaru -> Yield oldest-first ke Discord
+        # STEP 5: DSU Sorting & SQLite Checkpoint (Unified Chronological Order)
+        # Mengisi timestamp deterministik untuk semua postingan Feed & Reels dari shortcode,
+        # sehingga urutan upload serempak dan berbaur sempurna (oldest-to-newest).
         # ─────────────────────────────────────────────────────────────────────
+        for p in collected_posts:
+            if not p.timestamp and not p.post_id.startswith("ig_story_"):
+                p.timestamp = self._shortcode_to_timestamp(p.post_id)
+
+        # Evaluasi stop-condition dari post terbaru
         collected_posts.sort(
             key=lambda x: str(x.timestamp) if x.timestamp else "1970-01-01T00:00:00.000Z",
             reverse=True,
@@ -450,7 +477,7 @@ class InstagramScraper(BaseScraper):
                 break
             pending_posts.append(post)
 
-        # Re-sort ke kronologis tertib (oldest-to-newest) untuk pengiriman teratur ke Discord
+        # Re-sort ke kronologis tertib (oldest-to-newest) untuk pengiriman serempak dan berurutan ke Discord
         pending_posts.sort(
             key=lambda x: str(x.timestamp) if x.timestamp else "1970-01-01T00:00:00.000Z",
             reverse=False,
@@ -631,6 +658,7 @@ class InstagramScraper(BaseScraper):
                                         seen_ids.add(p_id)
                                         is_reel = "/reel" in p_url.lower()
                                         clean_post_url = f"https://www.instagram.com/reel/{p_id}/" if is_reel else f"https://www.instagram.com/p/{p_id}/"
+                                        ts_iso = self._shortcode_to_timestamp(p_id)
                                         results.append(
                                             PostMedia(
                                                 post_id=p_id,
@@ -638,6 +666,7 @@ class InstagramScraper(BaseScraper):
                                                 profile_url=url,
                                                 platform=self.PLATFORM,
                                                 media_type=MediaType.VIDEO if is_reel else MediaType.PHOTO,
+                                                timestamp=ts_iso,
                                                 cookies_file=None,
                                             )
                                         )
