@@ -205,17 +205,16 @@ class TwitterScraper(BaseScraper):
                         stop_after_batch = True
                         continue
 
-                    # Bersihkan media URLs ke resolusi original (name=orig)
+                    # Bersihkan media URLs ke resolusi original (format=jpg&name=orig)
                     cleaned_media_urls = []
                     for m_url in item.get("media_urls", []):
                         if "pbs.twimg.com/media/" in m_url:
                             clean_src = m_url.split("?")[0]
-                            if "format=" in m_url:
-                                high_res = re.sub(r"name=\w+", "name=orig", m_url)
-                                if "name=" not in high_res:
-                                    high_res += "&name=orig"
-                            else:
-                                high_res = f"{clean_src}?format=jpg&name=orig"
+                            format_val = "jpg"
+                            fmt_match = re.search(r"format=(\w+)", m_url)
+                            if fmt_match and fmt_match.group(1).lower() in ("png", "gif"):
+                                format_val = fmt_match.group(1).lower()
+                            high_res = f"{clean_src}?format={format_val}&name=orig"
                             cleaned_media_urls.append(high_res)
                         else:
                             cleaned_media_urls.append(m_url)

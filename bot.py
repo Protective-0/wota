@@ -53,7 +53,7 @@ from core.utils import (
     TAG_WARN, TAG_ERROR,
 )
 from scrapers import InstagramScraper, TikTokScraper, TwitterScraper
-from scrapers.base import BaseScraper, PostMedia
+from scrapers.base import BaseScraper, PostMedia, MediaType
 
 # ──────────────────────────────────────────────
 # Setup Logging

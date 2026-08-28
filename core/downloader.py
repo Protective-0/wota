@@ -2164,14 +2164,29 @@ class MediaDownloader:
                         cookies=cookies,
                         timeout=60,
                         allow_redirects=True,
-                        stream=True,  # FIX: stream agar tidak load seluruh response ke RAM
+                        stream=True,
                     )
+                    # Twitter CDN Fallback Handling jika format awal 404
+                    if response.status_code != 200 and "pbs.twimg.com/media/" in media_url:
+                        clean_src = media_url.split("?")[0]
+                        for fallback_fmt in ["?format=jpg&name=orig", "?format=jpg&name=large", "?format=jpg"]:
+                            alt_url = f"{clean_src}{fallback_fmt}"
+                            response = await session.get(
+                                alt_url,
+                                headers=req_headers,
+                                cookies=cookies,
+                                timeout=60,
+                                allow_redirects=True,
+                                stream=True,
+                            )
+                            if response.status_code == 200:
+                                break
+
                     if response.status_code != 200:
                         logger.error(f"Gagal download URL langsung (HTTP status {response.status_code})")
                         return None
 
-                    # FIX: streaming chunk write — cegah RAM spike untuk file besar
-                    # Supports both curl_cffi (aiter_content) and httpx (aiter_bytes)
+                    # Streaming chunk write di dalam session block aktif
                     async with aiofiles.open(output_path, "wb") as f:
                         if hasattr(response, "aiter_content"):
                             async for chunk in response.aiter_content(8192):
@@ -2181,17 +2196,23 @@ class MediaDownloader:
                                 await f.write(chunk)
                         else:
                             await f.write(response.content)
-                return output_path
+                    return output_path
             except (ImportError, ModuleNotFoundError):
                 import httpx  # pyright: ignore[reportMissingImports]
                 async with httpx.AsyncClient(headers=req_headers, cookies=cookies, timeout=60.0, follow_redirects=True) as client:
-                    async with client.stream("GET", media_url) as response:
-                        if response.status_code != 200:
-                            logger.error(f"Gagal download URL langsung via httpx (HTTP status {response.status_code})")
-                            return None
-                        async with aiofiles.open(output_path, "wb") as f:
-                            async for chunk in response.aiter_bytes(8192):
-                                await f.write(chunk)
+                    response = await client.get(media_url)
+                    if response.status_code != 200 and "pbs.twimg.com/media/" in media_url:
+                        clean_src = media_url.split("?")[0]
+                        for fallback_fmt in ["?format=jpg&name=orig", "?format=jpg&name=large", "?format=jpg"]:
+                            alt_url = f"{clean_src}{fallback_fmt}"
+                            response = await client.get(alt_url)
+                            if response.status_code == 200:
+                                break
+                    if response.status_code != 200:
+                        logger.error(f"Gagal download URL langsung via httpx (HTTP status {response.status_code})")
+                        return None
+                    async with aiofiles.open(output_path, "wb") as f:
+                        await f.write(response.content)
                 return output_path
 
         except Exception as e:
