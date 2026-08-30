@@ -172,7 +172,9 @@ class DatabaseManager:
                     # Tentukan tipe default berdasarkan nama kolom
                     col_type = (
                         "INTEGER NOT NULL DEFAULT 0" if col_name == "initial_scan_completed"
-                        else "INTEGER NOT NULL" if col_name == "channel_id"
+                        # FIX: include DEFAULT 0 so ALTER TABLE works on existing rows —
+                        # SQLite raises 'Cannot add a NOT NULL column without DEFAULT' otherwise.
+                        else "INTEGER NOT NULL DEFAULT 0" if col_name == "channel_id"
                         else "TEXT"
                     )
                     logger.info(f"[⚙️ SYSTEM] Migrasi monitored_accounts: Menambahkan kolom {col_name} ({col_type})")
@@ -327,21 +329,24 @@ class DatabaseManager:
         else:
             profile_url_built = f"https://www.instagram.com/{uname}/"
 
-        await self.db.execute(
-            """
-            INSERT OR IGNORE INTO scraped_posts (post_id, username, platform)
-            VALUES (?, ?, ?)
-            """,
-            (post_id, uname, plat),
-        )
-        await self.db.execute(
-            """
-            INSERT OR IGNORE INTO downloaded_posts (post_id, platform, profile_url, media_count, status)
-            VALUES (?, ?, ?, 1, 'done')
-            """,
-            (post_id, plat, profile_url_built),
-        )
-        await self.db.commit()
+        # FIX: wrap both INSERT statements in a single atomic transaction.
+        # Previously, two separate execute() + one commit() could leave DB in
+        # a partial-write state if the second execute raised (e.g. locked timeout).
+        async with self.db:  # aiosqlite context-manager issues BEGIN / COMMIT atomically
+            await self.db.execute(
+                """
+                INSERT OR IGNORE INTO scraped_posts (post_id, username, platform)
+                VALUES (?, ?, ?)
+                """,
+                (post_id, uname, plat),
+            )
+            await self.db.execute(
+                """
+                INSERT OR IGNORE INTO downloaded_posts (post_id, platform, profile_url, media_count, status)
+                VALUES (?, ?, ?, 1, 'done')
+                """,
+                (post_id, plat, profile_url_built),
+            )
 
     async def mark_post_downloaded(
         self,
@@ -507,8 +512,12 @@ class DatabaseManager:
         agar initial_scan_completed = 1 tanpa last_scraped_id valid tidak memicu historical dump loop.
         """
         async with self.db.execute(
+            # FIX: append ORDER BY created_at ASC for deterministic patrol order—
+            # without ORDER BY, SQLite returns rows in undefined heap order which
+            # can cause the same account to always patrol first across restarts.
             "SELECT username, platform, channel_id, last_scraped_id "
-            "FROM monitored_accounts WHERE (last_scraped_id IS NOT NULL AND last_scraped_id != '')"
+            "FROM monitored_accounts WHERE (last_scraped_id IS NOT NULL AND last_scraped_id != '') "
+            "ORDER BY created_at ASC"
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]

@@ -47,6 +47,56 @@ DOCKER_CHROMIUM_FLAGS = [
     "--no-default-browser-check",
 ]
 
+# ── Stealth init script (single source of truth) ─────────────────────────────
+# FIX: extracted from create_stealth_browser & create_persistent_stealth_context
+# so both methods share identical fingerprint spoofing without copy-paste drift.
+_STEALTH_SCRIPT = """
+    () => {
+        // 1. Clear Webdriver flag
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+        // 2. Mock Platform & UserAgentData to match Windows User-Agent on Linux servers
+        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+        if (navigator.userAgentData) {
+            Object.defineProperty(navigator.userAgentData, 'platform', { get: () => 'Windows' });
+        }
+
+        // 3. Mock Chrome runtime structure
+        window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+
+        // 4. Fake Languages, Plugins, Hardware
+        Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+        Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+    }
+"""
+
+
+def _get_cookie_candidates(platform: str, session_dir: str) -> list[Path]:
+    """
+    FIX: Deduplicated helper — previously identical lists were copy-pasted
+    inside both has_auth_configured() and load_cookies_as_list().
+    Returns ordered list of candidate cookie file paths for the given platform.
+    """
+    p = platform.lower().strip()
+    cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "sessions"))
+    sess_dir = Path(session_dir)
+    return [
+        cookie_dir / f"{p}.json",
+        cookie_dir / f"{p}.txt",
+        cookie_dir / f"cookies_{p}.json",
+        sess_dir / f"{p}.json",
+        sess_dir / f"{p}.txt",
+        sess_dir / f"cookies_{p}.json",
+        Path.cwd() / "sessions" / f"{p}.json",
+        Path.cwd() / "sessions" / f"{p}.txt",
+        Path.cwd() / "sessions" / f"cookies_{p}.json",
+        Path.cwd() / "config" / "cookies" / f"{p}.json",
+        Path.cwd() / "config" / "cookies" / f"{p}.txt",
+    ]
+
 
 class MediaType(Enum):
     """Tipe media yang didukung oleh bot."""
@@ -164,17 +214,8 @@ class BaseScraper(ABC):
                 return True
 
         # Cek 2: Cookie files di sessions/ atau COOKIE_DIR
-        cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "sessions"))
-        cookie_candidates = [
-            cookie_dir / f"{p}.json",
-            cookie_dir / f"{p}.txt",
-            cookie_dir / f"cookies_{p}.json",
-            Path.cwd() / "sessions" / f"{p}.json",
-            Path.cwd() / "sessions" / f"{p}.txt",
-            Path.cwd() / "sessions" / f"cookies_{p}.json",
-            Path.cwd() / "config" / "cookies" / f"{p}.json",
-        ]
-        for candidate in cookie_candidates:
+        # FIX: use shared _get_cookie_candidates() helper — eliminates duplicate path list
+        for candidate in _get_cookie_candidates(p, str(Path.cwd() / "sessions")):
             if candidate.exists() and candidate.stat().st_size > 0:
                 return True
 
@@ -262,9 +303,12 @@ class BaseScraper(ABC):
                     "[❌ ERROR  ] Tidak ada browser yang ditemukan di Linux! "
                     "Jalankan: `playwright install chromium` atau set env BROWSER_EXECUTABLE_PATH."
                 )
+                # FIX: DO NOT assign channel='chromium' when binary is absent —
+                # Playwright will crash with 'Executable doesn\'t exist' otherwise.
             else:
                 logger.debug("[⚙️ SYSTEM] Menggunakan Playwright bundled chromium via channel='chromium'.")
-            launch_kwargs["channel"] = "chromium"
+                # FIX: only set channel when the binary is actually present
+                launch_kwargs["channel"] = "chromium"
 
         if proxy:
             launch_kwargs["proxy"] = {"server": proxy}
@@ -298,29 +342,8 @@ class BaseScraper(ABC):
             timezone_id=timezone_id,
         )
 
-        # Deep Stealth Script Injection
-        await context.add_init_script("""
-            () => {
-                // 1. Clear Webdriver flag
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-                // 2. Mock Platform & UserAgentData to match Windows User-Agent on Linux servers
-                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-                if (navigator.userAgentData) {
-                    Object.defineProperty(navigator.userAgentData, 'platform', { get: () => 'Windows' });
-                }
-
-                // 3. Mock Chrome runtime structure
-                window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
-
-                // 4. Fake Languages, Plugins, Hardware
-                Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-                Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
-            }
-        """)
+        # Deep Stealth Script Injection — FIX: use module-level _STEALTH_SCRIPT constant
+        await context.add_init_script(_STEALTH_SCRIPT)
 
         return browser, context
 
@@ -353,29 +376,8 @@ class BaseScraper(ABC):
             **launch_kwargs
         )
 
-        # Deep Stealth Script Injection
-        await context.add_init_script("""
-            () => {
-                // 1. Clear Webdriver flag
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-                // 2. Mock Platform & UserAgentData to match Windows User-Agent on Linux servers
-                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-                if (navigator.userAgentData) {
-                    Object.defineProperty(navigator.userAgentData, 'platform', { get: () => 'Windows' });
-                }
-
-                // 3. Mock Chrome runtime structure
-                window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
-
-                // 4. Fake Languages, Plugins, Hardware
-                Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-                Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
-            }
-        """)
+        # Deep Stealth Script Injection — FIX: use module-level _STEALTH_SCRIPT constant
+        await context.add_init_script(_STEALTH_SCRIPT)
 
         return context
 
@@ -389,17 +391,8 @@ class BaseScraper(ABC):
         """
         cookies: list[dict] = []
 
-        cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "sessions"))
-        cookie_candidates = [
-            cookie_dir / f"{platform}.json",
-            cookie_dir / f"{platform}.txt",
-            cookie_dir / f"cookies_{platform}.json",
-            Path(self.session_dir) / f"{platform}.json",
-            Path(self.session_dir) / f"{platform}.txt",
-            Path(self.session_dir) / f"cookies_{platform}.json",
-            Path.cwd() / "config" / "cookies" / f"{platform}.json",
-            Path.cwd() / "config" / "cookies" / f"{platform}.txt",
-        ]
+        # FIX: use shared _get_cookie_candidates() helper — eliminates duplicate path list
+        cookie_candidates = _get_cookie_candidates(platform, str(self.session_dir))
 
         for cookie_file in cookie_candidates:
             if not cookie_file.exists():

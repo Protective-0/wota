@@ -124,8 +124,12 @@ class TwitterScraper(BaseScraper):
 
             seen_ids = set()
             no_new_count = 0
-            MAX_NO_NEW = 4
+            # FIX: raised from 4 to 6 — value of 4 is too aggressive for reply-heavy
+            # profiles where many consecutive scrolls may contain only text-only tweets.
+            MAX_NO_NEW = 6
             scroll_round = 0
+            # FIX: configurable via env MAX_TWITTER_SCROLLS — previously hardcoded to 35
+            MAX_TWITTER_SCROLLS = int(os.getenv("MAX_TWITTER_SCROLLS", "35"))
 
             scroll_start = time.monotonic()
             MAX_SCROLL_SECONDS = 180.0
@@ -251,14 +255,21 @@ class TwitterScraper(BaseScraper):
                 await page.evaluate("window.scrollBy(0, 1600)")
                 await asyncio.sleep(random.uniform(2.5, 3.5))
 
-                if scroll_round >= 35:
-                    logger.info(f"{TAG_CRAWL} Batas 35 scroll tercapai untuk @{username} — stop.")
+                if scroll_round >= MAX_TWITTER_SCROLLS:
+                    logger.info(f"{TAG_CRAWL} Batas {MAX_TWITTER_SCROLLS} scroll tercapai untuk @{username} — stop.")
                     break
 
-            await page.close()
         except Exception as e:
             logger.error(f"{TAG_ERROR} Gagal scrape timeline Twitter @{username}: {e}")
         finally:
+            # FIX: page.close() moved into finally so it always runs before self.close().
+            # Previously it was inside the try-block, which could raise 'Target closed'
+            # if an exception caused self.close() (context.close()) to fire via finally
+            # while page was still open. Closing page first avoids that race.
+            try:
+                await page.close()
+            except Exception:
+                pass
             await self.close()
 
         logger.info(f"{TAG_CRAWL} Selesai: {len(collected_posts)} tweet media terkumpul dari @{username}.")

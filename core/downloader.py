@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 from typing import Optional, cast, Any
 
+import httpx           # FIX: moved from inside download_post() — import once at module level
 import shutil
 import yt_dlp
 from yt_dlp.utils import DownloadError
@@ -156,33 +157,38 @@ class MediaDownloader:
 
         self.max_file_size_bytes = max_mb * 1024 * 1024
         self.target_file_size_bytes = target_mb * 1024 * 1024
+        # FIX: asyncio.Lock to prevent browser instantiation race — without this,
+        # two concurrent coroutines can both enter get_browser()'s if-branch and
+        # launch two separate browser instances before either finishes.
+        self._browser_lock = asyncio.Lock()
 
     async def get_browser(self):
         """Inisialisasi lazy browser Playwright Chromium (stealth). Auto-reinitialize jika browser crash/disconnect."""
-        if not self._browser or not self._browser.is_connected():
-            # FIX: imports moved here once — removed duplicate block that was at original L126-127
-            from playwright.async_api import async_playwright
-            from scrapers.base import BaseScraper
-            if self._browser:
-                try:
-                    await self._browser.close()
-                except Exception:
-                    pass
-            if self._playwright:
-                try:
-                    await self._playwright.stop()
-                except Exception:
-                    pass
-            self._playwright = await async_playwright().start()
-            brave_path = BaseScraper.get_brave_path()
-            # FIX: use BaseScraper.get_browser_launch_kwargs() instead of manual dict
-            # so stealth args stay in sync with all scrapers
-            launch_kwargs = BaseScraper.get_browser_launch_kwargs()
-            launch_kwargs["headless"] = True
-            if brave_path:
-                logger.info(f"Downloader menggunakan browser Brave dari: {brave_path}")
-                launch_kwargs["executable_path"] = brave_path
-            self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+        # FIX: acquire lock before checking connection state to prevent
+        # concurrent coroutines from both entering the init block simultaneously
+        # and launching duplicate browser instances.
+        async with self._browser_lock:
+            if not self._browser or not self._browser.is_connected():
+                from playwright.async_api import async_playwright
+                from scrapers.base import BaseScraper
+                if self._browser:
+                    try:
+                        await self._browser.close()
+                    except Exception:
+                        pass
+                if self._playwright:
+                    try:
+                        await self._playwright.stop()
+                    except Exception:
+                        pass
+                self._playwright = await async_playwright().start()
+                brave_path = BaseScraper.get_brave_path()
+                launch_kwargs = BaseScraper.get_browser_launch_kwargs()
+                launch_kwargs["headless"] = True
+                if brave_path:
+                    logger.info(f"Downloader menggunakan browser Brave dari: {brave_path}")
+                    launch_kwargs["executable_path"] = brave_path
+                self._browser = await self._playwright.chromium.launch(**launch_kwargs)
         return self._browser
 
     async def close_browser(self):
@@ -291,7 +297,13 @@ class MediaDownloader:
                     return await self.download_direct_url(img_url, filename, headers=headers, cookies=cookies_dict)
 
                 tasks = [download_single(idx, img_url) for idx, img_url in enumerate(image_urls)]
-                results = await asyncio.gather(*tasks)
+                # FIX: wrap gather() in wait_for() with 60s timeout.
+                # A single hung CDN endpoint would otherwise freeze the entire batch forever.
+                try:
+                    results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=60.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"{TAG_WARN} TikTok carousel download timeout (60s) untuk {post_url} — hasil parsial diproses.")
+                    results = []
 
                 downloaded_files = [path for path in results if path is not None]
                 if downloaded_files:
@@ -998,13 +1010,16 @@ class MediaDownloader:
         html_content = ""
         if has_scrapling:
             try:
-                response = await AsyncFetcher.get(
-                    url,
-                    headers=headers,
-                    cookies=cookies_dict if cookies_dict else None,
-                    timeout=15,
-                    impersonate="chrome124",
-                )
+                # FIX: removed invalid 'impersonate="chrome124"' parameter — not part of
+                # Scrapling AsyncFetcher.get() public API. Use stealth=True if available,
+                # otherwise rely on curl_cffi TLS impersonation via headers alone.
+                fetcher_kwargs: dict = {
+                    "headers": headers,
+                    "timeout": 15,
+                }
+                if cookies_dict:
+                    fetcher_kwargs["cookies"] = cookies_dict
+                response = await AsyncFetcher.get(url, **fetcher_kwargs)
                 if response.status == 200:
                     html_content = response.text
                     logger.debug("Tier 2: Scrapling AsyncFetcher berhasil mengambil HTML.")

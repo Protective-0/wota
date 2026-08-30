@@ -27,12 +27,10 @@ Discord Upload Limits:
 import asyncio
 import logging
 import os
-from io import BytesIO
 from pathlib import Path
 from typing import Optional
 from datetime import datetime, timedelta
 
-import aiofiles  # Async file I/O — tidak blokir event loop saat baca file besar
 import discord
 
 from .downloader import MediaDownloader
@@ -48,7 +46,8 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 # Jeda aman antar pengiriman pesan
-SEND_DELAY_SECONDS = 3
+# FIX: configurable via env SEND_DELAY_SECONDS — previously hardcoded to 3s
+SEND_DELAY_SECONDS = int(os.getenv("SEND_DELAY_SECONDS", "3"))
 
 # Max files per discord message (hard limit dari Discord API)
 DISCORD_MAX_FILES_PER_MSG = 10
@@ -119,11 +118,11 @@ class MediaSender:
             return False
 
         try:
-            # Baca file secara non-blocking via aiofiles
-            async with aiofiles.open(file_path, "rb") as f:
-                file_bytes = await f.read()
-
-            discord_file = discord.File(BytesIO(file_bytes), filename=file_path.name)
+            # FIX: pass file path directly to discord.File instead of reading
+            # the entire file into RAM via aiofiles.read() + BytesIO.
+            # discord.py natively accepts a file-like object or Path and streams
+            # it from disk — this saves up to 2x file-size worth of heap allocation.
+            discord_file = discord.File(fp=file_path, filename=file_path.name)
             try:
                 await self.channel.send(file=discord_file)
                 logger.info(f"{TAG_DISCORD} Video terkirim: {file_path.name} ({fmt_size(file_size)})")
@@ -175,10 +174,9 @@ class MediaSender:
             return False
 
         try:
-            async with aiofiles.open(file_path, "rb") as f:
-                file_bytes = await f.read()
-
-            discord_file = discord.File(BytesIO(file_bytes), filename=file_path.name)
+            # FIX: pass file path directly to discord.File — avoids reading whole file
+            # into RAM via aiofiles + BytesIO (saves up to 2x file-size heap usage).
+            discord_file = discord.File(fp=file_path, filename=file_path.name)
             try:
                 await self.channel.send(file=discord_file)
                 logger.info(f"{TAG_DISCORD} Media terkirim: {file_path.name} ({fmt_size(file_size)})")
@@ -261,12 +259,12 @@ class MediaSender:
 
             for p in chunk:
                 try:
-                    async with aiofiles.open(p, "rb") as f:
-                        file_bytes = await f.read()
-                    discord_files.append(discord.File(BytesIO(file_bytes), filename=p.name))
-                    chunk_total_bytes += len(file_bytes)
+                    # FIX: stream file from disk via discord.File(fp=path) — avoids
+                    # loading each carousel item fully into RAM via aiofiles.read().
+                    discord_files.append(discord.File(fp=p, filename=p.name))
+                    chunk_total_bytes += p.stat().st_size
                 except Exception as read_err:
-                    logger.error(f"{TAG_ERROR} Gagal membaca file chunk {p.name}: {read_err}")
+                    logger.error(f"{TAG_ERROR} Gagal membuka file chunk {p.name}: {read_err}")
 
             if not discord_files:
                 continue
@@ -299,10 +297,14 @@ class MediaSender:
             await self.downloader.cleanup_files_async(file_paths)
         else:
             for message in sent_messages:
-                try:
-                    await message.delete()
-                except discord.HTTPException as e:
-                    logger.error(f"{TAG_ERROR} Gagal rollback carousel message: {e}")
+                    try:
+                        await message.delete()
+                    except discord.NotFound:
+                        # FIX: message may have been deleted manually between send and rollback —
+                        # ignore 404 NotFound to prevent noisy traceback in logs.
+                        pass
+                    except discord.HTTPException as e:
+                        logger.error(f"{TAG_ERROR} Gagal rollback carousel message: {e}")
             logger.warning(f"{TAG_WARN} Carousel partial delivery — membersihkan file temporer.")
             await asyncio.sleep(1.5)
             await self.downloader.cleanup_files_async(file_paths)

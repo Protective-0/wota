@@ -63,6 +63,19 @@ logger = logging.getLogger(__name__)
 IG_WEB_APP_ID = "936619743392459"
 
 
+def _enrich_timestamps(posts: list) -> None:
+    """
+    FIX: Extracted from in-place for-loop inside scrape_profile() for clarity.
+    Fills missing timestamps for all non-story posts using InstagramScraper._shortcode_to_timestamp().
+    Mutates the list in-place; stories already have real timestamps from API so they are skipped.
+    """
+    for p in posts:
+        if not p.timestamp and not p.post_id.startswith("ig_story_"):
+            # Decode upload timestamp encoded in the Instagram shortcode base64.
+            # _shortcode_to_timestamp is a @staticmethod so called on the class directly.
+            p.timestamp = InstagramScraper._shortcode_to_timestamp(p.post_id)
+
+
 class InstagramScraper(BaseScraper):
     """
     Scraper profil Instagram 100% Guest Mode (Zero-Login) dengan dukungan Full Pagination & Reels.
@@ -280,7 +293,9 @@ class InstagramScraper(BaseScraper):
                 logger.info(f"{TAG_CRAWL} [TIER 1B] Memulai pagination API feed untuk @{username} (cursor: {end_cursor[:20]}...)...")
                 curr_cursor = end_cursor
                 page_idx = 1
-                max_pages = 20  # Batas aman max 240 postingan per scraping run
+                # FIX: configurable via env MAX_IG_FEED_PAGES — previously hardcoded to 20.
+                # Increase for accounts with 1000+ posts; decrease to reduce API load.
+                max_pages = int(os.getenv("MAX_IG_FEED_PAGES", "20"))
 
                 while curr_cursor and not stop_condition_met and page_idx <= max_pages:
                     feed_api_url = f"https://www.instagram.com/api/v1/feed/user/{user_id}/?count=12&max_id={curr_cursor}"
@@ -459,10 +474,9 @@ class InstagramScraper(BaseScraper):
         # STEP 5: DSU Sorting & SQLite Checkpoint (Unified Chronological Order)
         # Mengisi timestamp deterministik untuk semua postingan Feed & Reels dari shortcode,
         # sehingga urutan upload serempak dan berbaur sempurna (oldest-to-newest).
+        # FIX: extracted to _enrich_timestamps() helper for clarity
         # ─────────────────────────────────────────────────────────────────────
-        for p in collected_posts:
-            if not p.timestamp and not p.post_id.startswith("ig_story_"):
-                p.timestamp = self._shortcode_to_timestamp(p.post_id)
+        _enrich_timestamps(collected_posts)
 
         # Evaluasi stop-condition dari post terbaru
         collected_posts.sort(
@@ -692,110 +706,151 @@ class InstagramScraper(BaseScraper):
         [ZERO-LOGIN INSTAGRAM STORY ENGINE]
         Mengekstrak Instagram Stories aktif (24 jam) via Public Mirror Viewer tanpa memerlukan akun login/tumbal,
         lengkap dengan timestamp asli waktu unggah (converted ke ISO-8601 UTC).
+
+        Mirror Tier order:
+          Tier 1: dumpor.io/v/{username}  — reliable reverse-proxy mirror (aktif 2025)
+          Tier 2: storiesig.net/stories/{username}  — secondary fallback
         """
         results: list[PostMedia] = []
         clean_user = username.lower().replace("@", "").strip()
 
-        # 1. Fast Pass: Picuki Public Story Mirror via HTTP
-        try:
-            story_url = f"https://picuki.com/story/{clean_user}"
-            headers = {
-                "User-Agent": USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": "https://picuki.com/",
-            }
-            html_content = ""
-            if HAS_CURL_CFFI:
-                try:
-                    async with curl_requests.AsyncSession(impersonate="chrome124") as session:
-                        resp = await session.get(story_url, headers=headers, timeout=12)
-                        if resp.status_code == 200:
-                            html_content = resp.text
-                except Exception:
-                    pass
+        # Helper: ekstrak media dari HTML blok story yang sudah diparsing
+        def _parse_story_blocks(html_content: str, mirror_name: str) -> list[PostMedia]:
+            parsed: list[PostMedia] = []
+            now_utc = datetime.now(timezone.utc)
 
-            if not html_content:
-                async with httpx.AsyncClient(headers=headers, timeout=12.0, follow_redirects=True) as client:
-                    resp = await client.get(story_url)
-                    if resp.status_code == 200:
-                        html_content = resp.text
+            # Coba berbagai selector block yang umum dipakai mirror story public
+            story_items = re.findall(
+                r'<div[^>]*class="[^"]*(?:story[_-]?item|item[_-]?video|item[_-]?photo|story[_-]?card)[^"]*"[^>]*>(.*?)</div>\s*</div>',
+                html_content,
+                re.DOTALL | re.IGNORECASE,
+            ) or re.findall(
+                r'<div[^>]*class="[^"]*story[^"]*"[^>]*>(.*?)</div>',
+                html_content,
+                re.DOTALL | re.IGNORECASE,
+            )
 
-            if html_content and "User has no stories" not in html_content:
-                story_items = re.findall(
-                    r'<div[^>]*class="[^"]*(?:story_item|story-item|item_video|item_photo)[^"]*"[^>]*>(.*?)</div>\s*</div>',
-                    html_content,
-                    re.DOTALL | re.IGNORECASE,
-                ) or re.findall(
-                    r'<div[^>]*class="[^"]*story[^"]*"[^>]*>(.*?)</div>',
-                    html_content,
-                    re.DOTALL | re.IGNORECASE,
+            for idx, block in enumerate(story_items, 1):
+                video_match = (
+                    re.search(r'<video[^>]*src="([^"]+)"', block)
+                    or re.search(r'data-video="([^"]+)"', block)
+                    or re.search(r'<source[^>]*src="([^"]+\.mp4[^"]*)"', block, re.IGNORECASE)
+                )
+                img_match = (
+                    re.search(r'<img[^>]*src="([^"]+)"', block)
+                    or re.search(r'data-image="([^"]+)"', block)
+                )
+                download_match = (
+                    re.search(r'href="([^"]+)"[^>]*class="[^"]*download[^"]*"', block)
+                    or re.search(r'data-url="([^"]+)"', block)
                 )
 
-                for idx, block in enumerate(story_items, 1):
-                    video_match = re.search(r'<video[^>]*src="([^"]+)"', block) or re.search(r'data-video="([^"]+)"', block)
-                    img_match = re.search(r'<img[^>]*src="([^"]+)"', block) or re.search(r'data-image="([^"]+)"', block)
-                    download_match = re.search(r'href="([^"]+)"[^>]*class="[^"]*download[^"]*"', block) or re.search(r'data-url="([^"]+)"', block)
+                media_url = ""
+                is_video = False
+                if video_match:
+                    media_url = video_match.group(1)
+                    is_video = True
+                elif download_match and (".mp4" in download_match.group(1) or "video" in download_match.group(1)):
+                    media_url = download_match.group(1)
+                    is_video = True
+                elif download_match:
+                    media_url = download_match.group(1)
+                elif img_match:
+                    media_url = img_match.group(1)
 
-                    media_url = ""
-                    is_video = False
-                    if video_match:
-                        media_url = video_match.group(1)
-                        is_video = True
-                    elif download_match and (".mp4" in download_match.group(1) or "video" in download_match.group(1)):
-                        media_url = download_match.group(1)
-                        is_video = True
-                    elif download_match:
-                        media_url = download_match.group(1)
-                        is_video = False
-                    elif img_match:
-                        media_url = img_match.group(1)
-                        is_video = False
+                if not media_url or "placeholder" in media_url.lower():
+                    continue
 
-                    if not media_url or "placeholder" in media_url.lower():
-                        continue
+                # Ekstrak relative timestamp dari teks block
+                time_match = re.search(
+                    r'(\d+)\s*(hour|hours|h|min|minute|minutes|m|day|days|d|sec|second|seconds|s)\s*ago',
+                    block,
+                    re.IGNORECASE,
+                )
+                ts_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                if time_match:
+                    val = int(time_match.group(1))
+                    unit = time_match.group(2).lower()
+                    if unit.startswith("h"):
+                        ts_iso = (now_utc - timedelta(hours=val)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    elif unit.startswith("m") and not unit.startswith("mo"):
+                        ts_iso = (now_utc - timedelta(minutes=val)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    elif unit.startswith("d"):
+                        ts_iso = (now_utc - timedelta(days=val)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-                    # Ekstrak relative timestamp (e.g. '21 hours ago', '5h ago')
-                    time_match = re.search(
-                        r'(\d+)\s*(hour|hours|h|min|minute|minutes|m|day|days|d|sec|second|seconds|s)\s*ago',
-                        block,
-                        re.IGNORECASE,
+                raw_id = re.search(r'/([A-Za-z0-9_-]{10,})', media_url)
+                s_id = f"ig_story_{clean_user}_{raw_id.group(1)[:12] if raw_id else idx}_{int(now_utc.timestamp()) // 86400}"
+
+                parsed.append(
+                    PostMedia(
+                        post_id=s_id,
+                        post_url=f"https://www.instagram.com/stories/{clean_user}/",
+                        profile_url=f"https://www.instagram.com/{clean_user}/",
+                        platform=self.PLATFORM,
+                        media_type=MediaType.VIDEO if is_video else MediaType.PHOTO,
+                        media_urls=[media_url],
+                        timestamp=ts_iso,
+                        caption=f"📸 Instagram Story oleh @{clean_user} (via {mirror_name})",
+                        cookies_file=None,
                     )
-                    now_utc = datetime.now(timezone.utc)
-                    ts_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                )
 
-                    if time_match:
-                        val = int(time_match.group(1))
-                        unit = time_match.group(2).lower()
-                        if unit.startswith("h"):
-                            ts_iso = (now_utc - timedelta(hours=val)).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        elif unit.startswith("m"):
-                            ts_iso = (now_utc - timedelta(minutes=val)).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        elif unit.startswith("d"):
-                            ts_iso = (now_utc - timedelta(days=val)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            return parsed
 
-                    raw_id = re.search(r'/([A-Za-z0-9_-]{10,})', media_url)
-                    s_id = f"ig_story_{clean_user}_{raw_id.group(1)[:12] if raw_id else idx}_{int(now_utc.timestamp()) // 86400}"
+        # ── Tier 1: dumpor.io (aktif & reliable per 2025) ───────────────────────────────
+        # FIX: picuki.com/story/ has been dead since mid-2025 (redirects to TikTok mirror).
+        # dumpor.io provides reliable Instagram story proxy without login requirement.
+        mirror_tiers = [
+            ("dumpor.io",     f"https://dumpor.io/v/{clean_user}"),
+            ("storiesig.net", f"https://storiesig.net/stories/{clean_user}"),
+        ]
 
-                    results.append(
-                        PostMedia(
-                            post_id=s_id,
-                            post_url=f"https://www.instagram.com/stories/{clean_user}/",
-                            profile_url=f"https://www.instagram.com/{clean_user}/",
-                            platform=self.PLATFORM,
-                            media_type=MediaType.VIDEO if is_video else MediaType.PHOTO,
-                            media_urls=[media_url],
-                            timestamp=ts_iso,
-                            caption=f"📸 Instagram Story oleh @{clean_user}",
-                            cookies_file=None,
-                        )
-                    )
+        request_headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
 
-                if results:
-                    logger.info(f"{TAG_CRAWL} [STORY] Berhasil mengekstrak {len(results)} Instagram Story aktif untuk @{clean_user} (Zero-Login).")
-                    return results
+        for mirror_name, story_url in mirror_tiers:
+            try:
+                html_content = ""
+                request_headers["Referer"] = f"https://{mirror_name}/"
 
-        except Exception as e:
-            logger.debug(f"Public story mirror fast pass info: {e}")
+                if HAS_CURL_CFFI:
+                    try:
+                        async with curl_requests.AsyncSession(impersonate="chrome124") as session:
+                            resp = await session.get(story_url, headers=request_headers, timeout=12)
+                            if resp.status_code == 200:
+                                html_content = resp.text
+                    except Exception:
+                        pass
+
+                if not html_content:
+                    async with httpx.AsyncClient(headers=request_headers, timeout=12.0, follow_redirects=True) as client:
+                        resp = await client.get(story_url)
+                        if resp.status_code == 200:
+                            html_content = resp.text
+
+                if not html_content:
+                    logger.debug(f"[STORY] Mirror {mirror_name} tidak merespons untuk @{clean_user} — coba tier berikutnya.")
+                    continue
+
+                # Cek sinyal explicit 'no stories'
+                if any(sig in html_content.lower() for sig in (
+                    "no stories", "user has no stories", "profile not found",
+                    "sorry, no story", "doesn't have any stories",
+                )):
+                    logger.debug(f"[STORY] Mirror {mirror_name} melaporkan tidak ada story aktif untuk @{clean_user}.")
+                    continue
+
+                parsed = _parse_story_blocks(html_content, mirror_name)
+                if parsed:
+                    logger.info(f"{TAG_CRAWL} [STORY] Berhasil mengekstrak {len(parsed)} Instagram Story aktif untuk @{clean_user} (via {mirror_name}).")
+                    return parsed
+
+            except Exception as e:
+                logger.debug(f"Story mirror {mirror_name} error untuk @{clean_user}: {e}")
+            # Jeda singkat antar mirror tier
+            await asyncio.sleep(0.5)
 
         return results
 
