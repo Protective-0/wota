@@ -56,3 +56,5 @@ README.md
 .agents/
 skills-lock.json
 .skills/
+scratch/
+scratch_*

@@ -67,7 +67,9 @@ Thumbs.db
 skills-lock.json
 .skills/
 
-# Internal Audit Documents
+# Internal Audit Documents & Scratch files
 *_audit.md
 linux_server_audit.md
+scratch/
+scratch_*
 
