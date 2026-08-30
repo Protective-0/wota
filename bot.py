@@ -122,20 +122,22 @@ load_dotenv()
 # Discord bot token dari Developer Portal
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 
-# Channel ID tujuan pengiriman media (right-click channel → Copy Channel ID)
+# Channel ID tujuan pengiriman media (Opsional: fallback channel jika diisi)
 try:
     DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 except ValueError:
     DISCORD_CHANNEL_ID = 0
 
-if not DISCORD_CHANNEL_ID:
-    raise ValueError("DISCORD_CHANNEL_ID is not set in environment or invalid.")
+# User ID Discord pemilik bot (Opsional: jika kosong, otomatis auto-detect dari Discord Application Owner)
+# Mendukung single ID atau multi-ID dipisah koma (e.g. 1073807995328270427, 1234567890)
+raw_allowed_users = os.getenv("DISCORD_ALLOWED_USER_ID", "0")
+ALLOWED_USER_IDS: set[int] = set()
+for uid_str in raw_allowed_users.replace(";", ",").split(","):
+    clean_uid = uid_str.strip()
+    if clean_uid.isdigit() and int(clean_uid) > 0:
+        ALLOWED_USER_IDS.add(int(clean_uid))
 
-# User ID Discord yang diizinkan mengirim perintah (right-click user → Copy User ID)
-try:
-    ALLOWED_USER_ID = int(os.getenv("DISCORD_ALLOWED_USER_ID", "0"))
-except ValueError:
-    ALLOWED_USER_ID = 0
+ALLOWED_USER_ID = next(iter(ALLOWED_USER_IDS)) if ALLOWED_USER_IDS else 0
 
 TEMP_DIR = os.getenv("TEMP_DIR", "./temp_media")
 SESSION_DIR = os.getenv("SESSION_DIR", "./sessions")
@@ -151,9 +153,46 @@ DOWNLOAD_DELAY_MAX = float(os.getenv("DOWNLOAD_DELAY_MAX", "5"))
 raw_concurrent = int(os.getenv("CONCURRENT_DOWNLOADS", "3"))
 CONCURRENT_DOWNLOADS = max(1, min(10, raw_concurrent))
 
-# ──────────────────────────────────────────────
+
+def is_authorized_user(
+    user: Any,
+    guild: Optional[discord.Guild] = None,
+) -> bool:
+    """
+    Cek otorisasi pengguna secara menyeluruh (Multi-User & Multi-Server):
+    1. Superadmin / Bot Owner: ID ada di ALLOWED_USER_IDS / ALLOWED_USER_ID (dari .env).
+    2. Server Owner: User adalah pemilik server Discord ini (user.id == guild.owner_id).
+    3. Server Admin / Manager: Memiliki izin Administrator, Manage Guild, atau Manage Channels di server ini.
+    """
+    if not user:
+        return False
+
+    # 1. Bot Owner Universal Bypass (berlaku di server mana pun dan di DM)
+    user_id = getattr(user, "id", None)
+    if user_id in ALLOWED_USER_IDS or (ALLOWED_USER_ID and user_id == ALLOWED_USER_ID):
+        return True
+
+    # 2. Cek Server Owner
+    guild_obj = guild or getattr(user, "guild", None)
+    if guild_obj and getattr(guild_obj, "owner_id", None) == user_id:
+        return True
+
+    # 3. Cek Permission Server / Guild (Administrator, Manage Guild, Manage Channels)
+    perms = getattr(user, "guild_permissions", None)
+    if perms is not None:
+        if (
+            getattr(perms, "administrator", False)
+            or getattr(perms, "manage_guild", False)
+            or getattr(perms, "manage_channels", False)
+        ):
+            return True
+
+    return False
 
 
+def is_interaction_authorized(interaction: discord.Interaction) -> bool:
+    """Helper otorisasi khusus untuk discord.Interaction (Slash Commands)."""
+    return is_authorized_user(interaction.user, interaction.guild)
 
 
 # ──────────────────────────────────────────────
@@ -225,9 +264,9 @@ class MediaScraperBot(commands.Bot):
             channel: discord.TextChannel,
             platform: Optional[str] = None,
         ):
-            if interaction.user.id != ALLOWED_USER_ID:
+            if not is_interaction_authorized(interaction):
                 await safe_reply(
-                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator.", ephemeral=True
+                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator / Pengelola Server.", ephemeral=True
                 )
                 return
 
@@ -291,9 +330,9 @@ class MediaScraperBot(commands.Bot):
             username: str,
             channel: discord.TextChannel,
         ):
-            if interaction.user.id != ALLOWED_USER_ID:
+            if not is_interaction_authorized(interaction):
                 await safe_reply(
-                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator.", ephemeral=True
+                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator / Pengelola Server.", ephemeral=True
                 )
                 return
 
@@ -345,9 +384,9 @@ class MediaScraperBot(commands.Bot):
             username: str,
             channel: discord.TextChannel,
         ):
-            if interaction.user.id != ALLOWED_USER_ID:
+            if not is_interaction_authorized(interaction):
                 await safe_reply(
-                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator.", ephemeral=True
+                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator / Pengelola Server.", ephemeral=True
                 )
                 return
 
@@ -399,9 +438,9 @@ class MediaScraperBot(commands.Bot):
             username: str,
             channel: discord.TextChannel,
         ):
-            if interaction.user.id != ALLOWED_USER_ID:
+            if not is_interaction_authorized(interaction):
                 await safe_reply(
-                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator.", ephemeral=True
+                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator / Pengelola Server.", ephemeral=True
                 )
                 return
 
@@ -459,9 +498,9 @@ class MediaScraperBot(commands.Bot):
             username: str,
             platform: Optional[str] = None,
         ):
-            if interaction.user.id != ALLOWED_USER_ID:
+            if not is_interaction_authorized(interaction):
                 await safe_reply(
-                    interaction, "⛔ Akses Ditolak.", ephemeral=True
+                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator / Pengelola Server.", ephemeral=True
                 )
                 return
 
@@ -512,9 +551,9 @@ class MediaScraperBot(commands.Bot):
             username: str,
             platform: Optional[str] = None,
         ):
-            if interaction.user.id != ALLOWED_USER_ID:
+            if not is_interaction_authorized(interaction):
                 await safe_reply(
-                    interaction, "⛔ Akses Ditolak.", ephemeral=True
+                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator / Pengelola Server.", ephemeral=True
                 )
                 return
 
@@ -549,12 +588,13 @@ class MediaScraperBot(commands.Bot):
         # Registrasi Slash Command /reset_bot
         @self.tree.command(
             name="reset_bot",
-            description="Completely wipe database records, sessions/ and temp_media/ folders",
+            description="Completely wipe database records, sessions/ and temp_media/ folders (Owner Only)",
         )
         async def reset_bot(interaction: discord.Interaction):
-            if interaction.user.id != ALLOWED_USER_ID:
+            # Reset total sistem hanya diizinkan untuk Bot Owner (Superadmin)
+            if interaction.user.id not in ALLOWED_USER_IDS and interaction.user.id != ALLOWED_USER_ID:
                 await safe_reply(
-                    interaction, "⛔ Akses Ditolak.", ephemeral=True
+                    interaction, "⛔ Akses Ditolak: Reset total bot hanya dapat dilakukan oleh Bot Owner.", ephemeral=True
                 )
                 return
 
@@ -572,8 +612,6 @@ class MediaScraperBot(commands.Bot):
                 await asyncio.to_thread(clear_directory_contents, SESSION_DIR)
 
                 # Kosongkan antrean job yang tertunda
-                # FIX: task_done() removed — tidak ada Queue.join() di codebase ini,
-                # task_done() hanya relevan jika join() dipakai. get_nowait() sudah cukup.
                 while not self._job_queue.empty():
                     try:
                         self._job_queue.get_nowait()
@@ -595,9 +633,9 @@ class MediaScraperBot(commands.Bot):
             description="Memaksa bot melakukan scan menyeluruh ke semua akun saat ini juga",
         )
         async def force_scan(interaction: discord.Interaction):
-            if interaction.user.id != ALLOWED_USER_ID:
+            if not is_interaction_authorized(interaction):
                 await safe_reply(
-                    interaction, "❌ Anda tidak memiliki izin.", ephemeral=True
+                    interaction, "⛔ Akses Ditolak: Hanya untuk Administrator / Pengelola Server.", ephemeral=True
                 )
                 return
 
@@ -651,9 +689,9 @@ class MediaScraperBot(commands.Bot):
             name="list", description="Tampilkan semua akun yang sedang dimonitor"
         )
         async def list_accounts(interaction: discord.Interaction):
-            if interaction.user.id != ALLOWED_USER_ID:
+            if not is_interaction_authorized(interaction):
                 await interaction.response.send_message(
-                    "⛔ Akses Ditolak.", ephemeral=True
+                    "⛔ Akses Ditolak: Hanya untuk Administrator / Pengelola Server.", ephemeral=True
                 )
                 return
 
@@ -688,9 +726,9 @@ class MediaScraperBot(commands.Bot):
             name="sync", description="Force sync slash commands ke Discord server"
         )
         async def sync_commands(interaction: discord.Interaction):
-            if interaction.user.id != ALLOWED_USER_ID:
+            if not is_interaction_authorized(interaction):
                 await interaction.response.send_message(
-                    "⛔ Akses Ditolak.", ephemeral=True
+                    "⛔ Akses Ditolak: Hanya untuk Administrator / Pengelola Server.", ephemeral=True
                 )
                 return
 
@@ -711,9 +749,9 @@ class MediaScraperBot(commands.Bot):
         # Registrasi Slash Command /pause — pause patrol loop
         @self.tree.command(name="pause", description="Pause background patrol loop")
         async def pause(interaction: discord.Interaction):
-            if interaction.user.id != ALLOWED_USER_ID:
+            if not is_interaction_authorized(interaction):
                 await interaction.response.send_message(
-                    "⛔ Akses Ditolak.", ephemeral=True
+                    "⛔ Akses Ditolak: Hanya untuk Administrator / Pengelola Server.", ephemeral=True
                 )
                 return
             self.patrol_paused = True
@@ -723,9 +761,9 @@ class MediaScraperBot(commands.Bot):
         # Registrasi Slash Command /resume — resume patrol loop
         @self.tree.command(name="resume", description="Resume background patrol loop")
         async def resume(interaction: discord.Interaction):
-            if interaction.user.id != ALLOWED_USER_ID:
+            if not is_interaction_authorized(interaction):
                 await interaction.response.send_message(
-                    "⛔ Akses Ditolak.", ephemeral=True
+                    "⛔ Akses Ditolak: Hanya untuk Administrator / Pengelola Server.", ephemeral=True
                 )
                 return
             self.patrol_paused = False
@@ -759,20 +797,35 @@ class MediaScraperBot(commands.Bot):
         Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
         Path(SESSION_DIR).mkdir(parents=True, exist_ok=True)
 
-        # Resolve channel ID ke object channel
-        self._target_channel = self.get_channel(DISCORD_CHANNEL_ID)
-        if not self._target_channel:
-            logger.error(
-                f"[❌ ERROR  ] Channel ID {DISCORD_CHANNEL_ID} tidak ditemukan! "
-                f"Pastikan bot sudah di-invite ke server dan ID benar."
-            )
+        # Auto-detect Bot Application Owner dari Discord API
+        try:
+            app_info = await self.application_info()
+            if getattr(app_info, "team", None):
+                for member in app_info.team.members:
+                    ALLOWED_USER_IDS.add(member.id)
+            elif getattr(app_info, "owner", None):
+                ALLOWED_USER_IDS.add(app_info.owner.id)
+            logger.info(f"{TAG_SYSTEM} Bot Application Owner terdeteksi otomatis: {app_info.owner}")
+        except Exception as e:
+            logger.warning(f"{TAG_WARN} Gagal auto-detect bot owner dari Discord API: {e}")
+
+        # Resolve fallback channel jika diisi di .env
+        if DISCORD_CHANNEL_ID:
+            self._target_channel = self.get_channel(DISCORD_CHANNEL_ID)
+            if not self._target_channel:
+                logger.warning(
+                    f"{TAG_WARN} Fallback Channel ID {DISCORD_CHANNEL_ID} tidak ditemukan di server bot. "
+                    f"Bot akan menggunakan dynamic channel routing."
+                )
+        else:
+            self._target_channel = None
 
         # Sinkronisasi slash commands otomatis ke Discord API saat startup (Global)
         try:
             synced = await self.tree.sync()
-            logger.info(f"[⚙️ SYSTEM] Berhasil sync {len(synced)} slash commands secara global ke Discord.")
+            logger.info(f"{TAG_SYSTEM} Berhasil sync {len(synced)} slash commands secara global ke Discord.")
         except Exception as e:
-            logger.error(f"[❌ ERROR  ] Gagal sync slash commands di on_ready: {e}")
+            logger.error(f"{TAG_ERROR} Gagal sync slash commands di on_ready: {e}")
 
         # Start single sequential background worker
         if not self._worker_task or self._worker_task.done():
@@ -781,21 +834,25 @@ class MediaScraperBot(commands.Bot):
         # Start patrol background loop
         if not self.patrol_loop.is_running():
             self.patrol_loop.start()
-            logger.info("[⚙️ SYSTEM] Patrol loop started (interval: 10 menit).")
+            logger.info(f"{TAG_SYSTEM} Patrol loop started (interval: 10 menit).")
+
+        channel_display = f"#{self._target_channel}" if self._target_channel else "Dynamic (per-message / per-account mapping)"
+        owner_display = list(ALLOWED_USER_IDS) if ALLOWED_USER_IDS else "Auto-detected from Discord API"
 
         logger.info(
-            "[⚙️ SYSTEM] ============================================================"
+            f"{TAG_SYSTEM} ============================================================"
         )
-        logger.info("[⚙️ SYSTEM]   Discord Media Scraper Bot")
-        logger.info(f"[⚙️ SYSTEM]   Logged in as: {self.user}")
-        logger.info(f"[⚙️ SYSTEM]   Target channel: {self._target_channel}")
-        logger.info(f"[⚙️ SYSTEM]   Allowed user ID: {ALLOWED_USER_ID}")
-        logger.info(f"[⚙️ SYSTEM]   Concurrent downloads: {CONCURRENT_DOWNLOADS}")
+        logger.info(f"{TAG_SYSTEM}   Discord Media Scraper Bot")
+        logger.info(f"{TAG_SYSTEM}   Logged in as: {self.user}")
+        logger.info(f"{TAG_SYSTEM}   Default channel: {channel_display}")
+        logger.info(f"{TAG_SYSTEM}   Bot Owner IDs: {owner_display}")
+        logger.info(f"{TAG_SYSTEM}   Auth Mode: Bot Owner + Server Administrators / Managers")
+        logger.info(f"{TAG_SYSTEM}   Concurrent downloads: {CONCURRENT_DOWNLOADS}")
         logger.info(
-            f"[⚙️ SYSTEM]   Browser mode: {'Headed' if BROWSER_HEADED else 'Headless'}"
+            f"{TAG_SYSTEM}   Browser mode: {'Headed' if BROWSER_HEADED else 'Headless'}"
         )
         logger.info(
-            "[⚙️ SYSTEM] ============================================================"
+            f"{TAG_SYSTEM} ============================================================"
         )
 
     async def on_message(self, message: discord.Message) -> None:
@@ -806,8 +863,8 @@ class MediaScraperBot(commands.Bot):
         if message.author == self.user:
             return
 
-        # Security: hanya izinkan user yang terdaftar di .env
-        if message.author.id != ALLOWED_USER_ID:
+        # Security: hanya izinkan Bot Owner atau Administrator/Pengelola Server
+        if not is_authorized_user(message.author, message.guild):
             return
 
         text = message.content.strip()
@@ -866,7 +923,7 @@ class MediaScraperBot(commands.Bot):
             )
             return
 
-        # Command: !reset — hapus semua data dan sesi
+        # Command: !reset — hapus semua data dan sesi (Owner Only)
         if text.lower() == "!reset":
             await self._handle_reset(message)
             return
@@ -905,9 +962,9 @@ class MediaScraperBot(commands.Bot):
     # ──────────────────────────────────────────────
 
     async def _handle_reset(self, message: discord.Message) -> None:
-        """Handler reset: hapus seluruh data dan sesi bot (Admin Only)."""
-        if message.author.id != ALLOWED_USER_ID:
-            await message.reply("⛔ Akses ditolak.")
+        """Handler reset: hapus seluruh data dan sesi bot (Bot Owner Only)."""
+        if message.author.id not in ALLOWED_USER_IDS and message.author.id != ALLOWED_USER_ID:
+            await message.reply("⛔ Akses Ditolak: Reset total hanya dapat dilakukan oleh Bot Owner.")
             return
 
         status_msg = await message.reply("⏳ Memulai Hard Reset...")
@@ -1732,11 +1789,7 @@ class MediaScraperBot(commands.Bot):
 def main() -> None:
     """Fungsi utama untuk menjalankan bot dengan graceful SIGTERM handling."""
     if not DISCORD_BOT_TOKEN:
-        raise ValueError("DISCORD_BOT_TOKEN tidak ditemukan di file .env!")
-    if DISCORD_CHANNEL_ID == 0:
-        raise ValueError("DISCORD_CHANNEL_ID tidak ditemukan di file .env!")
-    if ALLOWED_USER_ID == 0:
-        raise ValueError("DISCORD_ALLOWED_USER_ID tidak ditemukan di file .env!")
+        raise ValueError("DISCORD_BOT_TOKEN tidak ditemukan di file .env! Harap masukkan bot token Anda.")
 
     bot = MediaScraperBot()
 
