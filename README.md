@@ -166,14 +166,3 @@ python bot.py
 > Bot berjalan dalam mode **Zero-Login** secara default. Cookie sesi Instagram/TikTok/Twitter **bersifat opsional** dan hanya digunakan untuk meningkatkan batas scraping pada akun publik dengan banyak postingan.
 
 ---
-
-## 📝 Changelog Singkat
-
-| Versi | Perubahan |
-| :--- | :--- |
-| Latest | Multi-server role-based auth + Zero-config Bot Owner auto-detect |
-| Latest | Feed + Reels diurutkan kronologis bersama (Snowflake decoder) |
-| Latest | Twitter/X CDN orig format resolution fix |
-| Latest | Instagram Reels tab scanning (19+ reels eksklusif) |
-| Latest | TikTok Playwright Stealth DOM extractor (bypass SlardarWAF) |
-| Latest | Tanggal post WIB dengan Indonesian date format |
