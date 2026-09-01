@@ -329,24 +329,21 @@ class DatabaseManager:
         else:
             profile_url_built = f"https://www.instagram.com/{uname}/"
 
-        # FIX: wrap both INSERT statements in a single atomic transaction.
-        # Previously, two separate execute() + one commit() could leave DB in
-        # a partial-write state if the second execute raised (e.g. locked timeout).
-        async with self.db:  # aiosqlite context-manager issues BEGIN / COMMIT atomically
-            await self.db.execute(
-                """
-                INSERT OR IGNORE INTO scraped_posts (post_id, username, platform)
-                VALUES (?, ?, ?)
-                """,
-                (post_id, uname, plat),
-            )
-            await self.db.execute(
-                """
-                INSERT OR IGNORE INTO downloaded_posts (post_id, platform, profile_url, media_count, status)
-                VALUES (?, ?, ?, 1, 'done')
-                """,
-                (post_id, plat, profile_url_built),
-            )
+        await self.db.execute(
+            """
+            INSERT OR IGNORE INTO scraped_posts (post_id, username, platform)
+            VALUES (?, ?, ?)
+            """,
+            (post_id, uname, plat),
+        )
+        await self.db.execute(
+            """
+            INSERT OR IGNORE INTO downloaded_posts (post_id, platform, profile_url, media_count, status)
+            VALUES (?, ?, ?, 1, 'done')
+            """,
+            (post_id, plat, profile_url_built),
+        )
+        await self.db.commit()
 
     async def mark_post_downloaded(
         self,
