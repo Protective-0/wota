@@ -403,9 +403,27 @@ class InstagramScraper(BaseScraper):
             logger.debug(f"Tier 1 Public Web API extraction info: {e}")
 
         # ─────────────────────────────────────────────────────────────────────
+        feed_posts_count = len(collected_posts)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # TIER 1.5: FEED GUEST BROWSER FALLBACK (Jika Tier 1 API gagal/rate-limited)
+        # Memastikan seluruh postingan Feed tetap terambil 100% tanpa terhalang Reels
+        # ─────────────────────────────────────────────────────────────────────
+        if feed_posts_count == 0 and not stop_condition_met:
+            logger.info(f"{TAG_CRAWL} [FEED] Menjalankan Playwright Guest Browser untuk Feed @{username} (Zero-Login)...")
+            feed_posts = await self._fetch_via_guest_browser(canonical_url, username, only_reels=False)
+            new_feed_count = 0
+            for fp in feed_posts:
+                if fp.post_id not in seen_shortcodes:
+                    seen_shortcodes.add(fp.post_id)
+                    collected_posts.append(fp)
+                    new_feed_count += 1
+            if new_feed_count > 0:
+                logger.info(f"{TAG_CRAWL} [FEED] Berhasil menemukan {new_feed_count} postingan Feed @{username}.")
+
         # ─────────────────────────────────────────────────────────────────────
         # REELS COMPREHENSIVE SCAN: Tab Reels Crawler
-        # Memastikan video dari tab Reels (yang tidak di-share ke main feed) tetap terambil 100%
+        # Memastikan video dari tab Reels tetap terambil 100% secara independen
         # ─────────────────────────────────────────────────────────────────────
         if not stop_condition_met:
             logger.info(f"{TAG_CRAWL} [REELS] Memeriksa tab Reels secara komprehensif untuk @{username}...")
@@ -436,7 +454,7 @@ class InstagramScraper(BaseScraper):
                 logger.info(f"{TAG_CRAWL} [STORY] Berhasil menemukan {new_story_count} Instagram Story aktif @{username}.")
 
         # ─────────────────────────────────────────────────────────────────────
-        # TIER 2: gallery-dl Subprocess Extractor (Guest Mode Fallback)
+        # TIER 2: gallery-dl Subprocess Extractor (Emergency Fallback jika kosong)
         # ─────────────────────────────────────────────────────────────────────
         if not collected_posts:
             logger.info(f"{TAG_CRAWL} [TIER 2] Menjalankan gallery-dl subprocess untuk @{username} (Zero-Login)...")
@@ -447,23 +465,12 @@ class InstagramScraper(BaseScraper):
                     collected_posts.append(p)
 
         # ─────────────────────────────────────────────────────────────────────
-        # TIER 3: yt-dlp Flat-Playlist Extractor (Guest Mode Fallback)
+        # TIER 3: yt-dlp Flat-Playlist Extractor (Emergency Fallback jika kosong)
         # ─────────────────────────────────────────────────────────────────────
         if not collected_posts:
             logger.info(f"{TAG_CRAWL} [TIER 3] Menjalankan yt-dlp flat-playlist untuk @{username} (Zero-Login)...")
             ytdl_posts = await self._fetch_via_ytdlp_flat(canonical_url)
             for p in ytdl_posts:
-                if p.post_id not in seen_shortcodes:
-                    seen_shortcodes.add(p.post_id)
-                    collected_posts.append(p)
-
-        # ─────────────────────────────────────────────────────────────────────
-        # TIER 4: Playwright Dual-Tab Guest Browser (Feed & Reels Scrolling Fallback)
-        # ─────────────────────────────────────────────────────────────────────
-        if not collected_posts:
-            logger.info(f"{TAG_CRAWL} [TIER 4] Menjalankan Playwright Guest Browser untuk @{username} (Dual-Tab)...")
-            browser_posts = await self._fetch_via_guest_browser(canonical_url, username, only_reels=False)
-            for p in browser_posts:
                 if p.post_id not in seen_shortcodes:
                     seen_shortcodes.add(p.post_id)
                     collected_posts.append(p)
@@ -607,7 +614,7 @@ class InstagramScraper(BaseScraper):
     async def _fetch_via_guest_browser(
         self, url: str, username: str, only_reels: bool = False
     ) -> list[PostMedia]:
-        """Fallback ekstraksi DOM Dual-Tab (Feed & Reels) via Playwright Guest Browser."""
+        """Fallback ekstraksi DOM via Playwright Guest Browser untuk Feed atau Reels secara terisolasi."""
         results: list[PostMedia] = []
         seen_ids = set()
 
@@ -617,50 +624,91 @@ class InstagramScraper(BaseScraper):
             self._browser, self._context = await BaseScraper.create_stealth_browser(
                 self._playwright,
                 headed=self.headed,
-                viewport={"width": 1280, "height": 800},
+                viewport={"width": 1280, "height": 900},
             )
             page = await self._context.new_page()
+
+            # Network Interceptor: Tangkap shortcode dan metadata dari GraphQL / API response internal
+            async def _on_network_response(resp):
+                r_url = resp.url
+                if any(k in r_url for k in ("graphql/query", "/api/v1/", "clips/user", "web_profile_info")) and resp.status == 200:
+                    try:
+                        data = await resp.json()
+                        text = json.dumps(data)
+                        found_codes = re.findall(r'\"(?:shortcode|code)\":\s*\"([A-Za-z0-9_-]{8,15})\"', text)
+                        for sc in found_codes:
+                            if sc not in seen_ids:
+                                seen_ids.add(sc)
+                                is_r = only_reels or "/reel" in text.lower()
+                                clean_url = f"https://www.instagram.com/reel/{sc}/" if is_r else f"https://www.instagram.com/p/{sc}/"
+                                ts_iso = self._shortcode_to_timestamp(sc)
+                                results.append(
+                                    PostMedia(
+                                        post_id=sc,
+                                        post_url=clean_url,
+                                        profile_url=url,
+                                        platform=self.PLATFORM,
+                                        media_type=MediaType.VIDEO if is_r else MediaType.PHOTO,
+                                        timestamp=ts_iso,
+                                        cookies_file=None,
+                                    )
+                                )
+                    except Exception:
+                        pass
+
+            page.on("response", _on_network_response)
 
             targets = (
                 [f"https://www.instagram.com/{username}/reels/"]
                 if only_reels
-                else [
-                    f"https://www.instagram.com/{username}/",
-                    f"https://www.instagram.com/{username}/reels/",
-                ]
+                else [f"https://www.instagram.com/{username}/"]
             )
 
             start_time = time.monotonic()
-            MAX_CRAWL_DURATION = 120.0 if only_reels else 300.0
+            MAX_CRAWL_DURATION = 180.0
+            max_scrolls = int(os.getenv("MAX_IG_BROWSER_SCROLLS", "25"))
 
             for target_tab in targets:
                 if time.monotonic() - start_time > MAX_CRAWL_DURATION:
-                    logger.warning(f"{TAG_WARN} Batas waktu crawl browser Instagram tercapai untuk @{username} — stop.")
+                    logger.warning(f"{TAG_WARN} Batas waktu crawl browser Instagram ({MAX_CRAWL_DURATION}s) tercapai untuk @{username}.")
                     break
                 try:
-                    await page.goto(target_tab, wait_until="domcontentloaded", timeout=30000)
-                    await asyncio.sleep(2.5)
+                    await page.goto(target_tab, wait_until="domcontentloaded", timeout=40000)
+                    await asyncio.sleep(3.0)
 
                     if "accounts/login" in page.url.lower() or bool(re.search(r"/challenge/?$|/challenge/\w+", page.url.lower())):
                         logger.warning(f"{TAG_WARN} Instagram mengalihkan {target_tab} ke login wall / challenge.")
                         continue
 
-                    # Dismiss modal dialog popup jika ada
-                    try:
-                        close_btn = await page.query_selector(
-                            'button:has-text("Not Now"), button:has-text("Lain Kali"), [aria-label="Close"], [aria-label="Tutup"]'
-                        )
-                        if close_btn:
-                            await close_btn.click()
-                            await asyncio.sleep(1.0)
-                    except Exception:
-                        pass
-
-                    # Scrolling pagination loop
-                    max_scrolls = 6 if only_reels else 8
-                    for _ in range(max_scrolls):
+                    no_new_rounds = 0
+                    for scroll_round in range(max_scrolls):
                         if time.monotonic() - start_time > MAX_CRAWL_DURATION:
                             break
+
+                        prev_count = len(results)
+
+                        # Auto-dismiss dialog modal popup / backdrop overlay
+                        try:
+                            await page.evaluate("""() => {
+                                const dialogs = document.querySelectorAll('[role="dialog"]');
+                                dialogs.forEach(d => {
+                                    if (d.textContent.includes("Log In") || d.textContent.includes("Masuk") || d.textContent.includes("Sign Up") || d.textContent.includes("Daftar")) {
+                                        d.remove();
+                                    }
+                                });
+                                const backdrop = document.querySelectorAll('div[style*="position: fixed"]');
+                                backdrop.forEach(b => {
+                                    if (b.innerText && (b.innerText.includes("Log In") || b.innerText.includes("Masuk"))) {
+                                        b.remove();
+                                    }
+                                });
+                                document.body.style.overflow = 'auto';
+                                document.documentElement.style.overflow = 'auto';
+                            }""")
+                        except Exception:
+                            pass
+
+                        # Ekstrak link dari elemen DOM
                         links = await page.locator('a[href*="/p/"], a[href*="/reel/"], a[href*="/reels/"]').all()
                         for link in links:
                             try:
@@ -670,7 +718,7 @@ class InstagramScraper(BaseScraper):
                                     p_id = self._extract_post_id(p_url)
                                     if p_id and p_id not in seen_ids:
                                         seen_ids.add(p_id)
-                                        is_reel = "/reel" in p_url.lower()
+                                        is_reel = only_reels or "/reel" in p_url.lower()
                                         clean_post_url = f"https://www.instagram.com/reel/{p_id}/" if is_reel else f"https://www.instagram.com/p/{p_id}/"
                                         ts_iso = self._shortcode_to_timestamp(p_id)
                                         results.append(
@@ -687,8 +735,15 @@ class InstagramScraper(BaseScraper):
                             except Exception:
                                 pass
 
-                        await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-                        await asyncio.sleep(random.uniform(1.5, 2.5))
+                        if len(results) == prev_count:
+                            no_new_rounds += 1
+                            if no_new_rounds >= 4:
+                                break
+                        else:
+                            no_new_rounds = 0
+
+                        await page.evaluate("window.scrollBy(0, 1800)")
+                        await asyncio.sleep(random.uniform(1.2, 2.0))
 
                 except Exception as tab_err:
                     logger.debug(f"Guest browser tab error ({target_tab}): {tab_err}")
