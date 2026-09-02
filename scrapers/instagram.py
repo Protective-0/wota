@@ -162,6 +162,10 @@ class InstagramScraper(BaseScraper):
         user_id = ""
         stop_condition_met = False
 
+        ig_cookies = await self.load_cookies_as_dict("instagram")
+        netscape_cookies_file = await self.export_session_cookies_for_ytdlp("instagram")
+        netscape_cookies_path_str = str(netscape_cookies_file) if netscape_cookies_file else None
+
         # ─────────────────────────────────────────────────────────────────────
         # TIER 1: Instagram Public Web API (Initial Profile Snapshot + Reels)
         # Mengambil snapshot awal timeline, tab reels (felix), dan user_id untuk pagination
@@ -186,7 +190,7 @@ class InstagramScraper(BaseScraper):
             resp_json = None
             if HAS_CURL_CFFI:
                 try:
-                    async with curl_requests.AsyncSession(impersonate="chrome124") as session:
+                    async with curl_requests.AsyncSession(impersonate="chrome124", cookies=ig_cookies or None) as session:
                         resp = await session.get(api_url, headers=headers, timeout=15)
                         if resp.status_code == 200:
                             resp_json = resp.json()
@@ -194,7 +198,7 @@ class InstagramScraper(BaseScraper):
                     logger.debug(f"curl_cffi web_profile_info note: {curl_err}")
 
             if not resp_json:
-                async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15.0) as client:
+                async with httpx.AsyncClient(headers=headers, cookies=ig_cookies or None, follow_redirects=True, timeout=15.0) as client:
                     resp = await client.get(api_url)
                     if resp.status_code == 200:
                         resp_json = resp.json()
@@ -303,7 +307,7 @@ class InstagramScraper(BaseScraper):
 
                     if HAS_CURL_CFFI:
                         try:
-                            async with curl_requests.AsyncSession(impersonate="chrome124") as session:
+                            async with curl_requests.AsyncSession(impersonate="chrome124", cookies=ig_cookies or None) as session:
                                 f_resp = await session.get(feed_api_url, headers=headers, timeout=15)
                                 if f_resp.status_code == 200:
                                     feed_data = f_resp.json()
@@ -312,7 +316,7 @@ class InstagramScraper(BaseScraper):
 
                     if not feed_data:
                         try:
-                            async with httpx.AsyncClient(headers=headers, timeout=15.0) as client:
+                            async with httpx.AsyncClient(headers=headers, cookies=ig_cookies or None, timeout=15.0) as client:
                                 f_resp = await client.get(feed_api_url)
                                 if f_resp.status_code == 200:
                                     feed_data = f_resp.json()
@@ -626,12 +630,14 @@ class InstagramScraper(BaseScraper):
                 headed=self.headed,
                 viewport={"width": 1280, "height": 900},
             )
+            if self._context:
+                await self.load_and_inject_cookies(self._context, "instagram")
             page = await self._context.new_page()
 
             # Network Interceptor: Tangkap shortcode dan metadata dari GraphQL / API response internal
             async def _on_network_response(resp):
                 r_url = resp.url
-                if any(k in r_url for k in ("graphql/query", "/api/v1/", "clips/user", "web_profile_info")) and resp.status == 200:
+                if any(k in r_url for k in ("api/graphql", "graphql/query", "/api/v1/", "clips/user", "web_profile_info")) and resp.status == 200:
                     try:
                         data = await resp.json()
                         text = json.dumps(data)
@@ -650,7 +656,7 @@ class InstagramScraper(BaseScraper):
                                         platform=self.PLATFORM,
                                         media_type=MediaType.VIDEO if is_r else MediaType.PHOTO,
                                         timestamp=ts_iso,
-                                        cookies_file=None,
+                                        cookies_file=self.session_dir / "instagram_cookies.txt" if (self.session_dir / "instagram_cookies.txt").exists() else None,
                                     )
                                 )
                     except Exception:
