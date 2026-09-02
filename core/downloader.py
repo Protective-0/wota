@@ -461,22 +461,16 @@ class MediaDownloader:
         elif is_twitter_photo:
             download_failed = True
         elif is_instagram_photo:
-            # Bypass yt-dlp langsung ke gallery-dl secara async untuk Instagram photo (/p/) jika bukan video
-            logger.info(
-                f"{TAG_DOWN} Instagram /p/ terdeteksi "
-                f"— bypass yt-dlp, routing ke gallery-dl."
-            )
-            gdl_files = await self._run_gallery_dl_async(post_url, cookies_file or "")
-            if gdl_files:
-                return gdl_files, "", None
-            logger.warning("gallery-dl tidak menghasilkan file untuk /p/, fallback ke yt-dlp...")
-            try:
-                downloaded_files, real_caption, ytdl_timestamp = await self._run_ytdlp_async(
-                    post_url, post_id, cookies_file
-                )
-            except Exception as e:
-                yt_error = str(e)
-                download_failed = True
+            # Jika ada cookie auth Netscape, coba gallery-dl terlebih dahulu
+            if cookies_file and Path(cookies_file).exists():
+                gdl_files = await self._run_gallery_dl_async(post_url, cookies_file)
+                if gdl_files:
+                    return gdl_files, "", None
+            # Zero-Login Mode (tanpa cookie): langsung ke Instagram API / Stealth Browser Extractor
+            ig_files, ig_cap, ig_ts = await self._extract_instagram_media_via_api_or_browser(post_url, post_id)
+            if ig_files:
+                return ig_files, ig_cap, ig_ts
+            download_failed = True
         else:
             try:
                 downloaded_files, real_caption, ytdl_timestamp = await self._run_ytdlp_async(
