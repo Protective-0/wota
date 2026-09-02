@@ -634,36 +634,6 @@ class InstagramScraper(BaseScraper):
                 await self.load_and_inject_cookies(self._context, "instagram")
             page = await self._context.new_page()
 
-            # Network Interceptor: Tangkap shortcode dan metadata dari GraphQL / API response internal
-            async def _on_network_response(resp):
-                r_url = resp.url
-                if any(k in r_url for k in ("api/graphql", "graphql/query", "/api/v1/", "clips/user", "web_profile_info")) and resp.status == 200:
-                    try:
-                        data = await resp.json()
-                        text = json.dumps(data)
-                        found_codes = re.findall(r'\"(?:shortcode|code)\":\s*\"([A-Za-z0-9_-]{8,15})\"', text)
-                        for sc in found_codes:
-                            if sc not in seen_ids:
-                                seen_ids.add(sc)
-                                is_r = only_reels or "/reel" in text.lower()
-                                clean_url = f"https://www.instagram.com/reel/{sc}/" if is_r else f"https://www.instagram.com/p/{sc}/"
-                                ts_iso = self._shortcode_to_timestamp(sc)
-                                results.append(
-                                    PostMedia(
-                                        post_id=sc,
-                                        post_url=clean_url,
-                                        profile_url=url,
-                                        platform=self.PLATFORM,
-                                        media_type=MediaType.VIDEO if is_r else MediaType.PHOTO,
-                                        timestamp=ts_iso,
-                                        cookies_file=self.session_dir / "instagram_cookies.txt" if (self.session_dir / "instagram_cookies.txt").exists() else None,
-                                    )
-                                )
-                    except Exception:
-                        pass
-
-            page.on("response", _on_network_response)
-
             targets = (
                 [f"https://www.instagram.com/{username}/reels/"]
                 if only_reels
@@ -714,8 +684,9 @@ class InstagramScraper(BaseScraper):
                         except Exception:
                             pass
 
-                        # Ekstrak link dari elemen DOM
-                        links = await page.locator('a[href*="/p/"], a[href*="/reel/"], a[href*="/reels/"]').all()
+                        # Ekstrak link hanya dari grid profile container (tag <main>)
+                        # Mencegah link dari sidebar Explore/Home Feed ikut terambil saat akun login
+                        links = await page.locator('main a[href*="/p/"], main a[href*="/reel/"], main a[href*="/reels/"]').all()
                         for link in links:
                             try:
                                 href = await link.get_attribute("href")
