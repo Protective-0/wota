@@ -462,13 +462,19 @@ class MediaDownloader:
         elif is_twitter_photo:
             download_failed = True
         elif is_instagram_photo:
+            # Resolusi cookies_file jika belum ada
+            if not cookies_file or not Path(cookies_file).exists():
+                default_ig_cookie = Path("sessions/instagram_cookies.txt")
+                if default_ig_cookie.exists():
+                    cookies_file = str(default_ig_cookie)
+
             # Jika ada cookie auth Netscape, coba gallery-dl terlebih dahulu
             if cookies_file and Path(cookies_file).exists():
                 gdl_files = await self._run_gallery_dl_async(post_url, cookies_file)
                 if gdl_files:
                     return gdl_files, "", None
-            # Zero-Login Mode (tanpa cookie): langsung ke Instagram API / Stealth Browser Extractor
-            ig_files, ig_cap, ig_ts = await self._extract_instagram_media_via_api_or_browser(post_url, post_id)
+            # Fallback ke Instagram API / Stealth Browser Extractor
+            ig_files, ig_cap, ig_ts = await self._extract_instagram_media_via_api_or_browser(post_url, post_id, cookies_file)
             if ig_files:
                 return ig_files, ig_cap, ig_ts
             download_failed = True
@@ -690,40 +696,52 @@ class MediaDownloader:
                         except Exception as dl_err:
                             logger.error(f"Error download gambar Twitter {img_url}: {dl_err}")
 
-        # Instagram Fallback Handler (API / Browser)
+        # Instagram Fallback Handler (gallery-dl & API / Browser)
         if (download_failed or not downloaded_files) and ("instagram.com" in post_url):
-            logger.info(f"{TAG_DOWN} Instagram Fallback Handler (API / Browser) aktif untuk: {post_url}")
-            ig_files, ig_caption, ig_ts = await self._extract_instagram_media_via_api_or_browser(post_url, post_id)
-            if ig_files:
-                downloaded_files = ig_files
-                if ig_caption:
-                    real_caption = ig_caption
-                if ig_ts:
-                    ytdl_timestamp = ig_ts
+            logger.info(f"{TAG_DOWN} Instagram Fallback Handler (gallery-dl & API / Browser) aktif untuk: {post_url}")
+            if not cookies_file or not Path(cookies_file).exists():
+                default_ig_cookie = Path("sessions/instagram_cookies.txt")
+                if default_ig_cookie.exists():
+                    cookies_file = str(default_ig_cookie)
+
+            if cookies_file and Path(cookies_file).exists():
+                gdl_files = await self._run_gallery_dl_async(post_url, cookies_file)
+                if gdl_files:
+                    downloaded_files = gdl_files
+
+            if not downloaded_files:
+                ig_files, ig_caption, ig_ts = await self._extract_instagram_media_via_api_or_browser(post_url, post_id, cookies_file)
+                if ig_files:
+                    downloaded_files = ig_files
+                    if ig_caption:
+                        real_caption = ig_caption
+                    if ig_ts:
+                        ytdl_timestamp = ig_ts
 
         # ── Video / Thumbnail File Isolation ─────────────────────────────────────
-        # Jika postingan menghasilkan file video (.mp4, .mov, .webm, .mkv), pastikan
-        # HANYA file video yang dikembalikan. Hapus thumbnail/cover (.jpg, .png, .webp)
-        # yang mungkin ikut terunduh oleh yt-dlp agar Discord hanya menerima video asli.
+        # Hanya hapus thumbnail/cover (.jpg, .png, .webp) jika stem-nya sama persis dengan video (misal post_001.mp4 dan post_001.jpg).
+        # JANGAN hapus foto asli pada postingan carousel campuran (mixed carousel foto + video).
         video_files = [f for f in downloaded_files if f.suffix.lower() in {".mp4", ".mov", ".webm", ".mkv"}]
         if video_files:
+            video_stems = {vf.stem for vf in video_files}
             image_files = [f for f in downloaded_files if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
             for img_f in image_files:
-                try:
-                    img_f.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            downloaded_files = video_files
+                if img_f.stem in video_stems:
+                    try:
+                        img_f.unlink(missing_ok=True)
+                        if img_f in downloaded_files:
+                            downloaded_files.remove(img_f)
+                    except Exception:
+                        pass
 
         return downloaded_files, real_caption, ytdl_timestamp
 
     async def _extract_instagram_media_via_api_or_browser(
-        self, post_url: str, post_id: str
+        self, post_url: str, post_id: str, cookies_file: Optional[str] = None
     ) -> tuple[list[Path], str, Optional[str]]:
         """
-        Ekstraksi dan unduh media Instagram (Video / Carousel / Foto) dalam 100% Guest Mode.
-        Tier 1: Instagram Public Web API (curl_cffi TLS impersonation chrome124)
-        Tier 2: Playwright Stealth Browser Fallback (dengan seleksi ketat <video> tanpa og:image)
+        Ekstraksi dan unduh media Instagram (Video / Carousel / Foto) via Public Web API atau Playwright Stealth Browser.
+        Mendukung post multi-slide carousel (campuran video dan gambar).
         """
         import httpx
         from datetime import datetime, timezone
@@ -731,6 +749,11 @@ class MediaDownloader:
         downloaded: list[Path] = []
         caption = ""
         timestamp = None
+
+        if not cookies_file or not Path(cookies_file).exists():
+            default_c = Path("sessions/instagram_cookies.txt")
+            if default_c.exists():
+                cookies_file = str(default_c)
 
         # Ekstrak username & shortcode dari URL
         username = ""
@@ -744,6 +767,8 @@ class MediaDownloader:
         s_match = re.search(r"/(?:p|reel)/([A-Za-z0-9_-]+)", post_url)
         if s_match:
             shortcode = s_match.group(1)
+
+        ig_cookies = self._parse_netscape_cookies(cookies_file) if cookies_file else {}
 
         # ── Tier 1: Instagram Public Web API via curl_cffi / httpx ──
         if username:
@@ -759,7 +784,7 @@ class MediaDownloader:
                 resp_data = None
                 try:
                     from curl_cffi import requests as curl_requests
-                    async with curl_requests.AsyncSession(impersonate="chrome124") as session:
+                    async with curl_requests.AsyncSession(impersonate="chrome124", cookies=ig_cookies or None) as session:
                         resp = await session.get(api_url, headers=headers, timeout=15)
                         if resp.status_code == 200:
                             resp_data = resp.json()
@@ -767,7 +792,7 @@ class MediaDownloader:
                     pass
 
                 if not resp_data:
-                    async with httpx.AsyncClient(headers=headers, timeout=15.0) as client:
+                    async with httpx.AsyncClient(headers=headers, cookies=ig_cookies or None, timeout=15.0) as client:
                         resp = await client.get(api_url)
                         if resp.status_code == 200:
                             resp_data = resp.json()
@@ -796,7 +821,6 @@ class MediaDownloader:
                         sidecar = target_node.get("edge_sidecar_to_children", {}).get("edges", [])
 
                         if is_video and video_url:
-                            # Direct download video (.mp4)
                             v_out = self.temp_dir / f"{post_id}_video.mp4"
                             async with httpx.AsyncClient(headers={"User-Agent": SHARED_USER_AGENT}, timeout=60.0) as client:
                                 v_resp = await client.get(video_url)
@@ -807,7 +831,6 @@ class MediaDownloader:
                                     return [v_out], caption, timestamp
 
                         elif sidecar:
-                            # Carousel items (bisa campuran gambar & video)
                             sidecar_files = []
                             for idx, c_edge in enumerate(sidecar):
                                 c_node = c_edge.get("node", {})
@@ -832,7 +855,6 @@ class MediaDownloader:
                                 return sidecar_files, caption, timestamp
 
                         else:
-                            # Single photo
                             display_url = target_node.get("display_url")
                             if display_url:
                                 out_p = self.temp_dir / f"{post_id}_001.jpg"
@@ -846,7 +868,7 @@ class MediaDownloader:
             except Exception as api_err:
                 logger.debug(f"Instagram Tier 1 API fallback note: {api_err}")
 
-        # ── Tier 2: Playwright Stealth Browser Fallback (Video-First Selection) ──
+        # ── Tier 2: Playwright Stealth Browser Fallback ──
         logger.info(f"{TAG_DOWN} Menjalankan Playwright stealth fallback untuk Instagram: {post_url}")
         try:
             browser = await self.get_browser()
@@ -855,13 +877,18 @@ class MediaDownloader:
                 viewport={"width": 1280, "height": 900},
                 locale="id-ID",
             )
+            if ig_cookies:
+                c_list = [
+                    {"name": k, "value": v, "domain": ".instagram.com", "path": "/", "secure": True}
+                    for k, v in ig_cookies.items()
+                ]
+                await context.add_cookies(c_list)
             page = await context.new_page()
 
             try:
                 await page.goto(post_url, wait_until="domcontentloaded", timeout=25000)
                 await asyncio.sleep(2.5)
 
-                # Cek login wall
                 if "accounts/login" in page.url.lower():
                     logger.warning(f"{TAG_WARN} Instagram post mengalihkan ke login page.")
                 else:
@@ -884,70 +911,95 @@ class MediaDownloader:
                     except Exception:
                         pass
 
-                    # 1. Prioritas Utama: Cek Video tag
-                    video_urls = []
-                    videos = await page.locator("video").all()
-                    for v in videos:
-                        src = await v.get_attribute("src")
-                        if src and not src.startswith("blob:"):
-                            video_urls.append(src)
-                        sources = await v.locator("source").all()
-                        for s in sources:
-                            s_src = await s.get_attribute("src")
-                            if s_src and not s_src.startswith("blob:"):
-                                video_urls.append(s_src)
+                    # Carousel Traversal: loop next button untuk mengumpulkan semua slide (video maupun foto)
+                    media_items: list[tuple[str, str]] = []  # (type, url)
+                    seen_urls = set()
 
-                    if not video_urls:
-                        og_v_loc = page.locator('meta[property="og:video"], meta[property="og:video:secure_url"]')
-                        if await og_v_loc.count() > 0:
-                            og_src = await og_v_loc.first.get_attribute("content")
-                            if og_src:
-                                video_urls.append(og_src)
+                    max_slides = 15
+                    for _ in range(max_slides):
+                        # 1. Cek video di slide aktif
+                        curr_videos = await page.locator("video").all()
+                        has_vid = False
+                        for v in curr_videos:
+                            src = await v.get_attribute("src")
+                            if src and not src.startswith("blob:") and src not in seen_urls:
+                                seen_urls.add(src)
+                                media_items.append(("video", src))
+                                has_vid = True
+                            sources = await v.locator("source").all()
+                            for s in sources:
+                                s_src = await s.get_attribute("src")
+                                if s_src and not s_src.startswith("blob:") and s_src not in seen_urls:
+                                    seen_urls.add(s_src)
+                                    media_items.append(("video", s_src))
+                                    has_vid = True
 
-                    if video_urls:
-                        # Ini adalah VIDEO: Download video mp4, JANGAN ambil thumbnail image!
-                        clean_v_url = video_urls[0]
-                        v_out = self.temp_dir / f"{post_id}_video.mp4"
-                        async with httpx.AsyncClient(headers={"User-Agent": SHARED_USER_AGENT}, timeout=60.0) as client:
-                            v_res = await client.get(clean_v_url)
-                            if v_res.status_code == 200:
-                                async with aiofiles.open(v_out, "wb") as f:
-                                    await f.write(v_res.content)
-                                logger.info(f"{TAG_DOWN} Instagram Video (Browser) terunduh: {v_out.name} ({fmt_size(v_out.stat().st_size)})")
-                                return [v_out], caption, timestamp
+                        # 2. Jika tidak ada video di slide aktif, ambil foto
+                        if not has_vid:
+                            curr_imgs = await page.locator('article img, div[role="presentation"] img').all()
+                            for img in curr_imgs:
+                                src = await img.get_attribute("src")
+                                if src and not src.startswith("blob:") and "instagram" in src and src not in seen_urls:
+                                    if not any(b in src for b in ("profile", "avatar", "150x150", "s150x150")):
+                                        seen_urls.add(src)
+                                        media_items.append(("image", src))
+                                        break
 
-                    # 2. Jika BUKAN video, ambil gambar
-                    img_urls = []
-                    imgs = await page.locator('article img, div[role="presentation"] img').all()
-                    for img in imgs:
-                        src = await img.get_attribute("src")
-                        if src and not src.startswith("blob:") and "instagram" in src:
-                            img_urls.append(src)
+                        # 3. Klik tombol Next untuk pindah ke slide berikutnya
+                        next_btn = page.locator('button[aria-label*="Next"], button[aria-label*="Selanjutnya"], [aria-label*="Next"]').first
+                        if await next_btn.count() > 0 and await next_btn.is_visible():
+                            try:
+                                await next_btn.click()
+                                await asyncio.sleep(1.2)
+                            except Exception:
+                                break
+                        else:
+                            break
 
-                    if not img_urls:
-                        og_img_loc = page.locator('meta[property="og:image"]')
-                        if await og_img_loc.count() > 0:
-                            og_img = await og_img_loc.first.get_attribute("content")
-                            if og_img:
-                                img_urls.append(og_img)
-
-                    unique_imgs = list(dict.fromkeys(img_urls))
-                    img_files = []
-                    for idx, img_u in enumerate(unique_imgs):
-                        out_p = self.temp_dir / f"{post_id}_{idx+1:03d}.jpg"
+                    # Download semua media item yang berhasil dikumpulkan dari carousel / post
+                    extracted_files: list[Path] = []
+                    for idx, (m_type, m_url) in enumerate(media_items):
+                        ext = "mp4" if m_type == "video" else "jpg"
+                        out_p = self.temp_dir / f"{post_id}_{idx+1:03d}.{ext}"
                         try:
-                            async with httpx.AsyncClient(headers={"User-Agent": SHARED_USER_AGENT}, timeout=30.0) as client:
-                                i_res = await client.get(img_u)
-                                if i_res.status_code == 200:
+                            timeout_val = 60.0 if m_type == "video" else 30.0
+                            async with httpx.AsyncClient(headers={"User-Agent": SHARED_USER_AGENT}, timeout=timeout_val) as client:
+                                res = await client.get(m_url)
+                                if res.status_code == 200:
                                     async with aiofiles.open(out_p, "wb") as f:
-                                        await f.write(i_res.content)
-                                    img_files.append(out_p)
-                        except Exception as i_err:
-                            logger.warning(f"Gagal unduh gambar Instagram: {i_err}")
+                                        await f.write(res.content)
+                                    extracted_files.append(out_p)
+                        except Exception as dl_e:
+                            logger.warning(f"Gagal unduh media carousel item {idx+1}: {dl_e}")
 
-                    if img_files:
-                        logger.info(f"{TAG_DOWN} Instagram Photo (Browser) terunduh: {len(img_files)} foto")
-                        return img_files, caption, timestamp
+                    if extracted_files:
+                        logger.info(f"{TAG_DOWN} Instagram Browser Carousel terunduh: {len(extracted_files)} item (campuran video & foto)")
+                        return extracted_files, caption, timestamp
+
+                    # Fallback metadata og:video / og:image jika traversal tidak menemukan media
+                    og_v = page.locator('meta[property="og:video"], meta[property="og:video:secure_url"]')
+                    if await og_v.count() > 0:
+                        v_src = await og_v.first.get_attribute("content")
+                        if v_src:
+                            v_out = self.temp_dir / f"{post_id}_video.mp4"
+                            async with httpx.AsyncClient(headers={"User-Agent": SHARED_USER_AGENT}, timeout=60.0) as client:
+                                v_res = await client.get(v_src)
+                                if v_res.status_code == 200:
+                                    async with aiofiles.open(v_out, "wb") as f:
+                                        await f.write(v_res.content)
+                                    return [v_out], caption, timestamp
+
+                    og_i = page.locator('meta[property="og:image"]')
+                    if await og_i.count() > 0:
+                        i_src = await og_i.first.get_attribute("content")
+                        if i_src:
+                            i_out = self.temp_dir / f"{post_id}_001.jpg"
+                            async with httpx.AsyncClient(headers={"User-Agent": SHARED_USER_AGENT}, timeout=30.0) as client:
+                                i_res = await client.get(i_src)
+                                if i_res.status_code == 200:
+                                    async with aiofiles.open(i_out, "wb") as f:
+                                        await f.write(i_res.content)
+                                    return [i_out], caption, timestamp
 
             finally:
                 await context.close()
@@ -2015,25 +2067,23 @@ class MediaDownloader:
 
     async def _run_gallery_dl_async(self, url: str, cookies_file: Optional[str] = None) -> list[Path]:
         """
-        Download foto menggunakan gallery-dl secara async via asyncio.create_subprocess_exec.
+        Download foto & video menggunakan gallery-dl secara async via asyncio.create_subprocess_exec.
         """
         cmd = [
-            "--dest",
+            "--directory",
             str(self.temp_dir),
             "--no-part",
         ]
 
         if cookies_file and Path(cookies_file).exists():
-            cmd += ["--cookies", cookies_file]
+            cmd += ["--cookies", str(cookies_file)]
 
         cmd.append(url)
 
         downloaded = []
         try:
-            # FIX: scope to flat glob instead of recursive rglob to avoid O(N) scan
-            # of the entire temp_dir on every gallery-dl call (expensive on busy servers
-            # with thousands of leftover files). gallery-dl writes flat into --dest dir.
-            before = set(f for f in self.temp_dir.glob("*") if f.is_file())
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
+            before = set(self.temp_dir.rglob("*.*"))
 
             proc = await asyncio.create_subprocess_exec(
                 sys.executable,
@@ -2047,13 +2097,10 @@ class MediaDownloader:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120.0)
             except asyncio.TimeoutError:
                 proc.kill()
-                # FIX: await proc.wait() setelah kill() untuk mencegah zombie process di Linux.
-                # Tanpa wait(), gallery-dl tetap di process table sebagai <defunct> zombie
-                # sampai parent process (Python) keluar. Pada server long-running, akumulasi.
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
-                    pass  # Proses bandel — biarkan OS reap saat bot restart
+                    pass
                 logger.error("gallery-dl timeout setelah 2 menit")
                 return []
 
@@ -2063,9 +2110,19 @@ class MediaDownloader:
                 )
                 return []
 
-            after = set(f for f in self.temp_dir.glob("*") if f.is_file())
+            after = set(self.temp_dir.rglob("*.*"))
             new_files = after - before
-            downloaded = [f for f in new_files if f.is_file()]
+            raw_downloaded = [f for f in new_files if f.is_file()]
+
+            for rf in raw_downloaded:
+                if rf.parent != self.temp_dir:
+                    dest_p = self.temp_dir / rf.name
+                    if dest_p.exists():
+                        dest_p.unlink()
+                    shutil.move(str(rf), str(dest_p))
+                    downloaded.append(dest_p)
+                else:
+                    downloaded.append(rf)
 
         except FileNotFoundError:
             logger.error("gallery-dl tidak ditemukan — pastikan sudah terinstall di PATH")
@@ -2076,32 +2133,23 @@ class MediaDownloader:
 
     def _run_gallery_dl(self, url: str, cookies_file: Optional[str] = None) -> list[Path]:
         """
-        Download foto menggunakan gallery-dl sebagai fallback dari yt-dlp.
-
-        gallery-dl mendukung Instagram foto, carousel, dan video.
-        Digunakan sebagai fallback ketika yt-dlp gagal karena post adalah foto
-        (yt-dlp Instagram extractor hanya mendukung video, bukan gambar statis).
-
-        gallery-dl bisa autentikasi via:
-        - cookies file (Netscape format) — sama dengan yt-dlp
-        - Username/password (tidak digunakan di sini)
+        Download foto menggunakan gallery-dl sebagai fallback sinkron dari yt-dlp.
         """
         cmd = [
             "gallery-dl",
-            "--dest",
+            "--directory",
             str(self.temp_dir),
-            # Simpan file tanpa nested subdirectory — taruh langsung di temp_dir/instagram/username/
-            "--no-part",  # Jangan simpan file .part
+            "--no-part",
         ]
 
         if cookies_file and Path(cookies_file).exists():
-            cmd += ["--cookies", cookies_file]
+            cmd += ["--cookies", str(cookies_file)]
 
         cmd.append(url)
 
         downloaded = []
         try:
-            # Catat semua file yang ada sebelum download (rekursif)
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
             before = set(self.temp_dir.rglob("*.*"))
 
             result = subprocess.run(
@@ -2111,17 +2159,25 @@ class MediaDownloader:
                 timeout=120,
             )
 
-            # gallery-dl return 0 = sukses, 1 = sebagian sukses, lainnya = error
             if result.returncode not in (0, 1):
                 logger.error(
                     f"gallery-dl error (code {result.returncode}): {result.stderr[-300:]}"
                 )
                 return []
 
-            # Scan rekursif untuk menemukan file baru (gallery-dl buat subdir)
             after = set(self.temp_dir.rglob("*.*"))
             new_files = after - before
-            downloaded = [f for f in new_files if f.is_file()]
+            raw_downloaded = [f for f in new_files if f.is_file()]
+
+            for rf in raw_downloaded:
+                if rf.parent != self.temp_dir:
+                    dest_p = self.temp_dir / rf.name
+                    if dest_p.exists():
+                        dest_p.unlink()
+                    shutil.move(str(rf), str(dest_p))
+                    downloaded.append(dest_p)
+                else:
+                    downloaded.append(rf)
 
             if downloaded:
                 logger.debug(f"gallery-dl output: {result.stdout[-200:]}")
