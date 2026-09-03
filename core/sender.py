@@ -216,8 +216,11 @@ class MediaSender:
         caption: str = "",
     ) -> bool:
         """
-        Kirim kumpulan file sebagai satu/beberapa message dengan multi-file attachment.
-        Tanpa menggunakan embed, melampirkan multiple discord.File dalam satu message.
+        Kirim kumpulan file sebagai postingan multi-media (carousel).
+        - Gambar (foto) dikelompokkan dalam satu/beberapa pesan agar Discord menampilkannya sebagai collage grid.
+        - Video dikirim per pesan individual agar Discord merender player video aktif untuk SETIAP video
+          (karena Discord client hanya merender player video pertama jika multiple video digabung).
+        - Memastikan ukuran tiap pesan tidak melebihi batas upload Discord (10MB default).
         """
         if not file_paths:
             return False
@@ -247,69 +250,94 @@ class MediaSender:
             await self.downloader.cleanup_files_async(file_paths)
             return False
 
-        # Pecah menjadi chunks
-        chunks = self.chunk_file_list(uploadable, DISCORD_MAX_FILES_PER_MSG)
-        total_chunks = len(chunks)
-        all_success = True
+        # Pisahkan file foto dan file video
+        image_files = [p for p in uploadable if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
+        video_files = [p for p in uploadable if p.suffix.lower() in {".mp4", ".mov", ".webm", ".mkv"}]
+
+        delivered_count = 0
         sent_messages = []
 
-        for idx, chunk in enumerate(chunks):
-            discord_files = []
-            chunk_total_bytes = 0
+        # 1. Kirim Foto (dikelompokkan agar Discord membuat collage grid foto)
+        # Batasi ukuran per chunk agar total bytes foto <= max_file_bytes dan jumlah <= 10
+        if image_files:
+            image_chunks: list[list[Path]] = []
+            curr_chunk: list[Path] = []
+            curr_chunk_bytes = 0
 
-            for p in chunk:
+            for img in image_files:
+                img_sz = img.stat().st_size
+                if len(curr_chunk) >= DISCORD_MAX_FILES_PER_MSG or (curr_chunk and curr_chunk_bytes + img_sz > self.max_file_bytes):
+                    image_chunks.append(curr_chunk)
+                    curr_chunk = [img]
+                    curr_chunk_bytes = img_sz
+                else:
+                    curr_chunk.append(img)
+                    curr_chunk_bytes += img_sz
+            if curr_chunk:
+                image_chunks.append(curr_chunk)
+
+            total_img_chunks = len(image_chunks)
+            for idx, chunk in enumerate(image_chunks):
+                discord_files = []
+                chunk_bytes = 0
+                for p in chunk:
+                    try:
+                        discord_files.append(discord.File(fp=p, filename=p.name))
+                        chunk_bytes += p.stat().st_size
+                    except Exception as err:
+                        logger.error(f"{TAG_ERROR} Gagal membuka foto {p.name}: {err}")
+
+                if not discord_files:
+                    continue
+
+                logger.info(
+                    f"{TAG_DISCORD} Upload carousel foto [{idx + 1}/{total_img_chunks}] "
+                    f"— {len(discord_files)} foto ({fmt_size(chunk_bytes)})"
+                )
+
                 try:
-                    # FIX: stream file from disk via discord.File(fp=path) — avoids
-                    # loading each carousel item fully into RAM via aiofiles.read().
-                    discord_files.append(discord.File(fp=p, filename=p.name))
-                    chunk_total_bytes += p.stat().st_size
-                except Exception as read_err:
-                    logger.error(f"{TAG_ERROR} Gagal membuka file chunk {p.name}: {read_err}")
+                    sent_msg = await self.channel.send(files=discord_files)
+                    sent_messages.append(sent_msg)
+                    delivered_count += len(discord_files)
+                    logger.info(f"{TAG_DISCORD} Carousel foto [{idx + 1}/{total_img_chunks}] terkirim.")
+                except Exception as e:
+                    logger.error(f"{TAG_ERROR} Gagal kirim chunk foto {idx + 1}: {e}")
+                finally:
+                    for f in discord_files:
+                        f.close()
 
-            if not discord_files:
-                continue
-
-            logger.info(
-                f"{TAG_DISCORD} Upload carousel [{idx + 1}/{total_chunks}] "
-                f"— {len(discord_files)} file ({fmt_size(chunk_total_bytes)})"
-            )
-
-            try:
-                sent_message = await self.channel.send(files=discord_files)
-                sent_messages.append(sent_message)
-                logger.info(f"{TAG_DISCORD} Carousel [{idx + 1}/{total_chunks}] terkirim.")
-            except discord.HTTPException as e:
-                logger.error(f"{TAG_ERROR} Discord error carousel chunk {idx + 1}: {e}")
-                all_success = False
-            except Exception as e:
-                logger.error(f"{TAG_ERROR} Error upload carousel chunk {idx + 1}: {e}")
-                all_success = False
-            finally:
-                for f in discord_files:
-                    f.close()
-
-            # Jeda antar chunk agar tidak kena rate limit Discord
-            if idx < total_chunks - 1:
                 await asyncio.sleep(SEND_DELAY_SECONDS)
 
-        if all_success:
-            await asyncio.sleep(1.5)
-            await self.downloader.cleanup_files_async(file_paths)
-        else:
-            for message in sent_messages:
-                    try:
-                        await message.delete()
-                    except discord.NotFound:
-                        # FIX: message may have been deleted manually between send and rollback —
-                        # ignore 404 NotFound to prevent noisy traceback in logs.
-                        pass
-                    except discord.HTTPException as e:
-                        logger.error(f"{TAG_ERROR} Gagal rollback carousel message: {e}")
-            logger.warning(f"{TAG_WARN} Carousel partial delivery — membersihkan file temporer.")
-            await asyncio.sleep(1.5)
-            await self.downloader.cleanup_files_async(file_paths)
+        # 2. Kirim Video (setiap video dikirim per pesan individual)
+        # Sangat krusial: Discord hanya menampilkan player video pertama jika digabung dalam 1 pesan!
+        total_videos = len(video_files)
+        for v_idx, v_path in enumerate(video_files):
+            v_size = v_path.stat().st_size
+            logger.info(
+                f"{TAG_DISCORD} Upload carousel video [{v_idx + 1}/{total_videos}] "
+                f"— {v_path.name} ({fmt_size(v_size)})"
+            )
+            try:
+                d_file = discord.File(fp=v_path, filename=v_path.name)
+                try:
+                    sent_msg = await self.channel.send(file=d_file)
+                    sent_messages.append(sent_msg)
+                    delivered_count += 1
+                    logger.info(f"{TAG_DISCORD} Carousel video [{v_idx + 1}/{total_videos}] terkirim.")
+                finally:
+                    d_file.close()
+            except Exception as e:
+                logger.error(f"{TAG_ERROR} Gagal kirim video carousel {v_path.name}: {e}")
 
-        return all_success
+            if v_idx < total_videos - 1:
+                await asyncio.sleep(SEND_DELAY_SECONDS)
+
+        # Cleanup file temporer
+        await asyncio.sleep(1.5)
+        await self.downloader.cleanup_files_async(file_paths)
+
+        # Jika minimal ada 1 media terkirim, anggap sukses agar bot tidak gagal total
+        return delivered_count > 0
 
     # ──────────────────────────────────────────────
     # Orkestrasi Pengiriman Postingan

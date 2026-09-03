@@ -2072,6 +2072,8 @@ class MediaDownloader:
         cmd = [
             "--directory",
             str(self.temp_dir),
+            "-o",
+            "directory=",
             "--no-part",
         ]
 
@@ -2139,6 +2141,8 @@ class MediaDownloader:
             "gallery-dl",
             "--directory",
             str(self.temp_dir),
+            "-o",
+            "directory=",
             "--no-part",
         ]
 
