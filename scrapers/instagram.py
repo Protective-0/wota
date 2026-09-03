@@ -41,6 +41,12 @@ try:
 except ImportError:
     HAS_CURL_CFFI = False
 
+try:
+    from scrapling.fetchers import AsyncFetcher
+    HAS_SCRAPLING = True
+except ImportError:
+    HAS_SCRAPLING = False
+
 from .base import (
     BaseScraper,
     MediaType,
@@ -162,15 +168,12 @@ class InstagramScraper(BaseScraper):
         user_id = ""
         stop_condition_met = False
 
-        ig_cookies = await self.load_cookies_as_dict("instagram")
-        netscape_cookies_file = await self.export_session_cookies_for_ytdlp("instagram")
-        netscape_cookies_path_str = str(netscape_cookies_file) if netscape_cookies_file else None
-
         # ─────────────────────────────────────────────────────────────────────
         # TIER 1: Instagram Public Web API (Initial Profile Snapshot + Reels)
         # Mengambil snapshot awal timeline, tab reels (felix), dan user_id untuk pagination
+        # 100% Zero-Login (Guest Mode) via Scrapling / curl_cffi / httpx
         # ─────────────────────────────────────────────────────────────────────
-        logger.info(f"{TAG_CRAWL} [TIER 1] Menjalankan Instagram Public Web API untuk @{username}...")
+        logger.info(f"{TAG_CRAWL} [TIER 1] Menjalankan Instagram Public Web API untuk @{username} (Zero-Login)...")
         end_cursor = None
         has_next_page = False
 
@@ -188,17 +191,30 @@ class InstagramScraper(BaseScraper):
             }
 
             resp_json = None
-            if HAS_CURL_CFFI:
+
+            # Pass A: Scrapling AsyncFetcher
+            if HAS_SCRAPLING:
                 try:
-                    async with curl_requests.AsyncSession(impersonate="chrome124", cookies=ig_cookies or None) as session:
+                    sc_resp = await AsyncFetcher.get(api_url, headers=headers, timeout=12)
+                    if sc_resp.status == 200:
+                        resp_json = sc_resp.json()
+                        logger.debug("[TIER 1] Scrapling AsyncFetcher berhasil mengambil web_profile_info.")
+                except Exception as sc_err:
+                    logger.debug(f"Scrapling web_profile_info note: {sc_err}")
+
+            # Pass B: curl_cffi TLS impersonation chrome124
+            if not resp_json and HAS_CURL_CFFI:
+                try:
+                    async with curl_requests.AsyncSession(impersonate="chrome124") as session:
                         resp = await session.get(api_url, headers=headers, timeout=15)
                         if resp.status_code == 200:
                             resp_json = resp.json()
                 except Exception as curl_err:
                     logger.debug(f"curl_cffi web_profile_info note: {curl_err}")
 
+            # Pass C: httpx async client
             if not resp_json:
-                async with httpx.AsyncClient(headers=headers, cookies=ig_cookies or None, follow_redirects=True, timeout=15.0) as client:
+                async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15.0) as client:
                     resp = await client.get(api_url)
                     if resp.status_code == 200:
                         resp_json = resp.json()
@@ -305,9 +321,17 @@ class InstagramScraper(BaseScraper):
                     feed_api_url = f"https://www.instagram.com/api/v1/feed/user/{user_id}/?count=12&max_id={curr_cursor}"
                     feed_data = None
 
-                    if HAS_CURL_CFFI:
+                    if HAS_SCRAPLING:
                         try:
-                            async with curl_requests.AsyncSession(impersonate="chrome124", cookies=ig_cookies or None) as session:
+                            sc_f_resp = await AsyncFetcher.get(feed_api_url, headers=headers, timeout=12)
+                            if sc_f_resp.status == 200:
+                                feed_data = sc_f_resp.json()
+                        except Exception as sc_f_err:
+                            logger.debug(f"Scrapling feed pagination note: {sc_f_err}")
+
+                    if not feed_data and HAS_CURL_CFFI:
+                        try:
+                            async with curl_requests.AsyncSession(impersonate="chrome124") as session:
                                 f_resp = await session.get(feed_api_url, headers=headers, timeout=15)
                                 if f_resp.status_code == 200:
                                     feed_data = f_resp.json()
@@ -316,7 +340,7 @@ class InstagramScraper(BaseScraper):
 
                     if not feed_data:
                         try:
-                            async with httpx.AsyncClient(headers=headers, cookies=ig_cookies or None, timeout=15.0) as client:
+                            async with httpx.AsyncClient(headers=headers, timeout=15.0) as client:
                                 f_resp = await client.get(feed_api_url)
                                 if f_resp.status_code == 200:
                                     feed_data = f_resp.json()
@@ -630,8 +654,6 @@ class InstagramScraper(BaseScraper):
                 headed=self.headed,
                 viewport={"width": 1280, "height": 900},
             )
-            if self._context:
-                await self.load_and_inject_cookies(self._context, "instagram")
             page = await self._context.new_page()
 
             targets = (

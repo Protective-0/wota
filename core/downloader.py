@@ -199,7 +199,8 @@ class MediaDownloader:
             if self._playwright:
                 await self._playwright.stop()
         except Exception as e:
-            logger.warning(f"Error saat menutup browser downloader: {e}")
+            if "Connection closed" not in str(e):
+                logger.warning(f"Error saat menutup browser downloader: {e}")
         finally:
             self._browser = None
             self._playwright = None
