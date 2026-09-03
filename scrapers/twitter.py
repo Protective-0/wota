@@ -129,14 +129,14 @@ class TwitterScraper(BaseScraper):
             MAX_NO_NEW = 6
             scroll_round = 0
             # FIX: configurable via env MAX_TWITTER_SCROLLS — previously hardcoded to 35
-            MAX_TWITTER_SCROLLS = int(os.getenv("MAX_TWITTER_SCROLLS", "35"))
+            MAX_TWITTER_SCROLLS = int(os.getenv("MAX_TWITTER_SCROLLS", "100"))
 
             scroll_start = time.monotonic()
-            MAX_SCROLL_SECONDS = 180.0
+            MAX_SCROLL_SECONDS = 300.0
 
             while no_new_count < MAX_NO_NEW:
                 if time.monotonic() - scroll_start > MAX_SCROLL_SECONDS:
-                    logger.warning(f"{TAG_WARN} Batas waktu scroll Twitter 180s tercapai untuk @{username} — stop.")
+                    logger.warning(f"{TAG_WARN} Batas waktu scroll Twitter {MAX_SCROLL_SECONDS}s tercapai untuk @{username} — stop.")
                     break
 
                 scroll_round += 1

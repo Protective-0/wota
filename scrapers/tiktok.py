@@ -238,7 +238,7 @@ class TikTokScraper(BaseScraper):
                 pass
 
             # Scrolling pagination loop dengan early-exit
-            max_scroll_rounds = 8
+            max_scroll_rounds = int(os.getenv("MAX_TIKTOK_SCROLLS", "50"))
             no_new_rounds = 0
             for scroll_idx in range(max_scroll_rounds):
                 prev_count = len(collected_urls)

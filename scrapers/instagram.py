@@ -654,6 +654,8 @@ class InstagramScraper(BaseScraper):
                 headed=self.headed,
                 viewport={"width": 1280, "height": 900},
             )
+            if self._context:
+                await self.load_and_inject_cookies(self._context, "instagram")
             page = await self._context.new_page()
 
             targets = (
@@ -663,8 +665,8 @@ class InstagramScraper(BaseScraper):
             )
 
             start_time = time.monotonic()
-            MAX_CRAWL_DURATION = 180.0
-            max_scrolls = int(os.getenv("MAX_IG_BROWSER_SCROLLS", "25"))
+            MAX_CRAWL_DURATION = 300.0
+            max_scrolls = int(os.getenv("MAX_IG_BROWSER_SCROLLS", "100"))
 
             for target_tab in targets:
                 if time.monotonic() - start_time > MAX_CRAWL_DURATION:
@@ -700,8 +702,6 @@ class InstagramScraper(BaseScraper):
                                         b.remove();
                                     }
                                 });
-                                document.body.style.overflow = 'auto';
-                                document.documentElement.style.overflow = 'auto';
                             }""")
                         except Exception:
                             pass
@@ -728,7 +728,7 @@ class InstagramScraper(BaseScraper):
                                                 platform=self.PLATFORM,
                                                 media_type=MediaType.VIDEO if is_reel else MediaType.PHOTO,
                                                 timestamp=ts_iso,
-                                                cookies_file=None,
+                                                cookies_file=str(self.session_dir / "instagram_cookies.txt") if (self.session_dir / "instagram_cookies.txt").exists() else None,
                                             )
                                         )
                             except Exception:
@@ -736,13 +736,19 @@ class InstagramScraper(BaseScraper):
 
                         if len(results) == prev_count:
                             no_new_rounds += 1
-                            if no_new_rounds >= 4:
+                            if no_new_rounds >= 6:
                                 break
                         else:
                             no_new_rounds = 0
 
-                        await page.evaluate("window.scrollBy(0, 1800)")
-                        await asyncio.sleep(random.uniform(1.2, 2.0))
+                        # Scroll fisik via scroll_into_view + mouse wheel untuk men-trigger React virtualizer secara alami
+                        if links:
+                            try:
+                                await links[-1].scroll_into_view_if_needed()
+                            except Exception:
+                                pass
+                        await page.mouse.wheel(0, 2500)
+                        await asyncio.sleep(random.uniform(1.5, 2.2))
 
                 except Exception as tab_err:
                     logger.debug(f"Guest browser tab error ({target_tab}): {tab_err}")
