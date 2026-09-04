@@ -93,6 +93,101 @@ class TikTokScraper(BaseScraper):
         )
         return any(pat in clean_url for pat in expected_patterns)
 
+    async def _solve_captcha_slider(self, page) -> bool:
+        """
+        Deteksi dan selesaikan tantangan puzzle slider TikTok secara otomatis menggunakan
+        analisis kontur gambar pada Canvas dan simulasi pergerakan mouse kurva human-like.
+        """
+        try:
+            drag_btn = await page.query_selector(
+                '[class*="drag"], [class*="slider"], button[role="slider"], .secsdk-captcha-drag-icon'
+            )
+            if not drag_btn:
+                return False
+
+            box = await drag_btn.bounding_box()
+            if not box:
+                return False
+
+            logger.info(f"{TAG_CRAWL} [🤖 SOLVER] Tantangan puzzle slider TikTok terdeteksi! Memulai bypass otomatis...")
+
+            target_dist = await page.evaluate("""() => {
+                try {
+                    const imgs = Array.from(document.querySelectorAll('img')).filter(
+                        i => (i.naturalWidth || i.width) > 40 && (i.naturalHeight || i.height) > 40
+                    );
+                    if (imgs.length >= 2) {
+                        const bgImg = imgs[0];
+                        const w = bgImg.naturalWidth || bgImg.width;
+                        const h = bgImg.naturalHeight || bgImg.height;
+                        const cBg = document.createElement('canvas');
+                        cBg.width = w;
+                        cBg.height = h;
+                        const ctx = cBg.getContext('2d');
+                        ctx.drawImage(bgImg, 0, 0, w, h);
+                        const data = ctx.getImageData(0, 0, w, h).data;
+                        
+                        const colScores = [];
+                        for (let x = 40; x < w - 40; x++) {
+                            let score = 0;
+                            for (let y = 30; y < h - 30; y++) {
+                                const idx = (y * w + x) * 4;
+                                const bCurr = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
+                                const idxPrev = (y * w + (x - 2)) * 4;
+                                const bPrev = (data[idxPrev] + data[idxPrev + 1] + data[idxPrev + 2]) / 3;
+                                const diff = bPrev - bCurr;
+                                if (diff > 35) score += diff;
+                            }
+                            colScores.push({ x, score });
+                        }
+                        colScores.sort((a, b) => b.score - a.score);
+                        if (colScores.length > 0 && colScores[0].score > 0) {
+                            const scale = bgImg.getBoundingClientRect().width / w;
+                            return Math.round(colScores[0].x * scale);
+                        }
+                    }
+                } catch (e) {}
+                return 120;
+            }""")
+
+            if not target_dist or target_dist < 40:
+                target_dist = 120
+
+            start_x = box['x'] + box['width'] / 2
+            start_y = box['y'] + box['height'] / 2
+
+            await page.mouse.move(start_x, start_y)
+            await asyncio.sleep(random.uniform(0.15, 0.25))
+            await page.mouse.down()
+            await asyncio.sleep(random.uniform(0.08, 0.15))
+
+            steps = random.randint(25, 35)
+            for i in range(1, steps + 1):
+                progress = i / steps
+                ease = 1 - (1 - progress) ** 3
+                curr_x = start_x + (target_dist * ease) + random.uniform(-0.8, 0.8)
+                curr_y = start_y + random.uniform(-1.5, 1.5)
+                await page.mouse.move(curr_x, curr_y)
+                await asyncio.sleep(random.uniform(0.008, 0.025))
+
+            await asyncio.sleep(random.uniform(0.15, 0.25))
+            await page.mouse.up()
+            logger.info(f"{TAG_CRAWL} [🤖 SOLVER] Slider digeser sejauh {target_dist}px. Menunggu konfirmasi TikTok...")
+            await asyncio.sleep(3.0)
+
+            still = await page.query_selector(
+                '[class*="drag"], [class*="slider"], button[role="slider"], .secsdk-captcha-drag-icon'
+            )
+            if not still:
+                logger.info(f"{TAG_SUCCESS} [🎉 BYPASS] Tantangan puzzle slider TikTok berhasil diselesaikan!")
+                return True
+            else:
+                logger.warning(f"{TAG_WARN} [🤖 SOLVER] Puzzle slider belum hilang, mencoba lanjut proses...")
+                return False
+        except Exception as e:
+            logger.debug(f"[SOLVER] Exception: {e}")
+            return False
+
     async def scrape_profile(
         self,
         profile_url: str,
@@ -213,6 +308,9 @@ class TikTokScraper(BaseScraper):
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=45000)
             await asyncio.sleep(4.0)
 
+            # Periksa dan selesaikan tantangan puzzle slider TikTok jika muncul
+            await self._solve_captcha_slider(page)
+
             # Tunggu elemen profil atau feed postingan selesai dirender oleh SlardarWAF
             try:
                 await page.wait_for_selector(
@@ -238,6 +336,10 @@ class TikTokScraper(BaseScraper):
             no_new_rounds = 0
             for scroll_idx in range(max_scroll_rounds):
                 prev_count = len(collected_urls)
+
+                # Coba auto-solve jika di pertengahan scroll muncul puzzle slider
+                if len(collected_urls) == 0 and scroll_idx in (1, 3):
+                    await self._solve_captcha_slider(page)
 
                 # 1. Ekstrak links dari DOM selectors
                 dom_links = await page.locator('a[href*="/video/"], a[href*="/photo/"], a[href*="/v/"], [data-e2e="user-post-item"] a, [data-e2e="user-post-item-list"] a').all()
@@ -329,7 +431,8 @@ class TikTokScraper(BaseScraper):
                     )
                 elif has_slider_challenge:
                     logger.warning(
-                        f"{TAG_WARN} [PASS 0] TikTok menampilkan bot challenge / captcha slider pada @{username}."
+                        f"{TAG_WARN} [PASS 0] TikTok menampilkan bot challenge / captcha slider pada @{username}. "
+                        f"Page Title: '{page_title}', URL: '{page.url}'"
                     )
                 else:
                     logger.warning(

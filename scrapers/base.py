@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 
 # Standard Chromium stealth flags untuk Linux headless & Docker container
@@ -48,8 +48,7 @@ DOCKER_CHROMIUM_FLAGS = [
 ]
 
 # ── Stealth init script (single source of truth) ─────────────────────────────
-# FIX: extracted from create_stealth_browser & create_persistent_stealth_context
-# so both methods share identical fingerprint spoofing without copy-paste drift.
+# Spoofing menyeluruh untuk Linux Docker headless: WebGL, Navigator, Permissions, Chrome
 _STEALTH_SCRIPT = """
     () => {
         // 1. Clear Webdriver flag completely (including prototype)
@@ -58,16 +57,58 @@ _STEALTH_SCRIPT = """
         } catch (e) {}
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
-        // 2. Mock Platform & UserAgentData to match Windows User-Agent on Linux servers
+        // 2. Mock Platform & UserAgentData matching Chromium 131 on Windows
         Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
         if (navigator.userAgentData) {
             Object.defineProperty(navigator.userAgentData, 'platform', { get: () => 'Windows' });
+            Object.defineProperty(navigator.userAgentData, 'mobile', { get: () => false });
+            Object.defineProperty(navigator.userAgentData, 'brands', {
+                get: () => [
+                    { brand: 'Google Chrome', version: '131' },
+                    { brand: 'Chromium', version: '131' },
+                    { brand: 'Not_A Brand', version: '24' }
+                ]
+            });
         }
 
-        // 3. Mock Chrome runtime structure
-        window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+        // 3. Spoof WebGL Vendor & Renderer (CRITICAL for Linux Docker / VM without GPU)
+        try {
+            const spoofWebGL = (proto) => {
+                if (!proto) return;
+                const orig = proto.getParameter;
+                proto.getParameter = function(param) {
+                    if (param === 37445) return 'Google Inc. (NVIDIA)';
+                    if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                    return orig.apply(this, arguments);
+                };
+            };
+            if (typeof WebGLRenderingContext !== 'undefined') {
+                spoofWebGL(WebGLRenderingContext.prototype);
+            }
+            if (typeof WebGL2RenderingContext !== 'undefined') {
+                spoofWebGL(WebGL2RenderingContext.prototype);
+            }
+        } catch (e) {}
 
-        // 4. Fake Languages, Plugins, Hardware
+        // 4. Mock Chrome runtime structure
+        window.chrome = {
+            app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } },
+            runtime: { OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' }, OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' } },
+            loadTimes: function() {},
+            csi: function() {},
+        };
+
+        // 5. Mock Permissions API
+        if (navigator.permissions) {
+            const origQuery = navigator.permissions.query;
+            navigator.permissions.query = (params) => (
+                params && params.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : origQuery(params)
+            );
+        }
+
+        // 6. Fake Languages, Plugins, Hardware
         Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
         Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
@@ -202,6 +243,16 @@ class BaseScraper(ABC):
             {
                 "env_key": "TIKTOK_SESSION_ID",
                 "name": "sid_tt",
+                "domain": ".tiktok.com",
+            },
+            {
+                "env_key": "TIKTOK_TTWID",
+                "name": "ttwid",
+                "domain": ".tiktok.com",
+            },
+            {
+                "env_key": "TIKTOK_MS_TOKEN",
+                "name": "msToken",
                 "domain": ".tiktok.com",
             },
         ],
