@@ -477,6 +477,22 @@ class BaseScraper(ABC):
                         "httpOnly": True,
                     }
 
+        # Khusus TikTok: sessionid_ss dan sid_tt wajib ada jika TIKTOK_SESSION_ID disetel
+        if platform == "tiktok":
+            tt_session = os.getenv("TIKTOK_SESSION_ID")
+            if tt_session and tt_session.strip():
+                val = tt_session.strip()
+                for alias in ("sessionid_ss", "sid_tt"):
+                    if alias not in env_token_map:
+                        env_token_map[alias] = {
+                            "name": alias,
+                            "value": val,
+                            "domain": ".tiktok.com",
+                            "path": "/",
+                            "secure": True,
+                            "httpOnly": True,
+                        }
+
         # 2. Cari file cookie manual pengguna (tiktok.json, tiktok.txt, dll)
         cookie_candidates = _get_cookie_candidates(platform, str(self.session_dir))
         for cookie_file in cookie_candidates:

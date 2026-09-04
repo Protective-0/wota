@@ -109,31 +109,91 @@ class TikTokScraper(BaseScraper):
             if not box:
                 return False
 
-            logger.info(f"{TAG_CRAWL} [🤖 SOLVER] Tantangan puzzle slider TikTok terdeteksi! Memulai bypass otomatis...")
+            logger.info(f"{TAG_CRAWL} [🤖 SOLVER] Tantangan puzzle captcha TikTok terdeteksi! Memulai bypass otomatis...")
 
-            target_dist = await page.evaluate("""() => {
+            solver_res = await page.evaluate("""() => {
                 try {
-                    const imgs = Array.from(document.querySelectorAll('img')).filter(
-                        i => (i.naturalWidth || i.width) > 40 && (i.naturalHeight || i.height) > 40
-                    );
-                    if (imgs.length >= 2) {
-                        const bgImg = imgs[0];
-                        const w = bgImg.naturalWidth || bgImg.width;
-                        const h = bgImg.naturalHeight || bgImg.height;
+                    const imgs = Array.from(document.querySelectorAll(
+                        '.captcha-verify-container img, #captcha-verify-container-main-page img, #captcha-verify-container img, img'
+                    )).filter(i => (i.naturalWidth || i.width) > 40 && (i.naturalHeight || i.height) > 40);
+
+                    if (imgs.length < 2) return { error: 'Kurang dari 2 elemen gambar' };
+
+                    const imOut = imgs[0];
+                    const imIn = imgs[1];
+                    const wOut = imOut.naturalWidth || imOut.width;
+                    const hOut = imOut.naturalHeight || imOut.height;
+                    const wIn = imIn.naturalWidth || imIn.width;
+                    const hIn = imIn.naturalHeight || imIn.height;
+
+                    const styleOut = (imOut.getAttribute('style') || '').toLowerCase();
+                    const styleIn = (imIn.getAttribute('style') || '').toLowerCase();
+                    const isRotate = styleOut.includes('circle') || styleIn.includes('circle') || styleOut.includes('rotate') || styleIn.includes('rotate');
+
+                    if (isRotate) {
+                        // ── Rotate Circle Puzzle Solver ──────────────────────────────
+                        const cOut = document.createElement('canvas');
+                        cOut.width = wOut; cOut.height = hOut;
+                        const ctxOut = cOut.getContext('2d');
+                        ctxOut.drawImage(imOut, 0, 0, wOut, hOut);
+                        const dOut = ctxOut.getImageData(0, 0, wOut, hOut).data;
+
+                        const cIn = document.createElement('canvas');
+                        cIn.width = wIn; cIn.height = hIn;
+                        const ctxIn = cIn.getContext('2d');
+                        ctxIn.drawImage(imIn, 0, 0, wIn, hIn);
+                        const dIn = ctxIn.getImageData(0, 0, wIn, hIn).data;
+
+                        const cxOut = wOut / 2, cyOut = hOut / 2;
+                        const cxIn = wIn / 2, cyIn = hIn / 2;
+                        const rIn = 0.90 * (wIn / 2);
+                        const rOut = (wOut / 2) * (wIn / wOut) * 1.05;
+
+                        const samplesOut = [];
+                        const samplesIn = [];
+                        for (let deg = 0; deg < 360; deg++) {
+                            const rad = (deg * Math.PI) / 180;
+                            const xo = Math.round(cxOut + rOut * Math.cos(rad));
+                            const yo = Math.round(cyOut + rOut * Math.sin(rad));
+                            const idxO = (Math.max(0, Math.min(hOut - 1, yo)) * wOut + Math.max(0, Math.min(wOut - 1, xo))) * 4;
+                            samplesOut.push([dOut[idxO], dOut[idxO + 1], dOut[idxO + 2]]);
+
+                            const xi = Math.round(cxIn + rIn * Math.cos(rad));
+                            const yi = Math.round(cyIn + rIn * Math.sin(rad));
+                            const idxI = (Math.max(0, Math.min(hIn - 1, yi)) * wIn + Math.max(0, Math.min(wIn - 1, xi))) * 4;
+                            samplesIn.push([dIn[idxI], dIn[idxI + 1], dIn[idxI + 2]]);
+                        }
+
+                        let bestDiff = Infinity;
+                        let bestRot = 0;
+                        for (let rot = 1; rot < 360; rot++) {
+                            let diff = 0;
+                            for (let deg = 0; deg < 360; deg++) {
+                                const po = samplesOut[deg];
+                                const pi = samplesIn[(deg - rot + 360) % 360];
+                                diff += Math.abs(po[0] - pi[0]) + Math.abs(po[1] - pi[1]) + Math.abs(po[2] - pi[2]);
+                            }
+                            if (diff < bestDiff) {
+                                bestDiff = diff;
+                                bestRot = rot;
+                            }
+                        }
+                        return { type: 'rotate', dragDist: bestRot / 1.2676 };
+                    } else {
+                        // ── Jigsaw Cutout Puzzle Solver ───────────────────────────────
                         const cBg = document.createElement('canvas');
-                        cBg.width = w;
-                        cBg.height = h;
+                        cBg.width = wOut; cBg.height = hOut;
                         const ctx = cBg.getContext('2d');
-                        ctx.drawImage(bgImg, 0, 0, w, h);
-                        const data = ctx.getImageData(0, 0, w, h).data;
+                        ctx.drawImage(imOut, 0, 0, wOut, hOut);
+                        const data = ctx.getImageData(0, 0, wOut, hOut).data;
                         
                         const colScores = [];
-                        for (let x = 40; x < w - 40; x++) {
+                        for (let x = 40; x < wOut - 40; x++) {
                             let score = 0;
-                            for (let y = 30; y < h - 30; y++) {
-                                const idx = (y * w + x) * 4;
+                            for (let y = 30; y < hOut - 30; y++) {
+                                const idx = (y * wOut + x) * 4;
                                 const bCurr = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-                                const idxPrev = (y * w + (x - 2)) * 4;
+                                const idxPrev = (y * wOut + (x - 2)) * 4;
                                 const bPrev = (data[idxPrev] + data[idxPrev + 1] + data[idxPrev + 2]) / 3;
                                 const diff = bPrev - bCurr;
                                 if (diff > 35) score += diff;
@@ -142,15 +202,23 @@ class TikTokScraper(BaseScraper):
                         }
                         colScores.sort((a, b) => b.score - a.score);
                         if (colScores.length > 0 && colScores[0].score > 0) {
-                            const scale = bgImg.getBoundingClientRect().width / w;
-                            return Math.round(colScores[0].x * scale);
+                            const scale = imOut.getBoundingClientRect().width / wOut;
+                            return { type: 'jigsaw', dragDist: Math.round(colScores[0].x * scale) };
                         }
+                        return { type: 'jigsaw', dragDist: 120 };
                     }
-                } catch (e) {}
-                return 120;
+                } catch (e) {
+                    return { error: String(e), dragDist: 120 };
+                }
             }""")
 
-            if not target_dist or target_dist < 40:
+            target_dist = 120
+            p_type = "slider"
+            if isinstance(solver_res, dict):
+                target_dist = float(solver_res.get("dragDist") or 120)
+                p_type = solver_res.get("type", "slider")
+
+            if target_dist < 30:
                 target_dist = 120
 
             start_x = box['x'] + box['width'] / 2
@@ -161,28 +229,28 @@ class TikTokScraper(BaseScraper):
             await page.mouse.down()
             await asyncio.sleep(random.uniform(0.08, 0.15))
 
-            steps = random.randint(25, 35)
+            steps = random.randint(28, 38)
             for i in range(1, steps + 1):
                 progress = i / steps
                 ease = 1 - (1 - progress) ** 3
                 curr_x = start_x + (target_dist * ease) + random.uniform(-0.8, 0.8)
-                curr_y = start_y + random.uniform(-1.5, 1.5)
+                curr_y = start_y + random.uniform(-1.2, 1.2)
                 await page.mouse.move(curr_x, curr_y)
-                await asyncio.sleep(random.uniform(0.008, 0.025))
+                await asyncio.sleep(random.uniform(0.010, 0.022))
 
             await asyncio.sleep(random.uniform(0.15, 0.25))
             await page.mouse.up()
-            logger.info(f"{TAG_CRAWL} [🤖 SOLVER] Slider digeser sejauh {target_dist}px. Menunggu konfirmasi TikTok...")
+            logger.info(f"{TAG_CRAWL} [🤖 SOLVER] Puzzle ({p_type}) digeser sejauh {target_dist:.1f}px. Menunggu konfirmasi TikTok...")
             await asyncio.sleep(3.0)
 
             still = await page.query_selector(
                 '[class*="drag"], [class*="slider"], button[role="slider"], .secsdk-captcha-drag-icon'
             )
             if not still:
-                logger.info(f"{TAG_SUCCESS} [🎉 BYPASS] Tantangan puzzle slider TikTok berhasil diselesaikan!")
+                logger.info(f"{TAG_SUCCESS} [🎉 BYPASS] Tantangan puzzle ({p_type}) TikTok berhasil diselesaikan!")
                 return True
             else:
-                logger.warning(f"{TAG_WARN} [🤖 SOLVER] Puzzle slider belum hilang, mencoba lanjut proses...")
+                logger.warning(f"{TAG_WARN} [🤖 SOLVER] Puzzle ({p_type}) belum hilang, mencoba lanjut proses...")
                 return False
         except Exception as e:
             logger.debug(f"[SOLVER] Exception: {e}")
@@ -237,6 +305,8 @@ class TikTokScraper(BaseScraper):
 
             page = await self._context.new_page()
 
+            pagination_has_more = [True]
+
             # Network Interceptor: Tangkap payload internal TikTok saat dimuat dengan verifikasi author ketat
             async def _on_page_response(resp):
                 r_url = resp.url
@@ -244,6 +314,16 @@ class TikTokScraper(BaseScraper):
                     try:
                         data = await resp.json()
                         if isinstance(data, dict):
+                            is_post_feed_endpoint = (
+                                "/api/post/item_list" in r_url
+                                or ("item_list" in r_url and "story" not in r_url and "collection" not in r_url and "playlist" not in r_url and "repost" not in r_url)
+                            )
+                            if is_post_feed_endpoint:
+                                if "hasMore" in data:
+                                    pagination_has_more[0] = bool(data.get("hasMore"))
+                                elif "has_more" in data:
+                                    pagination_has_more[0] = bool(data.get("has_more"))
+
                             items = (
                                 data.get("itemList", [])
                                 or data.get("items", [])
@@ -331,15 +411,28 @@ class TikTokScraper(BaseScraper):
             except Exception:
                 pass
 
-            # Scrolling pagination loop dengan early-exit
-            max_scroll_rounds = int(os.getenv("MAX_TIKTOK_SCROLLS", "50"))
+            # Scrolling pagination loop dengan cycle progress tracking & early-exit
+            max_scroll_rounds = int(os.getenv("MAX_TIKTOK_SCROLLS", "500"))
             no_new_rounds = 0
-            for scroll_idx in range(max_scroll_rounds):
-                prev_count = len(collected_urls)
+            for scroll_idx in range(1, max_scroll_rounds + 1):
+                cycle_start_count = len(collected_urls)
 
                 # Coba auto-solve jika di pertengahan scroll muncul puzzle slider
                 if len(collected_urls) == 0 and scroll_idx in (1, 3):
                     await self._solve_captcha_slider(page)
+
+                # Hybrid Scroll: Selalu scroll ke dasar dokumen untuk memicu IntersectionObserver TikTok
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.mouse.wheel(0, 2000)
+
+                # Bounce Scroll: jika macet >= 2 putaran, goyang ke atas lalu ke bawah lagi
+                if no_new_rounds >= 2:
+                    await page.evaluate("window.scrollBy(0, -800)")
+                    await asyncio.sleep(0.5)
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.mouse.wheel(0, 2500)
+
+                await asyncio.sleep(random.uniform(1.4, 1.9))
 
                 # 1. Ekstrak links dari DOM selectors
                 dom_links = await page.locator('a[href*="/video/"], a[href*="/photo/"], a[href*="/v/"], [data-e2e="user-post-item"] a, [data-e2e="user-post-item-list"] a').all()
@@ -391,21 +484,26 @@ class TikTokScraper(BaseScraper):
                         logger.info(f"{TAG_CRAWL} Stop-condition tercapai pada post {max_id} di DB.")
                         break
 
-                if len(collected_urls) == prev_count and len(collected_urls) > 0:
-                    no_new_rounds += 1
-                    if no_new_rounds >= 4:
-                        break
-                elif len(collected_urls) == 0 and scroll_idx >= 5:
-                    logger.warning(
-                        f"{TAG_WARN} [PASS 0] Belum ada postingan ditemukan setelah 6 kali scroll. "
-                        f"Menghentikan scroll lebih awal untuk mengecek status proteksi halaman..."
-                    )
-                    break
-                else:
-                    no_new_rounds = 0
+                cycle_end_count = len(collected_urls)
+                diff = cycle_end_count - cycle_start_count
 
-                await page.evaluate("window.scrollBy(0, 1600)")
-                await asyncio.sleep(random.uniform(1.2, 1.8))
+                if diff > 0:
+                    no_new_rounds = 0
+                else:
+                    if cycle_end_count > 0:
+                        no_new_rounds += 1
+                        if not pagination_has_more[0] and no_new_rounds >= 5:
+                            logger.info(f"{TAG_CRAWL} TikTok API menandakan hasMore=False. Seluruh postingan profil telah terambil ({len(collected_urls)} posts).")
+                            break
+                        elif no_new_rounds >= 10:
+                            logger.info(f"{TAG_CRAWL} Tidak ada postingan baru setelah 10 putaran scroll. Menghentikan pagination pada {len(collected_urls)} posts.")
+                            break
+                    elif scroll_idx >= 6:
+                        logger.warning(
+                            f"{TAG_WARN} [PASS 0] Belum ada postingan ditemukan setelah 6 kali scroll. "
+                            f"Menghentikan scroll lebih awal untuk mengecek status proteksi halaman..."
+                        )
+                        break
 
             if not collected_urls:
                 page_title = await page.title()
