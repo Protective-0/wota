@@ -52,7 +52,10 @@ DOCKER_CHROMIUM_FLAGS = [
 # so both methods share identical fingerprint spoofing without copy-paste drift.
 _STEALTH_SCRIPT = """
     () => {
-        // 1. Clear Webdriver flag
+        // 1. Clear Webdriver flag completely (including prototype)
+        try {
+            delete Object.getPrototypeOf(navigator).webdriver;
+        } catch (e) {}
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
         // 2. Mock Platform & UserAgentData to match Windows User-Agent on Linux servers
@@ -86,15 +89,22 @@ def _get_cookie_candidates(platform: str, session_dir: str) -> list[Path]:
     return [
         cookie_dir / f"{p}.json",
         cookie_dir / f"{p}.txt",
+        cookie_dir / f"{p}_cookies.txt",
         cookie_dir / f"cookies_{p}.json",
+        cookie_dir / f"cookies_{p}.txt",
         sess_dir / f"{p}.json",
         sess_dir / f"{p}.txt",
+        sess_dir / f"{p}_cookies.txt",
         sess_dir / f"cookies_{p}.json",
+        sess_dir / f"cookies_{p}.txt",
         Path.cwd() / "sessions" / f"{p}.json",
         Path.cwd() / "sessions" / f"{p}.txt",
+        Path.cwd() / "sessions" / f"{p}_cookies.txt",
         Path.cwd() / "sessions" / f"cookies_{p}.json",
+        Path.cwd() / "sessions" / f"cookies_{p}.txt",
         Path.cwd() / "config" / "cookies" / f"{p}.json",
         Path.cwd() / "config" / "cookies" / f"{p}.txt",
+        Path.cwd() / "config" / "cookies" / f"{p}_cookies.txt",
     ]
 
 
@@ -186,6 +196,16 @@ class BaseScraper(ABC):
             {
                 "env_key": "TIKTOK_SESSION_ID",
                 "name": "sessionid",
+                "domain": ".tiktok.com",
+            },
+            {
+                "env_key": "TIKTOK_SESSION_ID",
+                "name": "sessionid_ss",
+                "domain": ".tiktok.com",
+            },
+            {
+                "env_key": "TIKTOK_SESSION_ID",
+                "name": "sid_tt",
                 "domain": ".tiktok.com",
             },
         ],
@@ -288,6 +308,7 @@ class BaseScraper(ABC):
         brave_path = BaseScraper.get_brave_path()
         launch_kwargs: dict = {
             "args": list(DOCKER_CHROMIUM_FLAGS),
+            "ignore_default_args": ["--enable-automation"],
         }
         if brave_path:
             launch_kwargs["executable_path"] = brave_path

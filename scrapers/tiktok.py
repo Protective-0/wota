@@ -117,24 +117,21 @@ class TikTokScraper(BaseScraper):
         metadata_map: dict[str, dict] = {}
 
         # ─────────────────────────────────────────────────────────────────────
-        # PASS 0 (PRIMARY): Playwright Persistent Stealth Browser (Bypass WAF & Captcha)
+        # PASS 0 (PRIMARY): Playwright Stealth Browser (Bypass WAF & Captcha)
         # ─────────────────────────────────────────────────────────────────────
-        logger.info(f"{TAG_CRAWL} [PASS 0] Mengaktifkan Playwright Persistent Stealth Browser untuk @{username}...")
+        logger.info(f"{TAG_CRAWL} [PASS 0] Mengaktifkan Playwright Stealth Browser untuk @{username}...")
         try:
             from playwright.async_api import async_playwright
             self._playwright = await async_playwright().start()
-            user_data_dir = Path(self.session_dir) / "tiktok_browser_profile"
-            self._context = await BaseScraper.create_persistent_stealth_context(
+            self._browser, self._context = await BaseScraper.create_stealth_browser(
                 self._playwright,
-                user_data_dir=user_data_dir,
                 headed=self.headed,
                 viewport={"width": 1280, "height": 800},
                 locale="id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
                 timezone_id="Asia/Jakarta",
             )
-            self._browser = None  # Persistent context mengelola browser instance secara terintegrasi
 
-            # Muat session cookies jika tersedia di direktori sessions/
+            # Muat session cookies jika tersedia di direktori sessions/ atau .env
             try:
                 cookies = await self.load_cookies_as_list(self.PLATFORM)
                 if cookies:
@@ -143,8 +140,7 @@ class TikTokScraper(BaseScraper):
             except Exception as c_err:
                 logger.debug(f"Cookie load note: {c_err}")
 
-            # Gunakan tab aktif default (Tab 0) dari persistent context agar tidak membuat background tab
-            page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+            page = await self._context.new_page()
 
             # Network Interceptor: Tangkap payload internal TikTok saat dimuat dengan verifikasi author ketat
             async def _on_page_response(resp):
@@ -295,24 +291,39 @@ class TikTokScraper(BaseScraper):
 
                 if len(collected_urls) == prev_count and len(collected_urls) > 0:
                     no_new_rounds += 1
-                    if no_new_rounds >= 2:
+                    if no_new_rounds >= 4:
                         break
                 else:
                     no_new_rounds = 0
 
                 await page.evaluate("window.scrollBy(0, 1600)")
-                await asyncio.sleep(random.uniform(1.0, 1.5))
+                await asyncio.sleep(random.uniform(1.2, 1.8))
 
             if not collected_urls:
                 page_title = await page.title()
-                logger.warning(
-                    f"{TAG_WARN} [PASS 0] Playwright Persistent Browser selesai tanpa link. "
-                    f"Page Title: '{page_title}', URL: '{page.url}'"
-                )
+                p_content = ""
+                try:
+                    p_content = (await page.content()).lower()
+                except Exception:
+                    pass
+                if "kontrol audiens" in p_content or "audience control" in p_content:
+                    logger.warning(
+                        f"{TAG_WARN} [PASS 0] Akun @{username} mengaktifkan Kontrol Audiens (18+ / login-gated). "
+                        f"TikTok menyembunyikan video kecuali akun bot memiliki TIKTOK_SESSION_ID yang valid di .env."
+                    )
+                elif "verify" in page.url.lower() or "captcha" in p_content:
+                    logger.warning(
+                        f"{TAG_WARN} [PASS 0] TikTok menampilkan bot challenge / captcha slider pada @{username}."
+                    )
+                else:
+                    logger.warning(
+                        f"{TAG_WARN} [PASS 0] Playwright Stealth Browser selesai tanpa link. "
+                        f"Page Title: '{page_title}', URL: '{page.url}'"
+                    )
 
             await page.close()
             if collected_urls:
-                logger.info(f"{TAG_CRAWL} [PASS 0] Playwright Persistent Stealth Browser berhasil mengekstrak {len(collected_urls)} post.")
+                logger.info(f"{TAG_CRAWL} [PASS 0] Playwright Stealth Browser berhasil mengekstrak {len(collected_urls)} post.")
         except Exception as e:
             logger.warning(f"{TAG_WARN} [PASS 0] Playwright Stealth Browser exception: {e}")
         finally:

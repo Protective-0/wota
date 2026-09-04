@@ -1685,11 +1685,11 @@ class MediaDownloader:
             return None
 
         cookies_dict: dict = {}
-        netscape_path = Path("sessions/tiktok_cookies.txt")
+        for cand in [Path("sessions/tiktok_cookies.txt"), Path("sessions/tiktok.txt"), Path("sessions/cookies_tiktok.txt")]:
+            if cand.exists():
+                cookies_dict.update(self._parse_netscape_cookies(str(cand)))
         if cookies_file and Path(cookies_file).exists():
-            netscape_path = Path(cookies_file)
-        if netscape_path.exists():
-            cookies_dict.update(self._parse_netscape_cookies(str(netscape_path)))
+            cookies_dict.update(self._parse_netscape_cookies(str(cookies_file)))
 
         for c in browser_cookies:
             name = c.get("name", "")
@@ -1698,8 +1698,13 @@ class MediaDownloader:
                 cookies_dict[name] = value
 
         tiktok_session_id = os.getenv("TIKTOK_SESSION_ID", "").strip()
-        if tiktok_session_id and "sessionid" not in cookies_dict:
-            cookies_dict["sessionid"] = tiktok_session_id
+        if tiktok_session_id:
+            if "sessionid" not in cookies_dict:
+                cookies_dict["sessionid"] = tiktok_session_id
+            if "sessionid_ss" not in cookies_dict:
+                cookies_dict["sessionid_ss"] = tiktok_session_id
+            if "sid_tt" not in cookies_dict:
+                cookies_dict["sid_tt"] = tiktok_session_id
 
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
