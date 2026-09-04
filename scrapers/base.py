@@ -79,9 +79,9 @@ _STEALTH_SCRIPT = """
 
 def _get_cookie_candidates(platform: str, session_dir: str) -> list[Path]:
     """
-    FIX: Deduplicated helper — previously identical lists were copy-pasted
-    inside both has_auth_configured() and load_cookies_as_list().
     Returns ordered list of candidate cookie file paths for the given platform.
+    Catatan: {platform}_cookies.txt tidak dimasukkan ke sini agar file ekspor internal
+    yt-dlp tidak menimpa atau memblokir pembacaan token autentikasi .env yang baru.
     """
     p = platform.lower().strip()
     cookie_dir = Path(os.getenv("COOKIE_DIR", Path.cwd() / "sessions"))
@@ -89,22 +89,18 @@ def _get_cookie_candidates(platform: str, session_dir: str) -> list[Path]:
     return [
         cookie_dir / f"{p}.json",
         cookie_dir / f"{p}.txt",
-        cookie_dir / f"{p}_cookies.txt",
         cookie_dir / f"cookies_{p}.json",
         cookie_dir / f"cookies_{p}.txt",
         sess_dir / f"{p}.json",
         sess_dir / f"{p}.txt",
-        sess_dir / f"{p}_cookies.txt",
         sess_dir / f"cookies_{p}.json",
         sess_dir / f"cookies_{p}.txt",
         Path.cwd() / "sessions" / f"{p}.json",
         Path.cwd() / "sessions" / f"{p}.txt",
-        Path.cwd() / "sessions" / f"{p}_cookies.txt",
         Path.cwd() / "sessions" / f"cookies_{p}.json",
         Path.cwd() / "sessions" / f"cookies_{p}.txt",
         Path.cwd() / "config" / "cookies" / f"{p}.json",
         Path.cwd() / "config" / "cookies" / f"{p}.txt",
-        Path.cwd() / "config" / "cookies" / f"{p}_cookies.txt",
     ]
 
 
@@ -408,13 +404,30 @@ class BaseScraper(ABC):
 
     async def load_cookies_as_list(self, platform: str) -> list[dict]:
         """
-        Muat cookie dari file JSON, Netscape, atau .env dalam format list of dicts.
+        Muat cookie dari .env (prioritas utama) atau file JSON / Netscape di sessions/.
+        Jika token .env disetel, token tersebut dijamin menggantikan/menimpa session cookie
+        dari file agar bot selalu memakai sesi terbaru pengguna.
         """
         cookies: list[dict] = []
 
-        # FIX: use shared _get_cookie_candidates() helper — eliminates duplicate path list
-        cookie_candidates = _get_cookie_candidates(platform, str(self.session_dir))
+        # 1. Siapkan token dari .env (Prioritas Utama untuk Auth)
+        token_specs = self.ENV_TOKEN_MAP.get(platform, [])
+        env_token_map: dict[str, dict] = {}
+        if token_specs:
+            for spec in token_specs:
+                token_val = os.getenv(spec["env_key"])
+                if token_val and token_val.strip():
+                    env_token_map[spec["name"]] = {
+                        "name": spec["name"],
+                        "value": token_val.strip(),
+                        "domain": spec["domain"],
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": True,
+                    }
 
+        # 2. Cari file cookie manual pengguna (tiktok.json, tiktok.txt, dll)
+        cookie_candidates = _get_cookie_candidates(platform, str(self.session_dir))
         for cookie_file in cookie_candidates:
             if not cookie_file.exists():
                 continue
@@ -426,6 +439,7 @@ class BaseScraper(ABC):
                 if not content:
                     continue
 
+                parsed: list[dict] = []
                 if content.startswith("[") or content.startswith("{"):
                     json_data = json.loads(content)
                     if isinstance(json_data, dict):
@@ -449,7 +463,7 @@ class BaseScraper(ABC):
                                         norm_c["expires"] = int(float(exp))
                                     except (ValueError, TypeError):
                                         pass
-                                cookies.append(norm_c)
+                                parsed.append(norm_c)
                 else:
                     for line in content.splitlines():
                         line = line.strip()
@@ -468,35 +482,30 @@ class BaseScraper(ABC):
                             }
                             if expires and expires.isdigit() and int(expires) > 0:
                                 norm_c["expires"] = int(expires)
-                            cookies.append(norm_c)
+                            parsed.append(norm_c)
 
-                if cookies:
+                if parsed:
+                    cookies = parsed
                     logger.info(f"[⚙️ SYSTEM] Cookie {platform} berhasil dimuat dari {cookie_file.name} ({len(cookies)} cookies).")
-                    return cookies
+                    break
             except Exception as e:
                 logger.warning(f"Gagal membaca file cookie {platform} ({cookie_file.name}): {e}")
 
-        # Fallback ke .env
-        token_specs = self.ENV_TOKEN_MAP.get(platform, [])
-        if token_specs:
-            env_cookies = []
-            all_present = True
-            for spec in token_specs:
-                token_val = os.getenv(spec["env_key"])
-                if token_val:
-                    env_cookies.append({
-                        "name": spec["name"],
-                        "value": token_val.strip(),
-                        "domain": spec["domain"],
-                        "path": "/",
-                        "secure": True,
-                        "httpOnly": True,
-                    })
-                else:
-                    all_present = False
-            if all_present and env_cookies:
-                logger.info(f"[⚙️ SYSTEM] Cookie {platform} dibangun dari .env token ({len(env_cookies)} cookies).")
-                return env_cookies
+        # 3. Integrasikan token .env dengan file cookie
+        if env_token_map:
+            if cookies:
+                # Timpa atau tambahkan token .env ke dalam daftar cookies dari file
+                merged_dict = {c["name"]: c for c in cookies}
+                for name, env_c in env_token_map.items():
+                    merged_dict[name] = env_c
+                cookies = list(merged_dict.values())
+                logger.info(f"[⚙️ SYSTEM] Cookie {platform} disinkronkan dengan .env token ({len(cookies)} cookies aktif).")
+                return cookies
+            else:
+                # Tidak ada file cookie manual, gunakan token dari .env
+                cookies = list(env_token_map.values())
+                logger.info(f"[⚙️ SYSTEM] Cookie {platform} dibangun dari .env token ({len(cookies)} cookies).")
+                return cookies
 
         return cookies
 

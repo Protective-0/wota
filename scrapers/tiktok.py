@@ -208,7 +208,7 @@ class TikTokScraper(BaseScraper):
                         pass
 
             page.on("response", _on_page_response)
-            logger.info(f"{TAG_CRAWL} Membuka profil TikTok di persistent browser: {canonical_url}")
+            logger.info(f"{TAG_CRAWL} Membuka profil TikTok di stealth browser: {canonical_url}")
 
             await page.goto(canonical_url, wait_until="domcontentloaded", timeout=45000)
             await asyncio.sleep(4.0)
@@ -293,6 +293,12 @@ class TikTokScraper(BaseScraper):
                     no_new_rounds += 1
                     if no_new_rounds >= 4:
                         break
+                elif len(collected_urls) == 0 and scroll_idx >= 5:
+                    logger.warning(
+                        f"{TAG_WARN} [PASS 0] Belum ada postingan ditemukan setelah 6 kali scroll. "
+                        f"Menghentikan scroll lebih awal untuk mengecek status proteksi halaman..."
+                    )
+                    break
                 else:
                     no_new_rounds = 0
 
@@ -306,12 +312,22 @@ class TikTokScraper(BaseScraper):
                     p_content = (await page.content()).lower()
                 except Exception:
                     pass
+
+                has_slider_challenge = (
+                    "tarik penggeser" in p_content
+                    or "drag the slider" in p_content
+                    or "verify to continue" in p_content
+                    or "puzzle" in p_content
+                    or "verify-center" in page.url.lower()
+                    or await page.query_selector("#captcha-verify-container, .captcha-verify-container, #captcha_container, #verify-bar") is not None
+                )
+
                 if "kontrol audiens" in p_content or "audience control" in p_content:
                     logger.warning(
                         f"{TAG_WARN} [PASS 0] Akun @{username} mengaktifkan Kontrol Audiens (18+ / login-gated). "
                         f"TikTok menyembunyikan video kecuali akun bot memiliki TIKTOK_SESSION_ID yang valid di .env."
                     )
-                elif "verify" in page.url.lower() or "captcha" in p_content:
+                elif has_slider_challenge:
                     logger.warning(
                         f"{TAG_WARN} [PASS 0] TikTok menampilkan bot challenge / captcha slider pada @{username}."
                     )
